@@ -25,14 +25,33 @@ buffer:
   storage_device: 'cuda:0'
 
 trainer:
-  steps: ${env.steps}
-  pretrain: 0
-  eval_every: 1e4
-  eval_episode_num: ${env.eval_episode_num}
-  batch_size: ${batch_size}
-  batch_length: ${batch_length}
-  train_ratio: ${env.train_ratio}
-  video_pred_log: False
-  params_hist_log: False
-  update_log_every: 5e3
-  action_repeat: ${env.action_repeat}
+
+  steps: 100000
+
+  batch_per_gpu: 4
+
+  batch_length: 64
+
+  checkpoint_every: 500
+
+  log_every: 50
+
+  num_workers: 4
+
+  augmentation:
+
+    noise_std: 0.05
+
+    use_flip: true
+
+    use_brightness: true
+
+    brightness_std: 0.1
+
+    use_cutout: false
+
+    cutout_size: 32
+
+dataset:
+
+  segment_dir: /kaggle/input/fpv-segments
