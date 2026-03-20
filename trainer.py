@@ -1,192 +1,158 @@
+import pathlib
 import torch
+import torch.nn as nn
+import numpy as np
+from torch.utils.data import Dataset, DataLoader
 
-import tools
+
+class FPVDataset(Dataset):
+    def __init__(self, segment_dir: str, batch_length: int = 64):
+        self.files = sorted(pathlib.Path(segment_dir).glob("*.npz"))
+        self.batch_length = batch_length
+        assert len(self.files) > 0, f"Keine .npz Dateien in {segment_dir} gefunden"
+        print(f"FPVDataset: {len(self.files)} Segmente gefunden")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        data = np.load(self.files[idx])
+        frames = data["frames"]
+        T = frames.shape[0]
+        if T > self.batch_length:
+            start = np.random.randint(0, T - self.batch_length)
+            frames = frames[start : start + self.batch_length]
+        elif T < self.batch_length:
+            pad = np.zeros((self.batch_length - T, *frames.shape[1:]), dtype=np.uint8)
+            frames = np.concatenate([frames, pad], axis=0)
+        frames = torch.from_numpy(frames).float() / 255.0
+        return {"image": frames}
 
 
-class OnlineTrainer:
-    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
-        self.replay_buffer = replay_buffer
-        self.logger = logger
-        self.train_envs = train_envs
-        self.eval_envs = eval_envs
-        self.steps = int(config.steps)
-        self.pretrain = int(config.pretrain)
-        self.eval_every = int(config.eval_every)
-        self.eval_episode_num = int(config.eval_episode_num)
-        self.video_pred_log = bool(config.video_pred_log)
-        self.params_hist_log = bool(config.params_hist_log)
-        self.batch_length = int(config.batch_length)
-        batch_steps = int(config.batch_size * config.batch_length)
-        # train_ratio is based on data steps rather than environment steps.
-        self._updates_needed = tools.Every(batch_steps / config.train_ratio * config.action_repeat)
-        self._should_pretrain = tools.Once()
-        self._should_log = tools.Every(config.update_log_every)
-        self._should_eval = tools.Every(self.eval_every)
-        self._action_repeat = config.action_repeat
+class Augmentation:
+    def __init__(self, config):
+        self.noise_std      = float(config.noise_std)
+        self.use_flip       = bool(config.use_flip)
+        self.use_brightness = bool(config.use_brightness)
+        self.brightness_std = float(config.brightness_std)
+        self.use_cutout     = bool(config.use_cutout)
+        self.cutout_size    = int(config.cutout_size)
 
-    def eval(self, agent, train_step):
-        """Run evaluation episodes.
+    def __call__(self, x):
+        if self.noise_std > 0:
+            x = (x + self.noise_std * torch.randn_like(x)).clamp(0, 1)
+        if self.use_flip and torch.rand(1).item() > 0.5:
+            x = torch.flip(x, dims=[3])
+        if self.use_brightness:
+            delta = self.brightness_std * torch.randn(x.shape[0], 1, 1, 1, device=x.device)
+            x = (x + delta).clamp(0, 1)
+        if self.use_cutout:
+            B, T, H, W, C = x.shape
+            y = torch.randint(0, H - self.cutout_size, (1,)).item()
+            xc = torch.randint(0, W - self.cutout_size, (1,)).item()
+            x[:, :, y:y + self.cutout_size, xc:xc + self.cutout_size, :] = 0
+        return x
 
-        Environment stepping is executed on CPU to avoid GPU<->CPU synchronizations
-        in the worker processes. Observations are moved back to GPU asynchronously
-        (H2D with non_blocking=True) right before policy inference.
-        """
-        print("Evaluating the policy...")
-        envs = self.eval_envs
-        agent.eval()
-        # (B,)
-        done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
-        once_done = torch.zeros(envs.env_num, dtype=torch.bool, device=agent.device)
-        steps = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
-        log_metrics = {}
-        # cache is only used for video logging / open-loop prediction.
-        cache = []
-        agent_state = agent.get_initial_state(envs.env_num)
-        # (B, A)
-        act = agent_state["prev_action"].clone()
-        while not once_done.all():
-            steps += ~done * ~once_done
-            # Step environments on CPU.
-            # (B, A)
-            act_cpu = act.detach().to("cpu")
-            # (B,)
-            done_cpu = done.detach().to("cpu")
-            trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
-            # Move observations back to GPU asynchronously for the agent.
-            # dict of (B, 1, *)
-            trans = trans_cpu.to(agent.device, non_blocking=True)
-            # (B,)
-            done = done_cpu.to(agent.device)
 
-            # Store transition.
-            # We keep the observation and the action that produced it together.
-            trans["action"] = act
-            if len(cache) < self.batch_length:
-                cache.append(trans.clone())
-            # (B, A)
-            act, agent_state = agent.act(trans, agent_state, eval=True)
-            returns += trans["reward"][:, 0] * ~once_done
-            for key, value in trans.items():
-                if key.startswith("log_"):
-                    if key not in log_metrics:
-                        log_metrics[key] = torch.zeros_like(returns)
-                    log_metrics[key] += value[:, 0] * ~once_done
-            once_done |= done
-        # dict of (B, T, *)
-        cache = torch.stack(cache, dim=1) if len(cache) else None
-        self.logger.scalar("episode/eval_score", returns.mean())
-        self.logger.scalar("episode/eval_length", steps.to(torch.float32).mean())
-        for key, value in log_metrics.items():
-            if key == "log_success":
-                value = torch.clip(value, max=1.0)  # make sure 1.0 for success episode
-            self.logger.scalar(f"episode/eval_{key[4:]}", value.mean())
-        if cache is not None and "image" in cache:
-            self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
-        if self.video_pred_log and cache is not None:
-            initial = agent.get_initial_state(1)
-            self.logger.video(
-                "eval_open_loop",
-                tools.to_np(
-                    agent.video_pred(
-                        cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
-                    )
-                ),
-            )
-        self.logger.write(train_step)
-        agent.train()
+class OfflineTrainer:
+    def __init__(self, config, dataset, logger, logdir):
+        self.dataset          = dataset
+        self.logger           = logger
+        self.logdir           = pathlib.Path(logdir)
+        self.logdir.mkdir(parents=True, exist_ok=True)
+        self.steps            = int(config.steps)
+        self.batch_per_gpu    = int(config.batch_per_gpu)
+        self.checkpoint_every = int(config.checkpoint_every)
+        self.log_every        = int(config.log_every)
+        self.num_workers      = int(config.num_workers)
+        self.augmentation     = Augmentation(config.augmentation)
+
+    def _save_checkpoint(self, agent, step):
+        path = self.logdir / f"ckpt_{step:07d}.pt"
+        state = agent.module.state_dict() if isinstance(agent, nn.DataParallel) else agent.state_dict()
+        torch.save({"step": step, "model": state}, path)
+        print(f"  → Checkpoint gespeichert: {path.name}")
+
+    def load_checkpoint(self, agent, path: str):
+        ckpt = torch.load(path, map_location="cpu")
+        target = agent.module if isinstance(agent, nn.DataParallel) else agent
+        target.load_state_dict(ckpt["model"])
+        print(f"Checkpoint geladen: {path} (Step {ckpt['step']})")
+        return ckpt["step"]
+
+    def _setup_parallel(self, agent):
+        n_gpus = torch.cuda.device_count()
+        if n_gpus > 1:
+            print(f"DataParallel: {n_gpus} GPUs gefunden")
+            agent = nn.DataParallel(agent)
+        else:
+            print(f"Einzelne GPU gefunden")
+        return agent
+
+    def _compute_loss(self, agent, batch, device):
+        target = agent.module if isinstance(agent, nn.DataParallel) else agent
+        images = batch["image"].to(device, non_blocking=True)
+        aug_a = self.augmentation(images)
+        aug_b = self.augmentation(images)
+        z_a = target.encode(aug_a)
+        z_b = target.encode(aug_b)
+        loss, metrics = target.barlow_loss(z_a, z_b)
+        return loss, metrics
 
     def begin(self, agent):
-        """Main online training loop.
+        device = next(agent.parameters()).device
+        agent = self._setup_parallel(agent)
+        agent.train()
 
-        The loop is designed to overlap CPU environment stepping and GPU model
-        execution. Environments are stepped on CPU, observations are pinned,
-        then transferred to GPU with non_blocking=True.
-        """
-        envs = self.train_envs
-        video_cache = []
-        step = self.replay_buffer.count() * self._action_repeat
-        update_count = 0
-        # (B,)
-        done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
-        returns = torch.zeros(envs.env_num, dtype=torch.float32, device=agent.device)
-        lengths = torch.zeros(envs.env_num, dtype=torch.int32, device=agent.device)
-        episode_ids = torch.arange(
-            envs.env_num, dtype=torch.int32, device=agent.device
-        )  # Increment this to prevent sampling across episode boundaries
-        train_metrics = {}
-        agent_state = agent.get_initial_state(envs.env_num)
-        # (B, A)
-        act = agent_state["prev_action"].clone()
+        loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_per_gpu,
+            shuffle=True,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            persistent_workers=self.num_workers > 0,
+        )
+
+        print(f"\nStarte Offline Training")
+        print(f"  Segmente:    {len(self.dataset)}")
+        print(f"  Batch/GPU:   {self.batch_per_gpu}")
+        print(f"  Ziel-Steps:  {self.steps}")
+        print(f"  Checkpoints: alle {self.checkpoint_every} Steps\n")
+
+        target = agent.module if isinstance(agent, nn.DataParallel) else agent
+        optimizer = target.get_optimizer()
+        running_loss = 0.0
+        step = 0
+
         while step < self.steps:
-            # Evaluation
-            if self._should_eval(step) and self.eval_episode_num > 0:
-                self.eval(agent, step)
-            # Save metrics
-            if done.any():
-                for i, d in enumerate(done):
-                    if d and lengths[i] > 0:
-                        if i == 0 and len(video_cache) > 0:
-                            video = torch.stack(video_cache, axis=0)
-                            self.logger.video("train_video", tools.to_np(video[None]))
-                            video_cache = []
-                        self.logger.scalar("episode/score", returns[i])
-                        self.logger.scalar("episode/length", lengths[i])
-                        self.logger.write(step + i)  # to show all values on tensorboard
-                        returns[i] = lengths[i] = 0
-            step += int((~done).sum()) * self._action_repeat  # step is based on env side
-            lengths += ~done
+            for batch in loader:
+                if step >= self.steps:
+                    break
 
-            # Step environments on CPU to avoid GPU<->CPU sync in the worker processes.
-            # (B, A)
-            act_cpu = act.detach().to("cpu")
-            # (B,)
-            done_cpu = done.detach().to("cpu")
-            trans_cpu, done_cpu = envs.step(act_cpu, done_cpu)
+                optimizer.zero_grad()
+                loss, metrics = self._compute_loss(agent, batch, device)
+                loss.backward()
+                nn.utils.clip_grad_norm_(agent.parameters(), max_norm=100.0)
+                optimizer.step()
 
-            # Move observations back to GPU asynchronously for the agent.
-            # dict of (B, 1, *)
-            trans = trans_cpu.to(agent.device, non_blocking=True)
-            # (B,)
-            done = done_cpu.to(agent.device)
+                running_loss += loss.item()
+                step += 1
 
-            # Policy inference on GPU.
-            # "agent_state" is reset by the agent based on the "is_first" flag in trans.
-            # (B, A)
-            act, agent_state = agent.act(trans.clone(), agent_state, eval=False)
+                if step % self.log_every == 0:
+                    avg_loss = running_loss / self.log_every
+                    print(f"Step {step:6d}/{self.steps} | Loss: {avg_loss:.4f}", end="")
+                    for k, v in metrics.items():
+                        print(f" | {k}: {v:.4f}", end="")
+                    print()
+                    self.logger.scalar("train/loss", avg_loss)
+                    for k, v in metrics.items():
+                        self.logger.scalar(f"train/{k}", v)
+                    self.logger.write(step)
+                    running_loss = 0.0
 
-            # Store transition.
-            # We keep the observation and the action that produced it together.
-            # Mask actions after an episode has ended.
-            trans["action"] = act * ~done.unsqueeze(-1)
-            trans["stoch"] = agent_state["stoch"]
-            trans["deter"] = agent_state["deter"]
-            trans["episode"] = episode_ids  # Don't lift dim
-            if "image" in trans:
-                video_cache.append(trans["image"][0])
-            self.replay_buffer.add_transition(trans.detach())
-            returns += trans["reward"][:, 0]
-            # Update models after enough data has accumulated
-            if step // (envs.env_num * self._action_repeat) > self.batch_length + 1:
-                if self._should_pretrain():
-                    update_num = self.pretrain
-                else:
-                    update_num = self._updates_needed(step)
-                for _ in range(update_num):
-                    _metrics = agent.update(self.replay_buffer)
-                    train_metrics = _metrics
-                update_count += update_num
-                # Log training metrics
-                if self._should_log(step):
-                    for name, value in train_metrics.items():
-                        value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
-                        self.logger.scalar(f"train/{name}", value)
-                    self.logger.scalar("train/opt/updates", update_count)
-                    if self.video_pred_log:
-                        data, _, initial = self.replay_buffer.sample()
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
-                    if self.params_hist_log:
-                        for name, param in agent._named_params.items():
-                            self.logger.histogram(name, tools.to_np(param))
-                    self.logger.write(step, fps=True)
+                if step % self.checkpoint_every == 0:
+                    self._save_checkpoint(agent, step)
+
+        self._save_checkpoint(agent, step)
+        print(f"\nTraining abgeschlossen nach {step} Steps")
