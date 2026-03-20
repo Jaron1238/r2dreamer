@@ -8,3 +8,8 @@ depth: 32
 units: 512
 act: 'SiLU'
 norm: True
+
+
+img_height: 240
+img_width: 240
+act_dim: 4
