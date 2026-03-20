@@ -18,7 +18,7 @@ from tools import to_f32
 
 
 class Dreamer(nn.Module):
-    def __init__(self, config, obs_space, act_space):
+    def __init__(self, config):
         super().__init__()
         self.device = torch.device(config.device)
         self.act_entropy = float(config.act_entropy)
@@ -27,11 +27,13 @@ class Dreamer(nn.Module):
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
         self.return_ema = networks.ReturnEMA(device=self.device)
-        self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
+        self.act_dim = int(config.act_dim)
         self.rep_loss = str(config.rep_loss)
 
         # World model components
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+        shapes = {
+        "image": (int(config.img_height), int(config.img_width), 3)
+        }
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
         self.rssm = rssm.RSSM(
@@ -53,7 +55,6 @@ class Dreamer(nn.Module):
         else:
             config.actor.dist = config.actor.dist.cont
 
-        # Actor-critic components
         self.actor = networks.MLPHead(config.actor, self.rssm.feat_size)
         self.value = networks.MLPHead(config.critic, self.rssm.feat_size)
         self.slow_target_update = int(config.slow_target_update)
@@ -86,7 +87,6 @@ class Dreamer(nn.Module):
             self._loss_scales.update({k: recon for k in self.decoder.all_keys})
             modules.update({"decoder": self.decoder})
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
-            # add projector for latent to embedding
             self.prj = Projector(self.rssm.feat_size, self.embed_size)
             modules.update({"projector": self.prj})
             self.barlow_lambd = float(config.r2dreamer.lambd)
@@ -104,7 +104,6 @@ class Dreamer(nn.Module):
             self.aug_max_delta = float(dpc.aug.max_delta)
             self.aug_same_across_time = bool(dpc.aug.same_across_time)
             self.aug_bilinear = bool(dpc.aug.bilinear)
-
             self._prototypes = nn.Parameter(torch.randn(self.num_prototypes, self.proto_dim))
             self.obs_proj = nn.Linear(self.embed_size, self.proto_dim)
             self.feat_proj = nn.Linear(self.rssm.feat_size, self.proto_dim)
