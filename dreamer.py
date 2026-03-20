@@ -683,7 +683,38 @@ class Dreamer(nn.Module):
             "temp": temp_loss,
             "norm": norm_loss,
         }
+    def encode(self, images):
+        """Wird vom OfflineTrainer aufgerufen.
+        images: (B, T, H, W, 3) float32 in [0, 1]
+       """
+       obs = {"image": images}
+       return self.encoder(obs)
 
+    def barlow_loss(self, z_a, z_b):
+        """Barlow Twins Loss über gesammelten Batch.
+        z_a, z_b: (B*T, embed_dim)
+        """
+        N, D = z_a.shape
+
+        z_a_norm = (z_a - z_a.mean(0)) / (z_a.std(0) + 1e-8)
+        z_b_norm = (z_b - z_b.mean(0)) / (z_b.std(0) + 1e-8)
+
+        c = torch.mm(z_a_norm.T, z_b_norm) / N
+
+        invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+        off_diag_mask = ~torch.eye(D, dtype=torch.bool, device=z_a.device)
+        redundancy_loss = c[off_diag_mask].pow(2).sum()
+
+        loss = invariance_loss + self.barlow_lambd * redundancy_loss
+        metrics = {
+        "barlow/invariance": invariance_loss.item(),
+        "barlow/redundancy": redundancy_loss.item(),
+        }
+        return loss, metrics
+
+    def get_optimizer(self):
+        """Gibt den Optimizer zurück für den OfflineTrainer."""
+        return self._optimizer
     @torch.no_grad()
     def random_translate(self, x, max_delta, same_across_time=False, bilinear=False):
         B, T, C, H, W = x.shape
