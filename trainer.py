@@ -6,27 +6,72 @@ from torch.utils.data import Dataset, DataLoader
 
 
 class FPVDataset(Dataset):
-    def __init__(self, segment_dir: str, batch_length: int = 64):
-        self.files = sorted(pathlib.Path(segment_dir).glob("*.npz"))
+    def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
         self.batch_length = batch_length
-        assert len(self.files) > 0, f"Keine .npz Dateien in {segment_dir} gefunden"
-        print(f"FPVDataset: {len(self.files)} Segmente gefunden")
+        self.require_osd  = require_osd
+        self.mode         = str(config.mode)
+        self.ds           = None
+
+        if self.mode == "local":
+            self.files = sorted(pathlib.Path(config.segment_dir).glob("*.npz"))
+            if require_osd:
+                self.files = [f for f in self.files if "osd" in f.name]
+            assert len(self.files) > 0, f"Keine .npz Dateien in {config.segment_dir} gefunden"
+            print(f"FPVDataset (local): {len(self.files)} Segmente")
+
+        elif self.mode == "streaming":
+            from datasets import load_dataset
+            self.ds = load_dataset(config.hf_repo, streaming=True, split="train")
+            if require_osd:
+                self.ds = self.ds.filter(lambda x: x["has_osd"])
+            if config.shuffle_buffer > 0:
+                self.ds = self.ds.shuffle(seed=42, buffer_size=config.shuffle_buffer)
+            self.stream = iter(self.ds)
+            print(f"FPVDataset (streaming): {config.hf_repo} | buffer: {config.shuffle_buffer}")
 
     def __len__(self):
-        return len(self.files)
+        if self.mode == "local":
+            return len(self.files)
+        return int(1e9)
 
-    def __getitem__(self, idx):
-        data = np.load(self.files[idx])
-        frames = data["frames"]
+    def _next_stream(self):
+        try:
+            return next(self.stream)
+        except StopIteration:
+            self.stream = iter(self.ds)
+            return next(self.stream)
+
+    def _process_frames(self, frames):
         T = frames.shape[0]
         if T > self.batch_length:
-            start = np.random.randint(0, T - self.batch_length)
+            start  = np.random.randint(0, T - self.batch_length)
             frames = frames[start : start + self.batch_length]
         elif T < self.batch_length:
-            pad = np.zeros((self.batch_length - T, *frames.shape[1:]), dtype=np.uint8)
+            pad    = np.zeros((self.batch_length - T, *frames.shape[1:]), dtype=np.uint8)
             frames = np.concatenate([frames, pad], axis=0)
-        frames = torch.from_numpy(frames).float() / 255.0
-        return {"image": frames}
+
+        frames   = torch.from_numpy(frames).float() / 255.0  # (T, H, W, 3)
+
+        diff     = torch.zeros_like(frames)
+        diff[1:] = frames[1:] - frames[:-1]
+
+        frames_6ch = torch.cat([frames, diff], dim=-1)        # (T, H, W, 6)
+
+        is_first    = torch.zeros(self.batch_length, dtype=torch.bool)
+        is_first[0] = True
+
+        return frames_6ch, is_first
+
+    def __getitem__(self, idx):
+        if self.mode == "local":
+            data   = np.load(self.files[idx])
+            frames = data["frames"]
+        elif self.mode == "streaming":
+            sample = self._next_stream()
+            frames = np.array(sample["frames"], dtype=np.uint8)
+
+        frames, is_first = self._process_frames(frames)
+        return {"image": frames, "is_first": is_first}
 
 
 class Augmentation:
@@ -48,7 +93,7 @@ class Augmentation:
             x = (x + delta).clamp(0, 1)
         if self.use_cutout:
             B, T, H, W, C = x.shape
-            y = torch.randint(0, H - self.cutout_size, (1,)).item()
+            y  = torch.randint(0, H - self.cutout_size, (1,)).item()
             xc = torch.randint(0, W - self.cutout_size, (1,)).item()
             x[:, :, y:y + self.cutout_size, xc:xc + self.cutout_size, :] = 0
         return x
@@ -68,13 +113,13 @@ class OfflineTrainer:
         self.augmentation     = Augmentation(config.augmentation)
 
     def _save_checkpoint(self, agent, step):
-        path = self.logdir / f"ckpt_{step:07d}.pt"
+        path  = self.logdir / f"ckpt_{step:07d}.pt"
         state = agent.module.state_dict() if isinstance(agent, nn.DataParallel) else agent.state_dict()
         torch.save({"step": step, "model": state}, path)
         print(f"  → Checkpoint gespeichert: {path.name}")
 
     def load_checkpoint(self, agent, path: str):
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt   = torch.load(path, map_location="cpu")
         target = agent.module if isinstance(agent, nn.DataParallel) else agent
         target.load_state_dict(ckpt["model"])
         print(f"Checkpoint geladen: {path} (Step {ckpt['step']})")
@@ -92,38 +137,39 @@ class OfflineTrainer:
     def _compute_loss(self, agent, batch, device):
         target = agent.module if isinstance(agent, nn.DataParallel) else agent
         images = batch["image"].to(device, non_blocking=True)
-        aug_a = self.augmentation(images)
-        aug_b = self.augmentation(images)
-        z_a = target.encode(aug_a)
-        z_b = target.encode(aug_b)
+        aug_a  = self.augmentation(images)
+        aug_b  = self.augmentation(images)
+        z_a    = target.encode(aug_a)
+        z_b    = target.encode(aug_b)
         loss, metrics = target.barlow_loss(z_a, z_b)
         return loss, metrics
 
     def begin(self, agent):
-        device = next(agent.parameters()).device
-        agent = self._setup_parallel(agent)
+        device    = next(agent.parameters()).device
+        is_stream = self.dataset.mode == "streaming"
+        agent     = self._setup_parallel(agent)
         agent.train()
 
         loader = DataLoader(
             self.dataset,
-            batch_size=self.batch_per_gpu,
-            shuffle=True,
-            num_workers=self.num_workers,
-            pin_memory=True,
-            drop_last=True,
-            persistent_workers=self.num_workers > 0,
+            batch_size         = self.batch_per_gpu,
+            shuffle            = not is_stream,
+            num_workers        = 0 if is_stream else self.num_workers,
+            pin_memory         = True,
+            drop_last          = True,
+            persistent_workers = (not is_stream) and self.num_workers > 0,
         )
 
         print(f"\nStarte Offline Training")
-        print(f"  Segmente:    {len(self.dataset)}")
+        print(f"  Modus:       {self.dataset.mode}")
         print(f"  Batch/GPU:   {self.batch_per_gpu}")
         print(f"  Ziel-Steps:  {self.steps}")
         print(f"  Checkpoints: alle {self.checkpoint_every} Steps\n")
 
-        target = agent.module if isinstance(agent, nn.DataParallel) else agent
-        optimizer = target.get_optimizer()
+        target       = agent.module if isinstance(agent, nn.DataParallel) else agent
+        optimizer    = target.get_optimizer()
         running_loss = 0.0
-        step = 0
+        step         = 0
 
         while step < self.steps:
             for batch in loader:
@@ -137,7 +183,7 @@ class OfflineTrainer:
                 optimizer.step()
 
                 running_loss += loss.item()
-                step += 1
+                step         += 1
 
                 if step % self.log_every == 0:
                     avg_loss = running_loss / self.log_every
