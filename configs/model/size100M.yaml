@@ -10,7 +10,7 @@ units: 768
 act: 'SiLU'
 norm: True
 
-# WICHTIGE ANPASSUNGEN:
+
 img_height: 1024
 img_width: 720  
 act_dim: 4      
