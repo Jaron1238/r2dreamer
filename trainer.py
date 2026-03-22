@@ -5,74 +5,55 @@ import numpy as np
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
 
-class FPVDataset(Dataset):
+class FPVDataset(IterableDataset):
     def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
+        super().__init__()
         self.batch_length = batch_length
         self.require_osd  = require_osd
-        self.mode         = str(config.mode)
-        self.ds           = None
+        from datasets import load_dataset
+        self.ds = load_dataset(config.dataset.hf_repo, streaming=True, split="train")
+        if self.require_osd:
+            self.ds = self.ds.filter(lambda x: x.get("has_osd", False))
+        shuffle_buffer = int(getattr(config.dataset, "shuffle_buffer", 1000))
+        if shuffle_buffer > 0:
+            self.ds = self.ds.shuffle(seed=42, buffer_size=shuffle_buffer)
+            
+        print(f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | OSD-Pflicht: {self.require_osd}")
 
-        if self.mode == "local":
-            self.files = sorted(pathlib.Path(config.segment_dir).glob("*.npz"))
-            if require_osd:
-                self.files = [f for f in self.files if "osd" in f.name]
-            assert len(self.files) > 0, f"Keine .npz Dateien in {config.segment_dir} gefunden"
-            print(f"FPVDataset (local): {len(self.files)} Segmente")
+    def __iter__(self):
+        for sample in self.ds:
+            frames = torch.from_numpy(np.array(sample["frames"])).float() / 255.0
+            T = frames.shape[0]
+            start = 0
+            if T > self.batch_length:
+                start = torch.randint(0, T - self.batch_length, (1,)).item()
+                frames = frames[start : start + self.batch_length]
+            elif T < self.batch_length:
+                continue
+            diff = torch.zeros_like(frames)
+            diff[1:] = frames[1:] - frames[:-1]
+            frames_6ch = torch.cat([frames, diff], dim=-1)
+            is_first = torch.zeros(self.batch_length, dtype=torch.bool)
+            is_first[0] = True
 
-        elif self.mode == "streaming":
-            from datasets import load_dataset
-            self.ds = load_dataset(config.hf_repo, streaming=True, split="train")
-            if require_osd:
-                self.ds = self.ds.filter(lambda x: x["has_osd"])
-            if config.shuffle_buffer > 0:
-                self.ds = self.ds.shuffle(seed=42, buffer_size=config.shuffle_buffer)
-            self.stream = iter(self.ds)
-            print(f"FPVDataset (streaming): {config.hf_repo} | buffer: {config.shuffle_buffer}")
 
-    def __len__(self):
-        if self.mode == "local":
-            return len(self.files)
-        return int(1e9)
+            if self.require_osd and sample.get("has_osd", False):
 
-    def _next_stream(self):
-        try:
-            return next(self.stream)
-        except StopIteration:
-            self.stream = iter(self.ds)
-            return next(self.stream)
+                actions = torch.tensor(sample["actions"], dtype=torch.float32)[start : start + self.batch_length]
+                
 
-    def _process_frames(self, frames):
-        T = frames.shape[0]
-        if T > self.batch_length:
-            start  = np.random.randint(0, T - self.batch_length)
-            frames = frames[start : start + self.batch_length]
-        elif T < self.batch_length:
-            pad    = np.zeros((self.batch_length - T, *frames.shape[1:]), dtype=np.uint8)
-            frames = np.concatenate([frames, pad], axis=0)
+                if actions.shape[0] < self.batch_length:
+                    pad_act = torch.zeros((self.batch_length - actions.shape[0], 4), dtype=torch.float32)
+                    actions = torch.cat([actions, pad_act], dim=0)
+            else:
+                actions = torch.zeros((self.batch_length, 4), dtype=torch.float32)
 
-        frames   = torch.from_numpy(frames).float() / 255.0  # (T, H, W, 3)
-
-        diff     = torch.zeros_like(frames)
-        diff[1:] = frames[1:] - frames[:-1]
-
-        frames_6ch = torch.cat([frames, diff], dim=-1)        # (T, H, W, 6)
-
-        is_first    = torch.zeros(self.batch_length, dtype=torch.bool)
-        is_first[0] = True
-
-        return frames_6ch, is_first
-
-    def __getitem__(self, idx):
-        if self.mode == "local":
-            data   = np.load(self.files[idx])
-            frames = data["frames"]
-        elif self.mode == "streaming":
-            sample = self._next_stream()
-            frames = np.array(sample["frames"], dtype=np.uint8)
-
-        frames, is_first = self._process_frames(frames)
-        return {"image": frames, "is_first": is_first}
-
+            yield {
+                "image": frames_6ch,
+                "is_first": is_first,
+                "action": actions,
+                "drone_id": torch.tensor(sample["drone_id"], dtype=torch.long)
+            }
 
 class Augmentation:
     def __init__(self, config):
@@ -101,63 +82,58 @@ class Augmentation:
 
 class OfflineTrainer:
     def __init__(self, config, dataset, logger, logdir):
-        self.dataset          = dataset
-        self.logger           = logger
-        self.logdir           = pathlib.Path(logdir)
+        self.dataset = dataset
+        self.logger = logger
+        self.logdir = pathlib.Path(logdir)
         self.logdir.mkdir(parents=True, exist_ok=True)
-        self.steps            = int(config.steps)
-        self.batch_per_gpu    = int(config.batch_per_gpu)
+        self.steps = int(config.steps)
+        self.batch_per_gpu = int(config.batch_per_gpu)
         self.checkpoint_every = int(config.checkpoint_every)
-        self.log_every        = int(config.log_every)
-        self.num_workers      = int(config.num_workers)
-        self.augmentation     = Augmentation(config.augmentation)
+        self.log_every = int(config.log_every)
+        self.num_workers = int(config.num_workers)
+        self.augmentation = Augmentation(config.augmentation)
         self.accumulation_steps = config.get("accumulation_steps", 8)
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.accumulation_steps,
-            mixed_precision="fp16" 
+            mixed_precision="fp16"
         )
-    def _save_checkpoint(self, agent, step):
-        path  = self.logdir / f"ckpt_{step:07d}.pt"
-        self.accelerator.save_state(output_dir=ckpt_dir)
-        self.accelerator.print(f"  → Checkpoint gespeichert: {ckpt_dir.name}")
-    def load_checkpoint(self, agent, path: str):
-        self.accelerator.load_state(path)
-        self.accelerator.print(f"Checkpoint geladen: {path}")
 
+    def _save_checkpoint(self, step):
+        ckpt_path = self.logdir / f"checkpoint-{step:07d}"
+        self.accelerator.save_state(output_dir=str(ckpt_path))
+        self.accelerator.print(f"Checkpoint: {ckpt_path.name}")
+
+    def load_checkpoint(self, path):
+        self.accelerator.load_state(path)
+        self.accelerator.print(f"Loaded: {path}")
 
     def _compute_loss(self, agent, batch):
-        images = batch["image"] 
-        aug_a  = self.augmentation(images)
-        aug_b  = self.augmentation(images)
-        z_a    = agent.encode(aug_a)
-        z_b    = agent.encode(aug_b)
-        loss, metrics = agent.barlow_loss(z_a, z_b)
+        data = {
+            "image": batch["image"],
+            "is_first": batch["is_first"],
+            "action": batch["action"],
+            "drone_id": batch["drone_id"]
+        }
+        post, metrics = agent._cal_grad(data, initial=None)
+        loss = metrics.pop("opt/loss")
         return loss, metrics
-    def begin(self, agent):
-        device    = next(agent.parameters()).device
-        is_stream = self.dataset.mode == "streaming"
-        optimizer = agent.get_optimizer()
-        
 
+    def begin(self, agent):
+        is_stream = (self.dataset.mode == "streaming")
         loader = DataLoader(
             self.dataset,
-            batch_size         = self.batch_per_gpu,
-            shuffle            = not is_stream,
-            num_workers        = 0 if is_stream else self.num_workers,
-            pin_memory         = True,
-            drop_last          = True,
-            persistent_workers = (not is_stream) and self.num_workers > 0,
+            batch_size=self.batch_per_gpu,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=True,
+            drop_last=True
         )
-        agent, optimizer, loader = self.accelerator.prepare(
-            agent, optimizer, loader
-        )
-        
+        optimizer = agent.get_optimizer()
+        agent, optimizer, loader = self.accelerator.prepare(agent, optimizer, loader)
         agent.train()
-        self.accelerator.print(f"\nStarte Offline Training (Accelerate DDP)")
-        self.accelerator.print(f"  Modus:       {self.dataset.mode}")
-        self.accelerator.print(f"  Batch/GPU:   {self.batch_per_gpu}")
-        self.accelerator.print(f"  Accumulation:{self.accumulation_steps} Steps")
-        self.accelerator.print(f"  Checkpoints: alle {self.checkpoint_every} Steps\n")
+        
+        self.accelerator.print(f"Start Training | Processes: {self.accelerator.num_processes}")
+        
         running_loss = 0.0
         step = 0
 
@@ -169,7 +145,7 @@ class OfflineTrainer:
                 with self.accelerator.accumulate(agent):
                     loss, metrics = self._compute_loss(agent, batch)
                     self.accelerator.backward(loss)
-
+                    
                     if self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
 
@@ -183,7 +159,7 @@ class OfflineTrainer:
                         loss_tensor = torch.tensor(running_loss, device=self.accelerator.device)
                         avg_loss = self.accelerator.gather_for_metrics(loss_tensor).sum().item() / self.log_every
                         
-                        self.accelerator.print(f"Step {step:6d}/{self.steps} | Loss: {avg_loss:.4f}")
+                        self.accelerator.print(f"Step {step:6d} | Loss: {avg_loss:.4f}")
 
                         if self.accelerator.is_main_process:
                             self.logger.scalar("train/loss", avg_loss)
