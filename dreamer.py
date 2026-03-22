@@ -55,7 +55,8 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(config.loss_scales)
         self._log_grads   = bool(config.log_grads)
-
+        self.num_drones = int(config.get("num_drone_classes", 10))
+        self.drone_embed = nn.Embedding(self.num_drones, 16)
         modules = {
             "rssm":    self.rssm,
             "actor":   self.actor,
@@ -63,6 +64,7 @@ class Dreamer(nn.Module):
             "reward":  self.reward,
             "cont":    self.cont,
             "encoder": self.encoder,
+            "drone_embed": self.drone_embed, 
         }
 
         if self.rep_loss == "dreamer":
@@ -253,6 +255,14 @@ class Dreamer(nn.Module):
             assert name_orig == name_new
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
+        
+        self._frozen_drone_embed = copy.deepcopy(self.drone_embed)
+        for (name_orig, param_orig), (name_new, param_new) in zip(
+            self.drone_embed.named_parameters(), self._frozen_drone_embed.named_parameters()
+        ):
+            assert name_orig == name_new
+            param_new.data = param_orig.data
+            param_new.requires_grad_(False)
 
     def to(self, *args, **kwargs):
         super().to(*args, **kwargs)
@@ -353,10 +363,10 @@ class Dreamer(nn.Module):
         losses  = {}
         metrics = {}
         B, T    = data.shape
-
-        embed                              = self.encoder(data)
+        embed = self.encoder(data)
+        d_emb = self.drone_embed(data["drone_id"])
         post_stoch, post_deter, post_logit = self.rssm.observe(
-            embed, data["action"], initial, data["is_first"]
+            embed, data["action"], initial, data["is_first"], d_emb
         )
         _, prior_logit    = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
@@ -418,9 +428,10 @@ class Dreamer(nn.Module):
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
             post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
         )
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+        d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0) 
+        
+        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-
         imag_reward     = self._frozen_reward(imag_feat).mode()
         imag_cont       = self._frozen_cont(imag_feat).mean
         imag_value      = self._frozen_value(imag_feat).mode()
@@ -493,7 +504,7 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon):
+    def _imagine(self, start, imag_horizon, d_emb):
         feats   = []
         actions = []
         stoch, deter = start
@@ -502,7 +513,7 @@ class Dreamer(nn.Module):
             action = self._frozen_actor(feat).rsample()
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action)
+            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action, d_emb)
         return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
 
     @torch.no_grad()
