@@ -20,12 +20,11 @@ class Deter(nn.Module):
             nn.Linear(stoch, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
         )
         self._dyn_in2 = nn.Sequential(
-            nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
-        )
+            nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act())
 
         self._dyn_in3 = nn.Sequential(
-            nn.Linear(16, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
-        )
+            nn.Linear(16, hidden), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()) 
+
         
         self._dyn_hid = nn.Sequential()
 
