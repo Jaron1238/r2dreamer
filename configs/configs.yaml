@@ -1,6 +1,5 @@
 defaults:
-  - env: dmc_vision
-  - model: size12M
+  - model: size100M
   # Disable Hydra's Python logging-to-file (train.log)
   - override hydra/job_logging: disabled
   - _self_
@@ -25,33 +24,22 @@ buffer:
   storage_device: 'cuda:0'
 
 trainer:
-
   steps: 100000
-
   batch_per_gpu: 4
-
   batch_length: 64
-
   checkpoint_every: 500
-
   log_every: 50
-
   num_workers: 4
-
   augmentation:
-
     noise_std: 0.05
-
     use_flip: true
-
     use_brightness: true
-
     brightness_std: 0.1
-
     use_cutout: false
-
     cutout_size: 32
 
 dataset:
 
-  segment_dir: /kaggle/input/fpv-segments
+  mode: 'streaming'
+  hf_repo: 'dein_benutzername/dein_fpv_dataset' # Hier den Pfad zu deinem HF-Dataset einfügen
+  shuffle_buffer: 10000 
