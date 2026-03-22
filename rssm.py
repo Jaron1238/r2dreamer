@@ -22,8 +22,14 @@ class Deter(nn.Module):
         self._dyn_in2 = nn.Sequential(
             nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
         )
+
+        self._dyn_in3 = nn.Sequential(
+            nn.Linear(16, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()
+        )
+        
         self._dyn_hid = nn.Sequential()
-        in_ch = (3 * hidden + deter // self.blocks) * self.blocks
+
+        in_ch = (4 * hidden + deter // self.blocks) * self.blocks
         for i in range(self.dynlayers):
             self._dyn_hid.add_module(f"dyn_hid_{i}", BlockLinear(in_ch, deter, self.blocks))
             self._dyn_hid.add_module(f"norm_{i}", nn.RMSNorm(deter, eps=1e-04, dtype=torch.float32))
@@ -33,45 +39,31 @@ class Deter(nn.Module):
         self.flat2group = lambda x: x.reshape(*x.shape[:-1], self.blocks, -1)
         self.group2flat = lambda x: x.reshape(*x.shape[:-2], -1)
 
-    def forward(self, stoch, deter, action):
-        """Deterministic state transition (block-GRU style)."""
-        # (B, S, K), (B, D), (B, A)
-        B = action.shape[0]
 
-        # Flatten stochastic state and normalize action magnitude.
-        # (B, S*K)
+    def forward(self, stoch, deter, action, d_emb):
+        B = action.shape[0]
         stoch = stoch.reshape(B, -1)
         action = action / torch.clip(torch.abs(action), min=1.0).detach()
-        # (B, U)
+        
         x0 = self._dyn_in0(deter)
         x1 = self._dyn_in1(stoch)
         x2 = self._dyn_in2(action)
+        x3 = self._dyn_in3(d_emb) 
 
-        # Concatenate projected inputs and broadcast over blocks.
-        # (B, 3*U)
-        x = torch.cat([x0, x1, x2], -1)
-        # (B, G, 3*U)
+
+        x = torch.cat([x0, x1, x2, x3], -1)
         x = x.unsqueeze(-2).expand(-1, self.blocks, -1)
 
-        # Combine per-block deterministic state with per-block inputs.
-        # (B, G, D/G + 3*U) -> (B, D + 3*U*G)
         x = self.group2flat(torch.cat([self.flat2group(deter), x], -1))
-
-        # (B, D)
         x = self._dyn_hid(x)
-        # (B, 3*D)
         x = self._dyn_gru(x)
 
-        # Split GRU-style gates block-wise.
-        # (B, G, 3*D/G)
         gates = torch.chunk(self.flat2group(x), 3, dim=-1)
-
-        # (B, D)
         reset, cand, update = (self.group2flat(x) for x in gates)
         reset = torch.sigmoid(reset)
         cand = torch.tanh(reset * cand)
         update = torch.sigmoid(update - 1)
-        # (B, D)
+        
         return update * cand + (1 - update) * deter
 
 
