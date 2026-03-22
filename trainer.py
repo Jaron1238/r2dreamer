@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-
+from accelerate import Accelerator
 
 class FPVDataset(Dataset):
     def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
@@ -111,44 +111,33 @@ class OfflineTrainer:
         self.log_every        = int(config.log_every)
         self.num_workers      = int(config.num_workers)
         self.augmentation     = Augmentation(config.augmentation)
-
+        self.accumulation_steps = config.get("accumulation_steps", 8)
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=self.accumulation_steps,
+            mixed_precision="fp16" 
+        )
     def _save_checkpoint(self, agent, step):
         path  = self.logdir / f"ckpt_{step:07d}.pt"
-        state = agent.module.state_dict() if isinstance(agent, nn.DataParallel) else agent.state_dict()
-        torch.save({"step": step, "model": state}, path)
-        print(f"  → Checkpoint gespeichert: {path.name}")
-
+        self.accelerator.save_state(output_dir=ckpt_dir)
+        self.accelerator.print(f"  → Checkpoint gespeichert: {ckpt_dir.name}")
     def load_checkpoint(self, agent, path: str):
-        ckpt   = torch.load(path, map_location="cpu")
-        target = agent.module if isinstance(agent, nn.DataParallel) else agent
-        target.load_state_dict(ckpt["model"])
-        print(f"Checkpoint geladen: {path} (Step {ckpt['step']})")
-        return ckpt["step"]
+        self.accelerator.load_state(path)
+        self.accelerator.print(f"Checkpoint geladen: {path}")
 
-    def _setup_parallel(self, agent):
-        n_gpus = torch.cuda.device_count()
-        if n_gpus > 1:
-            print(f"DataParallel: {n_gpus} GPUs gefunden")
-            agent = nn.DataParallel(agent)
-        else:
-            print(f"Einzelne GPU gefunden")
-        return agent
 
-    def _compute_loss(self, agent, batch, device):
-        target = agent.module if isinstance(agent, nn.DataParallel) else agent
-        images = batch["image"].to(device, non_blocking=True)
+    def _compute_loss(self, agent, batch):
+        images = batch["image"] 
         aug_a  = self.augmentation(images)
         aug_b  = self.augmentation(images)
-        z_a    = target.encode(aug_a)
-        z_b    = target.encode(aug_b)
-        loss, metrics = target.barlow_loss(z_a, z_b)
+        z_a    = agent.encode(aug_a)
+        z_b    = agent.encode(aug_b)
+        loss, metrics = agent.barlow_loss(z_a, z_b)
         return loss, metrics
-
     def begin(self, agent):
         device    = next(agent.parameters()).device
         is_stream = self.dataset.mode == "streaming"
-        agent     = self._setup_parallel(agent)
-        agent.train()
+        optimizer = agent.get_optimizer()
+        
 
         loader = DataLoader(
             self.dataset,
@@ -159,46 +148,59 @@ class OfflineTrainer:
             drop_last          = True,
             persistent_workers = (not is_stream) and self.num_workers > 0,
         )
-
-        print(f"\nStarte Offline Training")
-        print(f"  Modus:       {self.dataset.mode}")
-        print(f"  Batch/GPU:   {self.batch_per_gpu}")
-        print(f"  Ziel-Steps:  {self.steps}")
-        print(f"  Checkpoints: alle {self.checkpoint_every} Steps\n")
-
-        target       = agent.module if isinstance(agent, nn.DataParallel) else agent
-        optimizer    = target.get_optimizer()
+        agent, optimizer, loader = self.accelerator.prepare(
+            agent, optimizer, loader
+        )
+        
+        agent.train()
+        self.accelerator.print(f"\nStarte Offline Training (Accelerate DDP)")
+        self.accelerator.print(f"  Modus:       {self.dataset.mode}")
+        self.accelerator.print(f"  Batch/GPU:   {self.batch_per_gpu}")
+        self.accelerator.print(f"  Accumulation:{self.accumulation_steps} Steps")
+        self.accelerator.print(f"  Checkpoints: alle {self.checkpoint_every} Steps\n")
         running_loss = 0.0
-        step         = 0
+        step = 0
 
         while step < self.steps:
             for batch in loader:
                 if step >= self.steps:
                     break
 
-                optimizer.zero_grad()
-                loss, metrics = self._compute_loss(agent, batch, device)
-                loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), max_norm=100.0)
-                optimizer.step()
+                with self.accelerator.accumulate(agent):
+                    loss, metrics = self._compute_loss(agent, batch)
+                    self.accelerator.backward(loss)
 
-                running_loss += loss.item()
-                step         += 1
+                    if self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
 
-                if step % self.log_every == 0:
-                    avg_loss = running_loss / self.log_every
-                    print(f"Step {step:6d}/{self.steps} | Loss: {avg_loss:.4f}", end="")
-                    for k, v in metrics.items():
-                        print(f" | {k}: {v:.4f}", end="")
-                    print()
-                    self.logger.scalar("train/loss", avg_loss)
-                    for k, v in metrics.items():
-                        self.logger.scalar(f"train/{k}", v)
-                    self.logger.write(step)
-                    running_loss = 0.0
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                    running_loss += loss.detach().item()
+                    step += 1
+
+                    if step % self.log_every == 0:
+                        loss_tensor = torch.tensor(running_loss, device=self.accelerator.device)
+                        avg_loss = self.accelerator.gather_for_metrics(loss_tensor).sum().item() / self.log_every
+                        
+                        self.accelerator.print(f"Step {step:6d}/{self.steps} | Loss: {avg_loss:.4f}")
+
+                        if self.accelerator.is_main_process:
+                            self.logger.scalar("train/loss", avg_loss)
+                            for k, v in metrics.items():
+                                val = v.item() if hasattr(v, 'item') else v
+                                self.logger.scalar(f"train/{k}", val)
+                            self.logger.write(step)
+
+                        running_loss = 0.0
 
                 if step % self.checkpoint_every == 0:
-                    self._save_checkpoint(agent, step)
+                    self.accelerator.wait_for_everyone()
+                    if self.accelerator.is_main_process:
+                        self._save_checkpoint(step)
 
-        self._save_checkpoint(agent, step)
-        print(f"\nTraining abgeschlossen nach {step} Steps")
+        self.accelerator.wait_for_everyone()
+        if self.accelerator.is_main_process:
+            self._save_checkpoint(step)
+        
+
