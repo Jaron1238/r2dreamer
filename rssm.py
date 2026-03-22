@@ -129,54 +129,36 @@ class RSSM(nn.Module):
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
 
-    def observe(self, embed, action, initial, reset):
-        """Posterior rollout using observations."""
-        # (B, T, E), (B, T, A), ((B, S, K), (B, D)) (B, T)
+    def observe(self, embed, action, initial, reset, d_emb):
         L = action.shape[1]
         stoch, deter = initial
-        stochs, deters, logits = [], [], []
+        stochs, deters, logits = [], [],[]
         for i in range(L):
-            # (B, S, K), (B, D), (B, S, K)
-            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i])
+            stoch, deter, logit = self.obs_step(stoch, deter, action[:, i], embed[:, i], reset[:, i], d_emb[:, i])
             stochs.append(stoch)
             deters.append(deter)
             logits.append(logit)
-        # (B, T, S, K), (B, T, D), (B, T, S, K)
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
         logits = torch.stack(logits, dim=1)
         return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset):
-        """Single posterior step."""
-        # (B, S, K), (B, D), (B, A), (B, E), (B,)
+    def obs_step(self, stoch, deter, prev_action, embed, reset, d_emb):
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
-        prev_action = torch.where(
-            rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action
-        )
+        prev_action = torch.where(rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action)
 
-        # Deterministic transition then posterior logits conditioned on embed.
-        # (B, D)
-        deter = self._deter_net(stoch, deter, prev_action)
-        # (B, D + E)
+        deter = self._deter_net(stoch, deter, prev_action, d_emb)
         x = torch.cat([deter, embed], dim=-1)
-        # (B, S, K)
         logit = self._obs_net(x)
-
-        # Sample discrete stochastic state via straight-through Gumbel-Softmax.
-        # (B, S, K)
         stoch = self.get_dist(logit).rsample()
         return stoch, deter, logit
 
-    def img_step(self, stoch, deter, prev_action):
-        """Single prior step (no observation)."""
-
-        # (B, D)
-        deter = self._deter_net(stoch, deter, prev_action)
-        # (B, S, K)
+    def img_step(self, stoch, deter, prev_action, d_emb):
+        deter = self._deter_net(stoch, deter, prev_action, d_emb)
         stoch, _ = self.prior(deter)
         return stoch, deter
+        
 
     def prior(self, deter):
         """Compute prior distribution parameters and sample stoch."""
