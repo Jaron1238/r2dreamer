@@ -17,6 +17,9 @@ from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
 
+_DEFAULT = object()
+
+
 class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -143,13 +146,14 @@ class Dreamer(nn.Module):
                 return min(1.0, (step + 1) / config.warmup)
             return 1.0
 
-        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+        self._lr_lambda = lr_lambda
+        self._scheduler = self.build_scheduler(self._optimizer)
 
         self.train()
         self.clone_and_freeze()
         if config.compile:
-            print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+            print("Compiling loss computation with torch.compile...")
+            self.compute_losses = torch.compile(self.compute_losses, mode="reduce-overhead")
 
     def encode(self, images):
         obs = {"image": images}
@@ -322,6 +326,93 @@ class Dreamer(nn.Module):
         error = (model - truth + 1.0) / 2.0
         return torch.cat([truth, model, error], 2)
 
+    def build_scheduler(self, optimizer):
+        return LambdaLR(optimizer, lr_lambda=self._lr_lambda)
+
+    def _optimizer_params(self, optimizer):
+        return [param for group in optimizer.param_groups for param in group["params"] if param is not None]
+
+    def train_step(
+        self,
+        data,
+        initial=None,
+        *,
+        optimizer=_DEFAULT,
+        scheduler=_DEFAULT,
+        scaler=_DEFAULT,
+        backward_fn=None,
+        clip_grad_fn=None,
+        grad_params=None,
+        zero_grad_kwargs=None,
+        autocast_enabled=True,
+        post_backward_hook=None,
+    ):
+        if optimizer is _DEFAULT:
+            optimizer = self._optimizer
+        if scheduler is _DEFAULT:
+            scheduler = self._scheduler
+        if scaler is _DEFAULT:
+            scaler = self._scaler
+        zero_grad_kwargs = zero_grad_kwargs or {"set_to_none": True}
+        grad_params = list(grad_params) if grad_params is not None else self._optimizer_params(optimizer)
+
+        metrics = {}
+        old_params = None
+        if self._log_grads:
+            old_params = [param.data.clone().detach() for param in grad_params]
+
+        autocast_context = autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=autocast_enabled,
+        )
+        with autocast_context:
+            (stoch, deter), loss, mets = self.compute_losses(data, initial)
+
+        if backward_fn is not None:
+            backward_fn(loss)
+        elif scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+
+        if post_backward_hook is not None:
+            post_backward_hook()
+
+        if self._log_grads:
+            grads = [param.grad for param in grad_params if param.grad is not None]
+            if grads:
+                mets["opt/grad_norm"] = tools.compute_global_norm(grads)
+                mets["opt/grad_rms"] = tools.compute_rms(grads)
+
+        self._agc(grad_params)
+        if clip_grad_fn is not None:
+            clip_grad_fn(grad_params)
+
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+            mets["opt/grad_scale"] = scaler.get_scale()
+        else:
+            optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
+            mets["opt/lr"] = scheduler.get_last_lr()[0]
+
+        self.zero_grad(**zero_grad_kwargs)
+
+        if self._log_grads and old_params is not None:
+            updates = [new.detach() - old for new, old in zip(grad_params, old_params)]
+            mets["opt/param_rms"] = tools.compute_rms(grad_params)
+            mets["opt/update_rms"] = tools.compute_rms(updates)
+
+        metrics.update(mets)
+        return (stoch, deter), metrics
+
     def update(self, replay_buffer):
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
@@ -329,37 +420,28 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
-        metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
-        self._scaler.unscale_(self._optimizer)
-        if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
-            self._prototypes.grad.zero_()
-        if self._log_grads:
-            old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads      = [p.grad for p in self._named_params.values() if p.grad is not None]
-            grad_norm  = tools.compute_global_norm(grads)
-            grad_rms   = tools.compute_rms(grads)
-            mets["opt/grad_norm"] = grad_norm
-            mets["opt/grad_rms"]  = grad_rms
-        self._agc(self._named_params.values())
-        self._scaler.step(self._optimizer)
-        self._scaler.update()
-        self._scheduler.step()
-        self._optimizer.zero_grad(set_to_none=True)
-        mets["opt/lr"]         = self._scheduler.get_lr()[0]
-        mets["opt/grad_scale"] = self._scaler.get_scale()
-        if self._log_grads:
-            updates    = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
-            update_rms = tools.compute_rms(updates)
-            params_rms = tools.compute_rms(self._named_params.values())
-            mets["opt/param_rms"]  = params_rms
-            mets["opt/update_rms"] = update_rms
-        metrics.update(mets)
+
+        def post_backward_hook():
+            if (
+                self.rep_loss == "dreamerpro"
+                and self._ema_updates < self.freeze_prototypes_iters
+                and self._prototypes.grad is not None
+            ):
+                self._prototypes.grad.zero_()
+
+        (stoch, deter), metrics = self.train_step(
+            p_data,
+            initial,
+            optimizer=self._optimizer,
+            scheduler=self._scheduler,
+            scaler=self._scaler,
+            zero_grad_kwargs={"set_to_none": True},
+            post_backward_hook=post_backward_hook,
+        )
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial):
+    def compute_losses(self, data, initial):
         losses  = {}
         metrics = {}
         B, T    = data.shape
@@ -500,10 +582,9 @@ class Dreamer(nn.Module):
         metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
-        return (post_stoch, post_deter), metrics
+        return (post_stoch, post_deter), total_loss, metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, d_emb):
