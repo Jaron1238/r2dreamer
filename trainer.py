@@ -115,9 +115,9 @@ class OfflineTrainer:
         self.accelerator.load_state(path)
         self.accelerator.print(f"Loaded: {path}")
 
-    def _compute_loss(self, agent, batch):
+    def _build_batch(self, batch):
         batch_size, time_steps = batch["image"].shape[:2]
-        data = TensorDict(
+        return TensorDict(
             {
                 "image": batch["image"],
                 "is_first": batch["is_first"],
@@ -129,9 +129,6 @@ class OfflineTrainer:
             },
             batch_size=[batch_size, time_steps],
         )
-        post, metrics = agent._cal_grad(data, initial=None)
-        loss = metrics.pop("opt/loss")
-        return loss, metrics
 
     def begin(self, agent):
         loader = DataLoader(
@@ -143,7 +140,8 @@ class OfflineTrainer:
             drop_last=True
         )
         optimizer = agent.get_optimizer()
-        agent, optimizer, loader = self.accelerator.prepare(agent, optimizer, loader)
+        scheduler = agent.build_scheduler(optimizer)
+        agent, optimizer, loader, scheduler = self.accelerator.prepare(agent, optimizer, loader, scheduler)
         agent.train()
         
         self.accelerator.print(f"Start Training | Processes: {self.accelerator.num_processes}")
@@ -157,15 +155,25 @@ class OfflineTrainer:
                     break
 
                 with self.accelerator.accumulate(agent):
-                    loss, metrics = self._compute_loss(agent, batch)
-                    self.accelerator.backward(loss)
-                    
-                    if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
+                    data = self._build_batch(batch)
 
-                    optimizer.step()
-                    optimizer.zero_grad()
+                    def clip_grad_fn(params):
+                        if self.accelerator.sync_gradients:
+                            self.accelerator.clip_grad_norm_(params, max_norm=100.0)
 
+                    _, metrics = agent.train_step(
+                        data,
+                        initial=None,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=None,
+                        backward_fn=self.accelerator.backward,
+                        clip_grad_fn=clip_grad_fn,
+                        zero_grad_kwargs={"set_to_none": True},
+                        autocast_enabled=False,
+                    )
+
+                    loss = metrics["opt/loss"]
                     running_loss += loss.detach().item()
                     step += 1
 
