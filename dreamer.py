@@ -363,6 +363,8 @@ class Dreamer(nn.Module):
         losses  = {}
         metrics = {}
         B, T    = data.shape
+        if initial is None:
+            initial = self.rssm.initial(B)
         embed = self.encoder(data)
         d_emb = self.drone_embed(data["drone_id"])
         post_stoch, post_deter, post_logit = self.rssm.observe(

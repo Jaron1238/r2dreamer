@@ -13,6 +13,14 @@ hydra:
   run:
     dir: ${logdir}
 
+env:
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+
 batch_size: 16
 batch_length: 64
 
@@ -42,4 +50,5 @@ dataset:
 
   mode: 'streaming'
   hf_repo: 'dein_benutzername/dein_fpv_dataset' # Hier den Pfad zu deinem HF-Dataset einfügen
-  shuffle_buffer: 10000 
+  shuffle_buffer: 10000
+  require_osd: true
