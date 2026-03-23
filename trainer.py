@@ -33,6 +33,8 @@ class FPVDataset(IterableDataset):
                 continue
             diff = torch.zeros_like(frames)
             diff[1:] = frames[1:] - frames[:-1]
+            # Das Dataset ist die einzige Stelle, an der aus RGB die 6-Kanal-
+            # Darstellung (RGB + Frame-Differenz) erzeugt wird.
             frames_6ch = torch.cat([frames, diff], dim=-1)
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True

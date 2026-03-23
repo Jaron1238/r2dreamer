@@ -193,21 +193,23 @@ class ConvEncoder(nn.Module):
     def __init__(self, config, input_shape):
         super().__init__()
         h, w, input_ch = input_shape
+        if input_ch != 6:
+            raise ValueError(f"ConvEncoder expects 6 input channels (RGB + diff), got {input_ch}.")
 
         # EfficientNet-B0 Backbone laden
         backbone = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
 
-        # Layer 1 auf 6 Channels erweitern (RGB + Frame-Differenz)
+        # Layer 1 auf die erwarteten 6 Kanäle anpassen (RGB + Frame-Differenz).
         old_conv = backbone.features[0][0]
         backbone.features[0][0] = nn.Conv2d(
-            in_channels=6,
+            in_channels=input_ch,
             out_channels=32,
             kernel_size=3,
             stride=2,
             padding=1,
             bias=False
         )
-        # Pretrained Gewichte kopieren – Diff-Channels bekommen gleichen Startpunkt
+        # Pretrained-Gewichte kopieren – die Diff-Kanäle bekommen denselben Startpunkt.
         with torch.no_grad():
             backbone.features[0][0].weight[:, :3] = old_conv.weight
             backbone.features[0][0].weight[:, 3:] = old_conv.weight
@@ -216,7 +218,7 @@ class ConvEncoder(nn.Module):
         for param in backbone.features[1:4].parameters():
             param.requires_grad = False
 
-        # Trainierbar: Layer 0 (6-Channel) + Layer 4-8 (high-level)
+        # Trainierbar: Layer 0 (6 Kanäle) + Layer 4-8 (high-level)
         for param in backbone.features[0].parameters():
             param.requires_grad = True
         for param in backbone.features[4:].parameters():
@@ -235,20 +237,12 @@ class ConvEncoder(nn.Module):
         self.out_dim = embed_dim
 
     def forward(self, obs):
-        """Encode image-like observations mit EfficientNet-B0 + Frame-Differenz."""
-        # (B, T, H, W, C)
+        """Encode dataset-built 6-channel image observations with EfficientNet-B0."""
+        # obs enthält bereits RGB + Frame-Differenz und hat Shape (B, T, H, W, 6).
         obs = obs - 0.5
 
-        # Frame-Differenz berechnen
-        # obs[:, 1:] ist Frame t+1, obs[:, :-1] ist Frame t
-        diff = torch.zeros_like(obs)
-        diff[:, 1:] = obs[:, 1:] - obs[:, :-1]  # Bewegung sichtbar machen
-
-        # RGB + Diff zusammenführen → 6 Channels
-        obs_6ch = torch.cat([obs, diff], dim=-1)  # (B, T, H, W, 6)
-
         # (B*T, H, W, 6)
-        x = obs_6ch.reshape(-1, *obs_6ch.shape[-3:])
+        x = obs.reshape(-1, *obs.shape[-3:])
         # (B*T, 6, H, W)
         x = x.permute(0, 3, 1, 2)
         # (B*T, 1280)
