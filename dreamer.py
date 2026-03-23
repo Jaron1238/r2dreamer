@@ -325,16 +325,29 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return self
 
+    def _get_drone_embedding(self, drone_id=None, *, batch_shape=None, frozen=False, device=None):
+        module = self._frozen_drone_embed if frozen else self.drone_embed
+        if drone_id is None:
+            if batch_shape is None:
+                raise ValueError("batch_shape is required when drone_id is not provided.")
+            drone_id = torch.zeros(*batch_shape, dtype=torch.long, device=device or self.device)
+        else:
+            drone_id = drone_id.to(device=device or self.device, dtype=torch.long)
+        return module(drone_id)
+
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         torch.compiler.cudagraph_mark_step_begin()
         p_obs                          = self.preprocess(obs)
         embed                          = self._frozen_encoder(p_obs)
+        d_emb                          = self._get_drone_embedding(
+            obs.get("drone_id"), batch_shape=embed.shape[:-1], frozen=True, device=embed.device
+        )
         prev_stoch, prev_deter, prev_action = (
             state["stoch"], state["deter"], state["prev_action"],
         )
         stoch, deter, _ = self._frozen_rssm.obs_step(
-            prev_stoch, prev_deter, prev_action, embed, obs["is_first"]
+            prev_stoch, prev_deter, prev_action, embed, obs["is_first"], d_emb
         )
         feat         = self._frozen_rssm.get_feat(stoch, deter)
         action_dist  = self._frozen_actor(feat)
@@ -363,14 +376,15 @@ class Dreamer(nn.Module):
             raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
         B     = min(data["action"].shape[0], 6)
         embed = self.encoder(data)
+        d_emb = self._get_drone_embedding(data.get("drone_id"), batch_shape=data["action"].shape[:2], device=embed.device)
         post_stoch, post_deter, _ = self.rssm.observe(
             embed[:B, :5], data["action"][:B, :5],
-            tuple(val[:B] for val in initial), data["is_first"][:B, :5],
+            tuple(val[:B] for val in initial), data["is_first"][:B, :5], d_emb[:B, :5],
         )
         recon               = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
         prior_stoch, prior_deter = self.rssm.imagine_with_action(
-            init_stoch, init_deter, data["action"][:B, 5:],
+            init_stoch, init_deter, data["action"][:B, 5:], d_emb[:B, 5:],
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
         model = torch.cat([recon[:, :5], openl], 1)
@@ -500,7 +514,7 @@ class Dreamer(nn.Module):
         if initial is None:
             initial = self.rssm.initial(B)
         embed = self.encoder(data)
-        d_emb = self.drone_embed(data["drone_id"])
+        d_emb = self._get_drone_embedding(data.get("drone_id"), batch_shape=data["action"].shape[:2], device=embed.device)
         post_stoch, post_deter, post_logit = self.rssm.observe(
             embed, data["action"], initial, data["is_first"], d_emb
         )
@@ -545,8 +559,11 @@ class Dreamer(nn.Module):
                 )
                 ema_proj = self.ema_proj(data_aug)
             embed_aug               = self.encoder(data_aug)
+            d_emb_aug               = self._get_drone_embedding(
+                data_aug.get("drone_id"), batch_shape=data_aug["action"].shape[:2], device=embed_aug.device
+            )
             post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
-                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
+                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"], d_emb_aug
             )
             proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
             losses.update(proto_losses)
