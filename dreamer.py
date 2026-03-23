@@ -30,8 +30,10 @@ class Dreamer(nn.Module):
         self.act_dim       = int(config.act_dim)
         self.rep_loss      = str(config.rep_loss)
 
+        image_shape = (int(config.img_height), int(config.img_width), 6)
         shapes = {
-            "image": (int(config.img_height), int(config.img_width), 6)
+            # "image" kommt bereits als RGB + Frame-Differenz aus dem Dataset.
+            "image": image_shape,
         }
 
         self.encoder    = networks.MultiEncoder(config.encoder, shapes)
