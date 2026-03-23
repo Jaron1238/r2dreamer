@@ -62,7 +62,7 @@ class Dreamer(nn.Module):
         self._log_grads   = bool(config.log_grads)
         self.num_drones = int(config.get("num_drone_classes", 10))
         self.drone_embed = nn.Embedding(self.num_drones, 16)
-        modules = {
+        modules = OrderedDict({
             "rssm":    self.rssm,
             "actor":   self.actor,
             "value":   self.value,
@@ -70,7 +70,7 @@ class Dreamer(nn.Module):
             "cont":    self.cont,
             "encoder": self.encoder,
             "drone_embed": self.drone_embed, 
-        }
+        })
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -111,23 +111,17 @@ class Dreamer(nn.Module):
                 "prototypes":   self._prototypes,
                 "obs_proj":     self.obs_proj,
                 "feat_proj":    self.feat_proj,
-                "ema_encoder":  self._ema_encoder,
-                "ema_obs_proj": self._ema_obs_proj,
             })
 
-        for key, module in modules.items():
+        self._modules = modules
+
+        for key, module in self._modules.items():
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
                 print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
 
-        self._named_params = OrderedDict()
-        for name, module in modules.items():
-            if isinstance(module, nn.Parameter):
-                self._named_params[name] = module
-            else:
-                for param_name, param in module.named_parameters():
-                    self._named_params[f"{name}.{param_name}"] = param
+        self._named_params = self._collect_named_params()
         print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
 
         def _agc(params):
@@ -135,12 +129,9 @@ class Dreamer(nn.Module):
 
         self._agc       = _agc
         self._base_lr   = float(config.lr)
-        self._optimizer = LaProp(
-            self._named_params.values(),
-            lr=self._base_lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-        )
+        self._opt_betas = (float(config.beta1), float(config.beta2))
+        self._opt_eps   = float(config.eps)
+        self._optimizer = self._build_optimizer()
         self._scaler = GradScaler()
 
         def lr_lambda(step):
@@ -179,18 +170,77 @@ class Dreamer(nn.Module):
         }
         return loss, metrics
 
+    def _iter_trainable_named_parameters(self, module_name, module):
+        if isinstance(module, nn.Parameter):
+            if module.requires_grad:
+                yield module_name, module
+            return
+        for param_name, param in module.named_parameters():
+            if param.requires_grad:
+                yield f"{module_name}.{param_name}", param
+
+    def _collect_named_params(self):
+        named_params = OrderedDict()
+        for module_name, module in self._modules.items():
+            for param_name, param in self._iter_trainable_named_parameters(module_name, module):
+                named_params[param_name] = param
+        return named_params
+
+    def _get_encoder_param_groups(self):
+        encoder_named_params = [
+            (name, param) for name, param in self._named_params.items()
+            if name.startswith("encoder.")
+        ]
+        if not encoder_named_params:
+            return []
+
+        stem_params = [
+            param for name, param in encoder_named_params
+            if ".backbone.0.0." in name
+        ]
+        other_encoder_params = [
+            param for name, param in encoder_named_params
+            if ".backbone.0.0." not in name
+        ]
+
+        param_groups = []
+        if stem_params:
+            param_groups.append({"params": stem_params, "lr": self._base_lr * 10})
+        if other_encoder_params:
+            param_groups.append({"params": other_encoder_params, "lr": self._base_lr})
+        return param_groups
+
+    def _build_optimizer_param_groups(self):
+        param_groups = self._get_encoder_param_groups()
+        grouped_param_ids = {
+            id(param)
+            for group in param_groups
+            for param in group["params"]
+        }
+
+        for module_name, module in self._modules.items():
+            if module_name == "encoder":
+                continue
+
+            module_params = [
+                param
+                for _, param in self._iter_trainable_named_parameters(module_name, module)
+                if id(param) not in grouped_param_ids
+            ]
+            if module_params:
+                param_groups.append({"params": module_params, "lr": self._base_lr})
+
+        return param_groups
+
+    def _build_optimizer(self):
+        return LaProp(
+            self._build_optimizer_param_groups(),
+            betas=self._opt_betas,
+            eps=self._opt_eps,
+        )
+
     def get_optimizer(self):
-        encoder_cnn = self.encoder.encoders[0]
-        return LaProp([
-            {"params": encoder_cnn.backbone.features[0].parameters(),
-             "lr":     self._base_lr * 10},
-            {"params": encoder_cnn.backbone.features[4:].parameters(),
-             "lr":     self._base_lr},
-            {"params": self.rssm.parameters(),
-             "lr":     self._base_lr},
-            {"params": self.prj.parameters(),
-             "lr":     self._base_lr},
-        ], betas=(0.9, 0.999), eps=1e-8)
+        return self._build_optimizer()
 
     def _update_slow_target(self):
         if self._slow_value_updates % self.slow_target_update == 0:
