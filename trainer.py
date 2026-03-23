@@ -72,20 +72,51 @@ class Augmentation:
         self.use_cutout     = bool(config.use_cutout)
         self.cutout_size    = int(config.cutout_size)
 
-    def __call__(self, x):
+    def active_transforms(self):
+        transforms = []
+        if self.noise_std > 0:
+            transforms.append(f"noise(std={self.noise_std})")
+        if self.use_flip:
+            transforms.append("horizontal_flip(p=0.5)")
+        if self.use_brightness:
+            transforms.append(f"brightness(std={self.brightness_std})")
+        if self.use_cutout:
+            transforms.append(f"cutout(size={self.cutout_size})")
+        return transforms
+
+    def enabled(self):
+        return bool(self.active_transforms())
+
+    def _apply_to_rgb(self, x):
         if self.noise_std > 0:
             x = (x + self.noise_std * torch.randn_like(x)).clamp(0, 1)
-        if self.use_flip and torch.rand(1).item() > 0.5:
+        if self.use_flip and torch.rand(1, device=x.device).item() > 0.5:
             x = torch.flip(x, dims=[3])
         if self.use_brightness:
-            delta = self.brightness_std * torch.randn(x.shape[0], 1, 1, 1, device=x.device)
+            delta = self.brightness_std * torch.randn(x.shape[0], 1, 1, 1, 1, device=x.device)
             x = (x + delta).clamp(0, 1)
         if self.use_cutout:
-            B, T, H, W, C = x.shape
-            y  = torch.randint(0, H - self.cutout_size, (1,)).item()
-            xc = torch.randint(0, W - self.cutout_size, (1,)).item()
-            x[:, :, y:y + self.cutout_size, xc:xc + self.cutout_size, :] = 0
+            _, _, H, W, _ = x.shape
+            cutout_h = min(self.cutout_size, H)
+            cutout_w = min(self.cutout_size, W)
+            y_max = H - cutout_h + 1
+            x_max = W - cutout_w + 1
+            y = torch.randint(0, y_max, (1,), device=x.device).item() if y_max > 1 else 0
+            x0 = torch.randint(0, x_max, (1,), device=x.device).item() if x_max > 1 else 0
+            x[:, :, y:y + cutout_h, x0:x0 + cutout_w, :] = 0
         return x
+
+    def __call__(self, x):
+        channels = x.shape[-1]
+        if channels == 3:
+            return self._apply_to_rgb(x)
+        if channels != 6:
+            raise ValueError(f"Expected 3 or 6 image channels for augmentation, got {channels}.")
+
+        rgb = self._apply_to_rgb(x[..., :3].clone())
+        diff = torch.zeros_like(rgb)
+        diff[:, 1:] = rgb[:, 1:] - rgb[:, :-1]
+        return torch.cat([rgb, diff], dim=-1)
 
 
 class OfflineTrainer:
@@ -105,6 +136,7 @@ class OfflineTrainer:
             gradient_accumulation_steps=self.accumulation_steps,
             mixed_precision="fp16"
         )
+        self._augmentation_logged = False
 
     def _save_checkpoint(self, step):
         ckpt_path = self.logdir / f"checkpoint-{step:07d}"
@@ -115,11 +147,15 @@ class OfflineTrainer:
         self.accelerator.load_state(path)
         self.accelerator.print(f"Loaded: {path}")
 
-    def _compute_loss(self, agent, batch):
-        batch_size, time_steps = batch["image"].shape[:2]
+    def _compute_loss(self, agent, batch, augment=False):
+        image = batch["image"]
+        if augment and self.augmentation.enabled():
+            image = self.augmentation(image)
+
+        batch_size, time_steps = image.shape[:2]
         data = TensorDict(
             {
-                "image": batch["image"],
+                "image": image,
                 "is_first": batch["is_first"],
                 "is_last": batch["is_last"],
                 "is_terminal": batch["is_terminal"],
@@ -147,7 +183,13 @@ class OfflineTrainer:
         agent.train()
         
         self.accelerator.print(f"Start Training | Processes: {self.accelerator.num_processes}")
-        
+        if not self._augmentation_logged:
+            active_augmentations = ", ".join(self.augmentation.active_transforms()) or "none"
+            self.accelerator.print(
+                f"Training augmentations on image batches (RGB augmented, diff channels recomputed): {active_augmentations}"
+            )
+            self._augmentation_logged = True
+
         running_loss = 0.0
         step = 0
 
@@ -157,7 +199,7 @@ class OfflineTrainer:
                     break
 
                 with self.accelerator.accumulate(agent):
-                    loss, metrics = self._compute_loss(agent, batch)
+                    loss, metrics = self._compute_loss(agent, batch, augment=True)
                     self.accelerator.backward(loss)
                     
                     if self.accelerator.sync_gradients:
