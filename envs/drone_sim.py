@@ -19,7 +19,7 @@ class DroneSimEnv(gym.Env):
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(int(config.model.act_dim),), dtype=np.float32)
         self.observation_space = spaces.Dict(
             {
-                "image": spaces.Box(low=0.0, high=1.0, shape=(1, h, w, 2), dtype=np.float32),
+                "image": spaces.Box(low=0.0, high=1.0, shape=(h, w, 2), dtype=np.float32),
                 "is_first": spaces.Box(low=0, high=1, shape=(1,), dtype=np.bool_),
                 "speed": spaces.Box(low=-100.0, high=100.0, shape=(1, 1), dtype=np.float32),
             }
@@ -27,8 +27,8 @@ class DroneSimEnv(gym.Env):
         self._step = 0
 
     def _dummy_obs(self, is_first=False):
-        h, w = self.observation_space["image"].shape[1:3]
-        depth = np.random.rand(1, h, w, 1).astype(np.float32)
+        h, w = self.observation_space["image"].shape[:2]
+        depth = np.random.rand(h, w, 1).astype(np.float32)
         diff = np.zeros_like(depth)
         return {
             "image": np.concatenate([depth, diff], axis=-1),

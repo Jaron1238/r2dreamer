@@ -37,7 +37,6 @@ class Dreamer(nn.Module):
         self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
 
-        image_shape = (int(config.img_height), int(config.img_width), 6)
         shapes = {
             "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
         }
@@ -122,9 +121,9 @@ class Dreamer(nn.Module):
                 "feat_proj":    self.feat_proj,
             })
 
-        self._modules = modules
+        self._model_modules = modules
 
-        for key, module in self._modules.items():
+        for key, module in self._model_modules.items():
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
@@ -191,7 +190,7 @@ class Dreamer(nn.Module):
 
     def _collect_named_params(self):
         named_params = OrderedDict()
-        for module_name, module in self._modules.items():
+        for module_name, module in self._model_modules.items():
             for param_name, param in self._iter_trainable_named_parameters(module_name, module):
                 named_params[param_name] = param
         return named_params
@@ -228,7 +227,7 @@ class Dreamer(nn.Module):
             for param in group["params"]
         }
 
-        for module_name, module in self._modules.items():
+        for module_name, module in self._model_modules.items():
             if module_name == "encoder":
                 continue
 
@@ -368,9 +367,12 @@ class Dreamer(nn.Module):
         action_dist  = self._frozen_actor(feat)
         action       = action_dist.mode if eval else action_dist.rsample()
         speed = obs.get("speed", torch.zeros(*action.shape[:-1], 1, device=action.device))
-        safety_score = self.safety_net(p_obs["image"], speed, action)
+        img_t = p_obs["image"].unsqueeze(1)
+        speed_t = speed.unsqueeze(1)
+        action_t = action.unsqueeze(1)
+        safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
         brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
-        action = torch.where(safety_score < self.safety_threshold, brake, action)
+        action = torch.where(safety_score > self.safety_threshold, brake, action)
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
@@ -400,12 +402,12 @@ class Dreamer(nn.Module):
             embed[:B, :5], data["action"][:B, :5],
             tuple(val[:B] for val in initial), data["is_first"][:B, :5], d_emb[:B, :5],
         )
-        recon               = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
+        recon               = self.decoder(post_stoch, post_deter)["image"].mode[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
         prior_stoch, prior_deter = self.rssm.imagine_with_action(
             init_stoch, init_deter, data["action"][:B, 5:], d_emb[:B, 5:],
         )
-        openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
+        openl = self.decoder(prior_stoch, prior_deter)["image"].mode
         model = torch.cat([recon[:, :5], openl], 1)
         truth = data["image"][:B]
         error = (model - truth + 1.0) / 2.0
@@ -606,7 +608,7 @@ class Dreamer(nn.Module):
 
         if self.phase == 2:
             actor_dist = self.actor(feat.detach())
-            actor_mode = actor_dist.mode()
+            actor_mode = actor_dist.mode
             losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
@@ -622,10 +624,10 @@ class Dreamer(nn.Module):
             d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0)
             imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_reward = self._frozen_reward(imag_feat).mode()
+            imag_reward = self._frozen_reward(imag_feat).mode
             imag_cont = self._frozen_cont(imag_feat).mean
-            imag_value = self._frozen_value(imag_feat).mode()
-            imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+            imag_value = self._frozen_value(imag_feat).mode
+            imag_slow_value = self._frozen_slow_value(imag_feat).mode
             disc = 1 - 1 / self.horizon
             weight = torch.cumprod(imag_cont * disc, dim=1)
             last = torch.zeros_like(imag_cont)
@@ -660,8 +662,8 @@ class Dreamer(nn.Module):
             last, term, reward = (to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]))
             feat = self.rssm.get_feat(post_stoch, post_deter)
             boot = ret[:, 0].reshape(B, T, 1)
-            value = self._frozen_value(feat).mode()
-            slow_value = self._frozen_slow_value(feat).mode()
+            value = self._frozen_value(feat).mode
+            slow_value = self._frozen_slow_value(feat).mode
             disc = 1 - 1 / self.horizon
             weight = 1.0 - last
             ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
@@ -676,7 +678,6 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), total_loss, metrics

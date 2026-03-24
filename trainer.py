@@ -3,8 +3,9 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from tensordict import TensorDict
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from accelerate import Accelerator
+from buffer import Buffer
 
 
 class DepthPreprocessor:
@@ -84,6 +85,7 @@ class FPVDataset(IterableDataset):
         self.batch_length = batch_length
         self.require_osd  = require_osd
         self.use_depth = bool(getattr(config, "use_depth", False))
+        self.action_dim = int(getattr(config.model, "act_dim", 4))
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
         self.depth_preprocessor = DepthPreprocessor(
@@ -105,7 +107,11 @@ class FPVDataset(IterableDataset):
         )
 
     def __iter__(self):
-        for sample in self.ds:
+        worker_info = get_worker_info()
+        ds_iter = self.ds
+        if worker_info is not None and worker_info.num_workers > 1:
+            ds_iter = ds_iter.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+        for sample in ds_iter:
             frames = torch.from_numpy(np.array(sample["frames"])).float()
             if frames.ndim >= 4 and frames.shape[-1] in (3, 4) and frames.max() > 1.5:
                 frames = frames / 255.0
@@ -140,7 +146,7 @@ class FPVDataset(IterableDataset):
                     pad_act = torch.zeros((self.batch_length - actions.shape[0], action_dim), dtype=torch.float32)
                     actions = torch.cat([actions, pad_act], dim=0)
             else:
-                actions = torch.zeros((self.batch_length, 4), dtype=torch.float32)
+                actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
 
             drone_id = int(sample.get("drone_id", 0))
             drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
@@ -289,6 +295,8 @@ class OfflineTrainer:
             },
             batch_size=[batch_size, time_steps],
         )
+        (_, _), total_loss, metrics = agent.compute_losses(data, initial=None)
+        return total_loss, metrics
 
     def begin(self, agent):
         loader = DataLoader(
@@ -328,6 +336,7 @@ class OfflineTrainer:
                         self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
 
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
 
                     running_loss += loss.detach().item()
@@ -335,7 +344,8 @@ class OfflineTrainer:
 
                     if step % self.log_every == 0:
                         loss_tensor = torch.tensor(running_loss, device=self.accelerator.device)
-                        avg_loss = self.accelerator.gather_for_metrics(loss_tensor).sum().item() / self.log_every
+                        gathered_loss = self.accelerator.gather_for_metrics(loss_tensor)
+                        avg_loss = gathered_loss.mean().item() / self.log_every
                         
                         self.accelerator.print(f"Step {step:6d} | Loss: {avg_loss:.4f}")
 
@@ -369,18 +379,78 @@ class OnlineTrainer:
             gradient_accumulation_steps=int(config.get("accumulation_steps", 1)),
             mixed_precision="fp16",
         )
+        self.num_eps = 0
 
     def begin(self, agent, env):
+        replay_buffer = Buffer(agent.config.buffer)
         optimizer = agent.get_optimizer()
         agent, optimizer = self.accelerator.prepare(agent, optimizer)
-        state = agent.get_initial_state(B=1)
+        state = agent.get_initial_state(B=1).to(self.accelerator.device)
         obs, _ = env.reset()
+        obs = self._to_device_obs(obs, is_first=True)
         step = 0
+        train_every = int(getattr(agent.config.trainer, "online_train_every", 1))
+        learning_starts = int(getattr(agent.config.trainer, "online_learning_starts", agent.config.buffer.batch_length + 1))
         while step < self.steps:
             action, state = agent.act(obs, state, eval=False)
             next_obs, reward, terminated, truncated, _ = env.step(action)
-            _ = (reward, terminated, truncated, next_obs)
+            next_obs = self._to_device_obs(next_obs, is_first=False)
+
+            done = bool(terminated or truncated)
+            transition = TensorDict(
+                {
+                    "image": obs["image"],
+                    "is_first": obs["is_first"],
+                    "is_last": torch.tensor([done], dtype=torch.bool, device=self.accelerator.device),
+                    "is_terminal": torch.tensor([bool(terminated)], dtype=torch.bool, device=self.accelerator.device),
+                    "reward": torch.tensor([[reward]], dtype=torch.float32, device=self.accelerator.device),
+                    "action": action.detach(),
+                    "speed": obs.get("speed", torch.zeros(1, 1, device=self.accelerator.device)),
+                    "drone_id": obs.get("drone_id", torch.zeros(1, dtype=torch.long, device=self.accelerator.device)),
+                    "crash": torch.tensor([[float(terminated)]], dtype=torch.float32, device=self.accelerator.device),
+                    "episode": torch.tensor([self.num_eps], dtype=torch.long, device=self.accelerator.device),
+                    "stoch": state["stoch"].detach(),
+                    "deter": state["deter"].detach(),
+                },
+                batch_size=[1],
+            )
+            replay_buffer.add_transition(transition)
+            obs = next_obs
+
+            if replay_buffer.count() >= learning_starts and (step + 1) % train_every == 0:
+                metrics = agent.update(replay_buffer)
+                if step % self.log_every == 0 and self.accelerator.is_main_process:
+                    for k, v in metrics.items():
+                        val = v.item() if hasattr(v, "item") else v
+                        self.logger.scalar(f"online/{k}", val)
+
+            if done:
+                self.num_eps += 1
+                obs, _ = env.reset()
+                obs = self._to_device_obs(obs, is_first=True)
+                state = agent.get_initial_state(B=1).to(self.accelerator.device)
             step += 1
             if step % self.log_every == 0 and self.accelerator.is_main_process:
                 self.logger.scalar("online/steps", step)
                 self.logger.write(step)
+
+    def _to_device_obs(self, obs, *, is_first=False):
+        out = {}
+        for key, value in obs.items():
+            tensor = value if torch.is_tensor(value) else torch.as_tensor(value)
+            tensor = tensor.to(self.accelerator.device)
+            if key == "drone_id":
+                tensor = tensor.long()
+            else:
+                tensor = tensor.float()
+            if key == "image" and tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.ndim == 0:
+                tensor = tensor.unsqueeze(0)
+            out[key] = tensor
+        out["is_first"] = torch.tensor([bool(is_first)], dtype=torch.bool, device=self.accelerator.device)
+        if "speed" not in out:
+            out["speed"] = torch.zeros(1, 1, dtype=torch.float32, device=self.accelerator.device)
+        if "drone_id" not in out:
+            out["drone_id"] = torch.zeros(1, dtype=torch.long, device=self.accelerator.device)
+        return out
