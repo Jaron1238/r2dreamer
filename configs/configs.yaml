@@ -8,6 +8,8 @@ logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
+phase: 1
+use_depth: True
 
 hydra:
   run:
@@ -21,7 +23,7 @@ env:
     mlp_keys: '$^'
     cnn_keys: 'image'
 
-batch_size: 16
+batch_size: 1
 batch_length: 64
 
 buffer:
@@ -33,13 +35,17 @@ buffer:
 
 trainer:
   steps: 100000
-  batch_per_gpu: 4
+  batch_per_gpu: 1
   batch_length: 64
   checkpoint_every: 500
   log_every: 50
   num_workers: 4
+  accumulation_steps: 16
   augmentation:
     noise_std: 0.05
+    depth_noise_std: 0.02
+    resolution_scale_min: 0.5
+    resolution_scale_max: 1.0
     use_flip: true
     use_brightness: true
     brightness_std: 0.1
@@ -52,3 +58,9 @@ dataset:
   hf_repo: 'dein_benutzername/dein_fpv_dataset' # Hier den Pfad zu deinem HF-Dataset einfügen
   shuffle_buffer: 10000
   require_osd: true
+
+model:
+  img_height: 256
+  img_width: 256
+  phase: ${phase}
+  use_depth: ${use_depth}

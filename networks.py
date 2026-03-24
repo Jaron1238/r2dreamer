@@ -193,24 +193,29 @@ class ConvEncoder(nn.Module):
     def __init__(self, config, input_shape):
         super().__init__()
         h, w, input_ch = input_shape
+        self.input_ch = int(input_ch)
 
         # EfficientNet-B0 Backbone laden
         backbone = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
 
-        # Layer 1 auf 6 Channels erweitern (RGB + Frame-Differenz)
+        # Layer 1 auf variable Channels erweitern (z. B. Depth + Diff = 2)
         old_conv = backbone.features[0][0]
         backbone.features[0][0] = nn.Conv2d(
-            in_channels=6,
+            in_channels=self.input_ch,
             out_channels=32,
             kernel_size=3,
             stride=2,
             padding=1,
             bias=False
         )
-        # Pretrained Gewichte kopieren – Diff-Channels bekommen gleichen Startpunkt
+        # Pretrained Gewichte kopieren / wiederholen.
         with torch.no_grad():
-            backbone.features[0][0].weight[:, :3] = old_conv.weight
-            backbone.features[0][0].weight[:, 3:] = old_conv.weight
+            if self.input_ch <= 3:
+                backbone.features[0][0].weight[:, :self.input_ch] = old_conv.weight[:, :self.input_ch]
+            else:
+                repeat = math.ceil(self.input_ch / 3)
+                repeated = old_conv.weight.repeat(1, repeat, 1, 1)[:, :self.input_ch]
+                backbone.features[0][0].weight.copy_(repeated)
 
         # Einfrieren: Layer 1-3 (low-level Features)
         for param in backbone.features[1:4].parameters():
@@ -235,21 +240,10 @@ class ConvEncoder(nn.Module):
         self.out_dim = embed_dim
 
     def forward(self, obs):
-        """Encode image-like observations mit EfficientNet-B0 + Frame-Differenz."""
+        """Encode image-like observations mit EfficientNet-B0."""
         # (B, T, H, W, C)
         obs = obs - 0.5
-
-        # Frame-Differenz berechnen
-        # obs[:, 1:] ist Frame t+1, obs[:, :-1] ist Frame t
-        diff = torch.zeros_like(obs)
-        diff[:, 1:] = obs[:, 1:] - obs[:, :-1]  # Bewegung sichtbar machen
-
-        # RGB + Diff zusammenführen → 6 Channels
-        obs_6ch = torch.cat([obs, diff], dim=-1)  # (B, T, H, W, 6)
-
-        # (B*T, H, W, 6)
-        x = obs_6ch.reshape(-1, *obs_6ch.shape[-3:])
-        # (B*T, 6, H, W)
+        x = obs.reshape(-1, *obs.shape[-3:])
         x = x.permute(0, 3, 1, 2)
         # (B*T, 1280)
         x = self.backbone(x)
@@ -257,6 +251,36 @@ class ConvEncoder(nn.Module):
         x = self.adapter(x)
         # (B, T, embed_dim)
         return x.reshape(*obs.shape[:-3], x.shape[-1])
+
+
+class SafetyNet(nn.Module):
+    def __init__(self, in_channels: int = 2, action_dim: int = 4, speed_dim: int = 1, hidden: int = 64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 16, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(32, hidden, kernel_size=3, stride=2, padding=1),
+            nn.SiLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+        )
+        self.head = nn.Sequential(
+            nn.Linear(hidden + action_dim + speed_dim, 64),
+            nn.SiLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, image, speed, action):
+        # image: (B, T, H, W, C)
+        b, t = image.shape[:2]
+        x = image.reshape(b * t, *image.shape[2:]).permute(0, 3, 1, 2)
+        feat = self.conv(x)
+        speed = speed.reshape(b * t, -1)
+        action = action.reshape(b * t, -1)
+        return self.head(torch.cat([feat, speed, action], dim=-1)).reshape(b, t, 1)
 
 class ConvDecoder(nn.Module):
     def __init__(self, config, deter, flat_stoch, shape=(3, 64, 64)):

@@ -8,7 +8,7 @@ import torch
 
 import tools
 from dreamer import Dreamer
-from trainer import FPVDataset, OfflineTrainer
+from trainer import FPVDataset, OfflineTrainer, OnlineTrainer
 
 warnings.filterwarnings("ignore")
 sys.path.append(str(pathlib.Path(__file__).parent))
@@ -32,12 +32,6 @@ def main(config):
     logger = tools.Logger(logdir)
     logger.log_hydra_config(config)
 
-    dataset = FPVDataset(
-        config,
-        batch_length=config.trainer.batch_length,
-        require_osd=bool(config.dataset.get("require_osd", False)),
-    )
-
     agent = Dreamer(config.model).to(config.device)
 
     if config.get("checkpoint", None):
@@ -47,8 +41,19 @@ def main(config):
             agent.load_state_dict(ckpt["model"])
             print(f"Checkpoint geladen: {ckpt_path}")
 
-    trainer = OfflineTrainer(config.trainer, dataset, logger, logdir)
-    trainer.begin(agent)
+    if int(getattr(config, "phase", 1)) >= 3:
+        from envs.drone_sim import DroneSimEnv
+        trainer = OnlineTrainer(config.trainer, logger, logdir)
+        env = DroneSimEnv(config)
+        trainer.begin(agent, env)
+    else:
+        dataset = FPVDataset(
+            config,
+            batch_length=config.trainer.batch_length,
+            require_osd=bool(config.dataset.get("require_osd", False)),
+        )
+        trainer = OfflineTrainer(config.trainer, dataset, logger, logdir)
+        trainer.begin(agent)
 
     torch.save(
         {"model": agent.state_dict()},

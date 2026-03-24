@@ -1,9 +1,67 @@
 import pathlib
 import torch
 import numpy as np
+import torch.nn.functional as F
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, IterableDataset
 from accelerate import Accelerator
+
+
+class DepthPreprocessor:
+    def __init__(self, use_depth: bool = True, output_size: int = 256):
+        self.use_depth = bool(use_depth)
+        self.output_size = int(output_size)
+        self._depth_model = None
+        self._backend = "disabled"
+        if not self.use_depth:
+            return
+        try:
+            from depth_anything_v2.dpt import DepthAnythingV2  # type: ignore
+            self._depth_model = DepthAnythingV2(encoder="vits")
+            self._depth_model.eval()
+            self._backend = "depth-anything-v2"
+        except Exception:
+            self._depth_model = None
+            self._backend = "grayscale-fallback"
+
+    @property
+    def backend(self):
+        return self._backend
+
+    def _resize_depth(self, depth: torch.Tensor) -> torch.Tensor:
+        depth = F.interpolate(
+            depth[None, None],
+            size=(self.output_size, self.output_size),
+            mode="bilinear",
+            align_corners=False,
+        )[0, 0]
+        return depth.clamp(0.0, 1.0)
+
+    @torch.no_grad()
+    def __call__(self, frames: torch.Tensor) -> torch.Tensor:
+        # frames: (T, H, W, 3), float32 in [0, 1]
+        if not self.use_depth:
+            return frames
+        if self._depth_model is None:
+            gray = frames.mean(dim=-1)
+            return torch.stack([self._resize_depth(gray[t]) for t in range(gray.shape[0])], dim=0)
+
+        # Depth Anything path (best effort in offline preprocessing).
+        # In constrained environments we gracefully fallback to grayscale.
+        try:
+            import cv2  # type: ignore
+
+            outs = []
+            for t in range(frames.shape[0]):
+                rgb = (frames[t].cpu().numpy() * 255.0).astype(np.uint8)
+                depth = self._depth_model.infer_image(rgb)  # np.ndarray(H, W)
+                depth = torch.from_numpy(depth).float()
+                depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+                outs.append(self._resize_depth(depth))
+            return torch.stack(outs, dim=0)
+        except Exception:
+            gray = frames.mean(dim=-1)
+            return torch.stack([self._resize_depth(gray[t]) for t in range(gray.shape[0])], dim=0)
 
 class FPVDataset(IterableDataset):
     def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
@@ -11,6 +69,13 @@ class FPVDataset(IterableDataset):
         self.mode = str(getattr(config.dataset, "mode", "streaming"))
         self.batch_length = batch_length
         self.require_osd  = require_osd
+        self.use_depth = bool(getattr(config, "use_depth", False))
+        self.img_height = int(getattr(config.model, "img_height", 256))
+        self.img_width = int(getattr(config.model, "img_width", 256))
+        self.depth_preprocessor = DepthPreprocessor(
+            use_depth=self.use_depth,
+            output_size=min(self.img_height, self.img_width),
+        )
         from datasets import load_dataset
         self.ds = load_dataset(config.dataset.hf_repo, streaming=True, split="train")
         if self.require_osd:
@@ -19,7 +84,11 @@ class FPVDataset(IterableDataset):
         if shuffle_buffer > 0:
             self.ds = self.ds.shuffle(seed=42, buffer_size=shuffle_buffer)
             
-        print(f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | OSD-Pflicht: {self.require_osd}")
+        print(
+            f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | "
+            f"OSD-Pflicht: {self.require_osd} | use_depth={self.use_depth} "
+            f"(backend={self.depth_preprocessor.backend})"
+        )
 
     def __iter__(self):
         for sample in self.ds:
@@ -31,9 +100,16 @@ class FPVDataset(IterableDataset):
                 frames = frames[start : start + self.batch_length]
             elif T < self.batch_length:
                 continue
-            diff = torch.zeros_like(frames)
-            diff[1:] = frames[1:] - frames[:-1]
-            frames_6ch = torch.cat([frames, diff], dim=-1)
+            if self.use_depth:
+                depth = self.depth_preprocessor(frames)  # (T, 256, 256)
+                depth = depth[..., None]
+                diff = torch.zeros_like(depth)
+                diff[1:] = depth[1:] - depth[:-1]
+                image = torch.cat([depth, diff], dim=-1)
+            else:
+                diff = torch.zeros_like(frames)
+                diff[1:] = frames[1:] - frames[:-1]
+                image = torch.cat([frames, diff], dim=-1)
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True
             is_last = torch.zeros(self.batch_length, dtype=torch.bool)
@@ -54,17 +130,22 @@ class FPVDataset(IterableDataset):
             drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
 
             yield {
-                "image": frames_6ch,
+                "image": image,
                 "is_first": is_first,
                 "is_last": is_last,
                 "is_terminal": is_terminal,
                 "reward": reward,
                 "action": actions,
                 "drone_id": drone_id,
+                "speed": torch.zeros(self.batch_length, 1, dtype=torch.float32),
+                "crash": is_terminal.float().unsqueeze(-1),
             }
 
 class Augmentation:
     def __init__(self, config):
+        self.depth_noise_std = float(getattr(config, "depth_noise_std", config.noise_std))
+        self.resolution_scale_min = float(getattr(config, "resolution_scale_min", 0.5))
+        self.resolution_scale_max = float(getattr(config, "resolution_scale_max", 1.0))
         self.noise_std      = float(config.noise_std)
         self.use_flip       = bool(config.use_flip)
         self.use_brightness = bool(config.use_brightness)
@@ -76,6 +157,11 @@ class Augmentation:
         transforms = []
         if self.noise_std > 0:
             transforms.append(f"noise(std={self.noise_std})")
+        if self.depth_noise_std > 0:
+            transforms.append(f"depth_noise(std={self.depth_noise_std})")
+        transforms.append(
+            f"random_resolution_scale([{self.resolution_scale_min}, {self.resolution_scale_max}])"
+        )
         if self.use_flip:
             transforms.append("horizontal_flip(p=0.5)")
         if self.use_brightness:
@@ -106,12 +192,34 @@ class Augmentation:
             x[:, :, y:y + cutout_h, x0:x0 + cutout_w, :] = 0
         return x
 
+    def _random_resolution_scale(self, x):
+        # x: (B, T, H, W, C)
+        _, _, h, w, _ = x.shape
+        scale = self.resolution_scale_min + torch.rand(1, device=x.device).item() * (
+            self.resolution_scale_max - self.resolution_scale_min
+        )
+        scale = max(0.1, min(1.0, scale))
+        nh, nw = max(1, int(h * scale)), max(1, int(w * scale))
+        x_nchw = x.permute(0, 1, 4, 2, 3).reshape(-1, x.shape[-1], h, w)
+        down = F.interpolate(x_nchw, size=(nh, nw), mode="bilinear", align_corners=False)
+        up = F.interpolate(down, size=(h, w), mode="bilinear", align_corners=False)
+        return up.reshape(x.shape[0], x.shape[1], x.shape[-1], h, w).permute(0, 1, 3, 4, 2)
+
     def __call__(self, x):
         channels = x.shape[-1]
+        if channels not in (2, 3, 6):
+            raise ValueError(f"Expected 2, 3 or 6 image channels for augmentation, got {channels}.")
+
+        x = self._random_resolution_scale(x)
+        if channels == 2:
+            depth = x[..., :1]
+            if self.depth_noise_std > 0:
+                depth = (depth + self.depth_noise_std * torch.randn_like(depth)).clamp(0, 1)
+            diff = torch.zeros_like(depth)
+            diff[:, 1:] = depth[:, 1:] - depth[:, :-1]
+            return torch.cat([depth, diff], dim=-1)
         if channels == 3:
             return self._apply_to_rgb(x)
-        if channels != 6:
-            raise ValueError(f"Expected 3 or 6 image channels for augmentation, got {channels}.")
 
         rgb = self._apply_to_rgb(x[..., :3].clone())
         diff = torch.zeros_like(rgb)
@@ -234,4 +342,31 @@ class OfflineTrainer:
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             self._save_checkpoint(step)
-        
+
+
+class OnlineTrainer:
+    def __init__(self, config, logger, logdir):
+        self.logger = logger
+        self.logdir = pathlib.Path(logdir)
+        self.steps = int(config.steps)
+        self.log_every = int(config.log_every)
+        self.checkpoint_every = int(config.checkpoint_every)
+        self.accelerator = Accelerator(
+            gradient_accumulation_steps=int(config.get("accumulation_steps", 1)),
+            mixed_precision="fp16",
+        )
+
+    def begin(self, agent, env):
+        optimizer = agent.get_optimizer()
+        agent, optimizer = self.accelerator.prepare(agent, optimizer)
+        state = agent.get_initial_state(B=1)
+        obs, _ = env.reset()
+        step = 0
+        while step < self.steps:
+            action, state = agent.act(obs, state, eval=False)
+            next_obs, reward, terminated, truncated, _ = env.step(action)
+            _ = (reward, terminated, truncated, next_obs)
+            step += 1
+            if step % self.log_every == 0 and self.accelerator.is_main_process:
+                self.logger.scalar("online/steps", step)
+                self.logger.write(step)
