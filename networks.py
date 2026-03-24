@@ -111,26 +111,21 @@ class MultiEncoder(nn.Module):
         print("Encoder MLP shapes:", self.mlp_shapes)
 
         self.out_dim = 0
-        self.selectors = []
+        self.encoder_specs = []
         self.encoders = []
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
             self.encoders.append(ConvEncoder(config.cnn, input_shape))
-            self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
+            self.encoder_specs.append(("cnn", tuple(self.cnn_shapes.keys())))
             self.out_dim += self.encoders[-1].out_dim
         if self.mlp_shapes:
             inp_dim = sum([sum(v) for v in self.mlp_shapes.values()])
             self.encoders.append(MLP(config.mlp, inp_dim))
-            self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.mlp_shapes], -1))
+            self.encoder_specs.append(("mlp", tuple(self.mlp_shapes.keys())))
             self.out_dim += self.encoders[-1].out_dim
         self.encoders = nn.ModuleList(self.encoders)
-
-        if len(self.encoders) > 1:
-            self.fuser = lambda x: torch.cat(x, dim=-1)
-        elif len(self.encoders) == 1:
-            self.fuser = lambda x: x[0]
-        else:
+        if len(self.encoders) == 0:
             raise NotImplementedError
 
         self.apply(weight_init_)
@@ -138,7 +133,13 @@ class MultiEncoder(nn.Module):
     def forward(self, obs):
         """Encode a dict of observations."""
         # dict of (B, T, *)
-        return self.fuser([enc(sel(obs)) for enc, sel in zip(self.encoders, self.selectors)])
+        outputs = []
+        for encoder, (_, keys) in zip(self.encoders, self.encoder_specs):
+            selected = torch.cat([obs[k] for k in keys], dim=-1)
+            outputs.append(encoder(selected))
+        if len(outputs) == 1:
+            return outputs[0]
+        return torch.cat(outputs, dim=-1)
 
 
 class MultiDecoder(nn.Module):

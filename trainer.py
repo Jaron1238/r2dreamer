@@ -85,6 +85,7 @@ class FPVDataset(IterableDataset):
         self.batch_length = batch_length
         self.require_osd  = require_osd
         self.use_depth = bool(getattr(config, "use_depth", False))
+        self.action_dim = int(getattr(config.model, "act_dim", 4))
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
         self.depth_preprocessor = DepthPreprocessor(
@@ -145,7 +146,7 @@ class FPVDataset(IterableDataset):
                     pad_act = torch.zeros((self.batch_length - actions.shape[0], action_dim), dtype=torch.float32)
                     actions = torch.cat([actions, pad_act], dim=0)
             else:
-                actions = torch.zeros((self.batch_length, 4), dtype=torch.float32)
+                actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
 
             drone_id = int(sample.get("drone_id", 0))
             drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
@@ -335,6 +336,7 @@ class OfflineTrainer:
                         self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
 
                     optimizer.step()
+                    scheduler.step()
                     optimizer.zero_grad()
 
                     running_loss += loss.detach().item()
@@ -342,7 +344,8 @@ class OfflineTrainer:
 
                     if step % self.log_every == 0:
                         loss_tensor = torch.tensor(running_loss, device=self.accelerator.device)
-                        avg_loss = self.accelerator.gather_for_metrics(loss_tensor).sum().item() / self.log_every
+                        gathered_loss = self.accelerator.gather_for_metrics(loss_tensor)
+                        avg_loss = gathered_loss.mean().item() / self.log_every
                         
                         self.accelerator.print(f"Step {step:6d} | Loss: {avg_loss:.4f}")
 
@@ -376,6 +379,7 @@ class OnlineTrainer:
             gradient_accumulation_steps=int(config.get("accumulation_steps", 1)),
             mixed_precision="fp16",
         )
+        self.num_eps = 0
 
     def begin(self, agent, env):
         replay_buffer = Buffer(agent.config.buffer)
@@ -404,6 +408,7 @@ class OnlineTrainer:
                     "speed": obs.get("speed", torch.zeros(1, 1, device=self.accelerator.device)),
                     "drone_id": obs.get("drone_id", torch.zeros(1, dtype=torch.long, device=self.accelerator.device)),
                     "crash": torch.tensor([[float(terminated)]], dtype=torch.float32, device=self.accelerator.device),
+                    "episode": torch.tensor([self.num_eps], dtype=torch.long, device=self.accelerator.device),
                     "stoch": state["stoch"].detach(),
                     "deter": state["deter"].detach(),
                 },
@@ -420,6 +425,7 @@ class OnlineTrainer:
                         self.logger.scalar(f"online/{k}", val)
 
             if done:
+                self.num_eps += 1
                 obs, _ = env.reset()
                 obs = self._to_device_obs(obs, is_first=True)
                 state = agent.get_initial_state(B=1).to(self.accelerator.device)
@@ -437,7 +443,9 @@ class OnlineTrainer:
                 tensor = tensor.long()
             else:
                 tensor = tensor.float()
-            if tensor.ndim == 0:
+            if key == "image" and tensor.ndim == 3:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.ndim == 0:
                 tensor = tensor.unsqueeze(0)
             out[key] = tensor
         out["is_first"] = torch.tensor([bool(is_first)], dtype=torch.bool, device=self.accelerator.device)
