@@ -32,11 +32,14 @@ class Dreamer(nn.Module):
         self.return_ema    = networks.ReturnEMA(device=self.device)
         self.act_dim       = int(config.act_dim)
         self.rep_loss      = str(config.rep_loss)
+        self.phase         = int(getattr(config, "phase", 1))
+        self.use_depth     = bool(getattr(config, "use_depth", False))
+        self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
+        self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
 
         image_shape = (int(config.img_height), int(config.img_width), 6)
         shapes = {
-            # "image" kommt bereits als RGB + Frame-Differenz aus dem Dataset.
-            "image": image_shape,
+            "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
         }
 
         self.encoder    = networks.MultiEncoder(config.encoder, shapes)
@@ -62,7 +65,12 @@ class Dreamer(nn.Module):
         self._log_grads   = bool(config.log_grads)
         self.num_drones = int(config.get("num_drone_classes", 10))
         self.drone_embed = nn.Embedding(self.num_drones, 16)
-        modules = OrderedDict({
+        self.safety_net = networks.SafetyNet(
+            in_channels=shapes["image"][-1],
+            action_dim=self.act_dim,
+            speed_dim=1,
+        )
+        modules = {
             "rssm":    self.rssm,
             "actor":   self.actor,
             "value":   self.value,
@@ -70,7 +78,8 @@ class Dreamer(nn.Module):
             "cont":    self.cont,
             "encoder": self.encoder,
             "drone_embed": self.drone_embed, 
-        })
+            "safety_net": self.safety_net,
+        }
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -143,6 +152,7 @@ class Dreamer(nn.Module):
         self._scheduler = self.build_scheduler(self._optimizer)
 
         self.train()
+        self._configure_trainable_modules()
         self.clone_and_freeze()
         if config.compile:
             print("Compiling loss computation with torch.compile...")
@@ -240,7 +250,12 @@ class Dreamer(nn.Module):
         )
 
     def get_optimizer(self):
-        return self._build_optimizer()
+        params = [p for p in self.parameters() if p.requires_grad]
+        return LaProp(
+            [{"params": params, "lr": self._base_lr}],
+            betas=(0.9, 0.999),
+            eps=1e-8,
+        )
 
     def _update_slow_target(self):
         if self._slow_value_updates % self.slow_target_update == 0:
@@ -352,6 +367,10 @@ class Dreamer(nn.Module):
         feat         = self._frozen_rssm.get_feat(stoch, deter)
         action_dist  = self._frozen_actor(feat)
         action       = action_dist.mode if eval else action_dist.rsample()
+        speed = obs.get("speed", torch.zeros(*action.shape[:-1], 1, device=action.device))
+        safety_score = self.safety_net(p_obs["image"], speed, action)
+        brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
+        action = torch.where(safety_score < self.safety_threshold, brake, action)
         return action, TensorDict(
             {"stoch": stoch, "deter": deter, "prev_action": action},
             batch_size=state.batch_size,
@@ -513,11 +532,19 @@ class Dreamer(nn.Module):
         B, T    = data.shape
         if initial is None:
             initial = self.rssm.initial(B)
-        embed = self.encoder(data)
-        d_emb = self._get_drone_embedding(data.get("drone_id"), batch_shape=data["action"].shape[:2], device=embed.device)
-        post_stoch, post_deter, post_logit = self.rssm.observe(
-            embed, data["action"], initial, data["is_first"], d_emb
-        )
+        if self.phase == 2:
+            with torch.no_grad():
+                embed = self.encoder(data)
+                d_emb = self.drone_embed(data["drone_id"])
+                post_stoch, post_deter, post_logit = self.rssm.observe(
+                    embed, data["action"], initial, data["is_first"], d_emb
+                )
+        else:
+            embed = self.encoder(data)
+            d_emb = self.drone_embed(data["drone_id"])
+            post_stoch, post_deter, post_logit = self.rssm.observe(
+                embed, data["action"], initial, data["is_first"], d_emb
+            )
         _, prior_logit    = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         losses["dyn"]     = torch.mean(dyn_loss)
@@ -577,80 +604,79 @@ class Dreamer(nn.Module):
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
 
-        start = (
-            post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
-            post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
-        )
-        d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0) 
-        
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
-        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-        imag_reward     = self._frozen_reward(imag_feat).mode()
-        imag_cont       = self._frozen_cont(imag_feat).mean
-        imag_value      = self._frozen_value(imag_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
-        disc            = 1 - 1 / self.horizon
-        weight          = torch.cumprod(imag_cont * disc, dim=1)
-        last            = torch.zeros_like(imag_cont)
-        term            = 1 - imag_cont
-        ret             = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
-        ret_offset, ret_scale = self.return_ema(ret)
-        adv             = (ret - imag_value[:, :-1]) / ret_scale
+        if self.phase == 2:
+            actor_dist = self.actor(feat.detach())
+            actor_mode = actor_dist.mode()
+            losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
+            speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
+            crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
+            safety_pred = self.safety_net(data["image"], speed, data["action"])
+            losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
+            metrics["safety/score_mean"] = safety_pred.mean()
+            metrics["bc/mse"] = losses["bc"].detach()
+        elif self.phase >= 3:
+            start = (
+                post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
+                post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+            )
+            d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0)
+            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
+            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+            imag_reward = self._frozen_reward(imag_feat).mode()
+            imag_cont = self._frozen_cont(imag_feat).mean
+            imag_value = self._frozen_value(imag_feat).mode()
+            imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+            disc = 1 - 1 / self.horizon
+            weight = torch.cumprod(imag_cont * disc, dim=1)
+            last = torch.zeros_like(imag_cont)
+            term = 1 - imag_cont
+            ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
+            ret_offset, ret_scale = self.return_ema(ret)
+            adv = (ret - imag_value[:, :-1]) / ret_scale
+            policy = self.actor(imag_feat)
+            logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
+            entropy = policy.entropy()[:, :-1].unsqueeze(-1)
+            losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+            imag_value_dist = self.value(imag_feat)
+            tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+            losses["value"] = torch.mean(
+                weight[:, :-1].detach()
+                * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[:, :-1].unsqueeze(-1)
+            )
+            ret_normed = (ret - ret_offset) / ret_scale
+            metrics["ret"] = torch.mean(ret_normed)
+            metrics["ret_005"] = self.return_ema.ema_vals[0]
+            metrics["ret_095"] = self.return_ema.ema_vals[1]
+            metrics["adv"] = torch.mean(adv)
+            metrics["adv_std"] = torch.std(adv)
+            metrics["con"] = torch.mean(imag_cont)
+            metrics["rew"] = torch.mean(imag_reward)
+            metrics["val"] = torch.mean(imag_value)
+            metrics["tar"] = torch.mean(ret)
+            metrics["slowval"] = torch.mean(imag_slow_value)
+            metrics["weight"] = torch.mean(weight)
+            metrics["action_entropy"] = torch.mean(entropy)
+            metrics.update(tools.tensorstats(imag_action, "action"))
+            last, term, reward = (to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]))
+            feat = self.rssm.get_feat(post_stoch, post_deter)
+            boot = ret[:, 0].reshape(B, T, 1)
+            value = self._frozen_value(feat).mode()
+            slow_value = self._frozen_slow_value(feat).mode()
+            disc = 1 - 1 / self.horizon
+            weight = 1.0 - last
+            ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
+            ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+            value_dist = self.value(feat)
+            losses["repval"] = torch.mean(
+                weight[:, :-1]
+                * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1)
+            )
+            metrics.update(tools.tensorstats(ret, "ret_replay"))
+            metrics.update(tools.tensorstats(value, "value_replay"))
+            metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
-        policy  = self.actor(imag_feat)
-        logpi   = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
-        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = torch.mean(
-            weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)
-        )
-
-        imag_value_dist = self.value(imag_feat)
-        tar_padded      = torch.cat([ret, 0 * ret[:, -1:]], 1)
-        losses["value"] = torch.mean(
-            weight[:, :-1].detach()
-            * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
-                :, :-1
-            ].unsqueeze(-1)
-        )
-
-        ret_normed                = (ret - ret_offset) / ret_scale
-        metrics["ret"]            = torch.mean(ret_normed)
-        metrics["ret_005"]        = self.return_ema.ema_vals[0]
-        metrics["ret_095"]        = self.return_ema.ema_vals[1]
-        metrics["adv"]            = torch.mean(adv)
-        metrics["adv_std"]        = torch.std(adv)
-        metrics["con"]            = torch.mean(imag_cont)
-        metrics["rew"]            = torch.mean(imag_reward)
-        metrics["val"]            = torch.mean(imag_value)
-        metrics["tar"]            = torch.mean(ret)
-        metrics["slowval"]        = torch.mean(imag_slow_value)
-        metrics["weight"]         = torch.mean(weight)
-        metrics["action_entropy"] = torch.mean(entropy)
-        metrics.update(tools.tensorstats(imag_action, "action"))
-
-        last, term, reward = (
-            to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]),
-        )
-        feat        = self.rssm.get_feat(post_stoch, post_deter)
-        boot        = ret[:, 0].reshape(B, T, 1)
-        value       = self._frozen_value(feat).mode()
-        slow_value  = self._frozen_slow_value(feat).mode()
-        disc        = 1 - 1 / self.horizon
-        weight      = 1.0 - last
-        ret         = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
-        ret_padded  = torch.cat([ret, 0 * ret[:, -1:]], 1)
-
-        value_dist      = self.value(feat)
-        losses["repval"] = torch.mean(
-            weight[:, :-1]
-            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1)
-        )
-
-        metrics.update(tools.tensorstats(ret, "ret_replay"))
-        metrics.update(tools.tensorstats(value, "value_replay"))
-        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
-
-        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
+        self._scaler.scale(total_loss).backward()
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), total_loss, metrics
@@ -682,8 +708,29 @@ class Dreamer(nn.Module):
     @torch.no_grad()
     def preprocess(self, data):
         if "image" in data:
-            data["image"] = to_f32(data["image"]) / 255.0
+            image = to_f32(data["image"])
+            if torch.max(image) > 1.5:
+                image = image / 255.0
+            data["image"] = image
         return data
+
+    def _configure_trainable_modules(self):
+        # Phase 1: world model only; no policy/value updates.
+        if self.phase == 1:
+            for p in self.actor.parameters():
+                p.requires_grad = False
+            for p in self.value.parameters():
+                p.requires_grad = False
+        # Phase 2: freeze encoder/rssm, train actor via BC and safety net.
+        elif self.phase == 2:
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            for p in self.rssm.parameters():
+                p.requires_grad = False
+            for p in self.reward.parameters():
+                p.requires_grad = False
+            for p in self.cont.parameters():
+                p.requires_grad = False
 
     @torch.no_grad()
     def augment_data(self, data):
