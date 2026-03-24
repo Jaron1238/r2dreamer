@@ -82,6 +82,7 @@ class RSSM(nn.Module):
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
         self._blocks = int(config.blocks)
+        self._d_emb_dim = 16
         self.flat_stoch = self._stoch * self._discrete
         self.feat_size = self.flat_stoch + self._deter
         self._deter_net = Deter(
@@ -128,8 +129,14 @@ class RSSM(nn.Module):
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         return stoch, deter
 
-    def observe(self, embed, action, initial, reset, d_emb):
+    def _default_d_emb(self, tensor):
+        shape = tuple(tensor.shape[:-1])
+        return torch.zeros(*shape, self._d_emb_dim, dtype=torch.float32, device=tensor.device)
+
+    def observe(self, embed, action, initial, reset, d_emb=None):
         L = action.shape[1]
+        if d_emb is None:
+            d_emb = self._default_d_emb(action)
         stoch, deter = initial
         stochs, deters, logits = [], [],[]
         for i in range(L):
@@ -142,7 +149,9 @@ class RSSM(nn.Module):
         logits = torch.stack(logits, dim=1)
         return stochs, deters, logits
 
-    def obs_step(self, stoch, deter, prev_action, embed, reset, d_emb):
+    def obs_step(self, stoch, deter, prev_action, embed, reset, d_emb=None):
+        if d_emb is None:
+            d_emb = self._default_d_emb(prev_action)
         stoch = torch.where(rpad(reset, stoch.dim() - int(reset.dim())), torch.zeros_like(stoch), stoch)
         deter = torch.where(rpad(reset, deter.dim() - int(reset.dim())), torch.zeros_like(deter), deter)
         prev_action = torch.where(rpad(reset, prev_action.dim() - int(reset.dim())), torch.zeros_like(prev_action), prev_action)
@@ -153,7 +162,9 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, deter, logit
 
-    def img_step(self, stoch, deter, prev_action, d_emb):
+    def img_step(self, stoch, deter, prev_action, d_emb=None):
+        if d_emb is None:
+            d_emb = self._default_d_emb(prev_action)
         deter = self._deter_net(stoch, deter, prev_action, d_emb)
         stoch, _ = self.prior(deter)
         return stoch, deter
@@ -167,13 +178,16 @@ class RSSM(nn.Module):
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
-    def imagine_with_action(self, stoch, deter, actions):
+    def imagine_with_action(self, stoch, deter, actions, d_emb=None):
         """Roll out prior dynamics given a sequence of actions."""
         # (B, S, K), (B, D), (B, T, A)
         L = actions.shape[1]
+        if d_emb is None:
+            d_emb = self._default_d_emb(actions)
         stochs, deters = [], []
         for i in range(L):
-            stoch, deter = self.img_step(stoch, deter, actions[:, i])
+            step_d_emb = d_emb[:, i] if d_emb.dim() == 3 else d_emb
+            stoch, deter = self.img_step(stoch, deter, actions[:, i], step_d_emb)
             stochs.append(stoch)
             deters.append(deter)
         # (B, T, S, K), (B, T, D)

@@ -221,7 +221,7 @@ class ConvEncoder(nn.Module):
         for param in backbone.features[1:4].parameters():
             param.requires_grad = False
 
-        # Trainierbar: Layer 0 (6-Channel) + Layer 4-8 (high-level)
+        # Trainierbar: Layer 0 (6 Kanäle) + Layer 4-8 (high-level)
         for param in backbone.features[0].parameters():
             param.requires_grad = True
         for param in backbone.features[4:].parameters():

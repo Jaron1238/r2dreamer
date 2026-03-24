@@ -17,6 +17,9 @@ from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
 
+_DEFAULT = object()
+
+
 class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -34,6 +37,7 @@ class Dreamer(nn.Module):
         self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
 
+        image_shape = (int(config.img_height), int(config.img_width), 6)
         shapes = {
             "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
         }
@@ -116,23 +120,17 @@ class Dreamer(nn.Module):
                 "prototypes":   self._prototypes,
                 "obs_proj":     self.obs_proj,
                 "feat_proj":    self.feat_proj,
-                "ema_encoder":  self._ema_encoder,
-                "ema_obs_proj": self._ema_obs_proj,
             })
 
-        for key, module in modules.items():
+        self._modules = modules
+
+        for key, module in self._modules.items():
             if isinstance(module, nn.Parameter):
                 print(f"{module.numel():>14,}: {key}")
             else:
                 print(f"{sum(p.numel() for p in module.parameters()):>14,}: {key}")
 
-        self._named_params = OrderedDict()
-        for name, module in modules.items():
-            if isinstance(module, nn.Parameter):
-                self._named_params[name] = module
-            else:
-                for param_name, param in module.named_parameters():
-                    self._named_params[f"{name}.{param_name}"] = param
+        self._named_params = self._collect_named_params()
         print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
 
         def _agc(params):
@@ -140,12 +138,9 @@ class Dreamer(nn.Module):
 
         self._agc       = _agc
         self._base_lr   = float(config.lr)
-        self._optimizer = LaProp(
-            self._named_params.values(),
-            lr=self._base_lr,
-            betas=(config.beta1, config.beta2),
-            eps=config.eps,
-        )
+        self._opt_betas = (float(config.beta1), float(config.beta2))
+        self._opt_eps   = float(config.eps)
+        self._optimizer = self._build_optimizer()
         self._scaler = GradScaler()
 
         def lr_lambda(step):
@@ -153,14 +148,15 @@ class Dreamer(nn.Module):
                 return min(1.0, (step + 1) / config.warmup)
             return 1.0
 
-        self._scheduler = LambdaLR(self._optimizer, lr_lambda=lr_lambda)
+        self._lr_lambda = lr_lambda
+        self._scheduler = self.build_scheduler(self._optimizer)
 
         self.train()
         self._configure_trainable_modules()
         self.clone_and_freeze()
         if config.compile:
-            print("Compiling update function with torch.compile...")
-            self._cal_grad = torch.compile(self._cal_grad, mode="reduce-overhead")
+            print("Compiling loss computation with torch.compile...")
+            self.compute_losses = torch.compile(self.compute_losses, mode="reduce-overhead")
 
     def encode(self, images):
         obs = {"image": images}
@@ -183,6 +179,75 @@ class Dreamer(nn.Module):
             "barlow/std_mean":   z_a_norm.std(0).mean().item(),
         }
         return loss, metrics
+
+    def _iter_trainable_named_parameters(self, module_name, module):
+        if isinstance(module, nn.Parameter):
+            if module.requires_grad:
+                yield module_name, module
+            return
+        for param_name, param in module.named_parameters():
+            if param.requires_grad:
+                yield f"{module_name}.{param_name}", param
+
+    def _collect_named_params(self):
+        named_params = OrderedDict()
+        for module_name, module in self._modules.items():
+            for param_name, param in self._iter_trainable_named_parameters(module_name, module):
+                named_params[param_name] = param
+        return named_params
+
+    def _get_encoder_param_groups(self):
+        encoder_named_params = [
+            (name, param) for name, param in self._named_params.items()
+            if name.startswith("encoder.")
+        ]
+        if not encoder_named_params:
+            return []
+
+        stem_params = [
+            param for name, param in encoder_named_params
+            if ".backbone.0.0." in name
+        ]
+        other_encoder_params = [
+            param for name, param in encoder_named_params
+            if ".backbone.0.0." not in name
+        ]
+
+        param_groups = []
+        if stem_params:
+            param_groups.append({"params": stem_params, "lr": self._base_lr * 10})
+        if other_encoder_params:
+            param_groups.append({"params": other_encoder_params, "lr": self._base_lr})
+        return param_groups
+
+    def _build_optimizer_param_groups(self):
+        param_groups = self._get_encoder_param_groups()
+        grouped_param_ids = {
+            id(param)
+            for group in param_groups
+            for param in group["params"]
+        }
+
+        for module_name, module in self._modules.items():
+            if module_name == "encoder":
+                continue
+
+            module_params = [
+                param
+                for _, param in self._iter_trainable_named_parameters(module_name, module)
+                if id(param) not in grouped_param_ids
+            ]
+            if module_params:
+                param_groups.append({"params": module_params, "lr": self._base_lr})
+
+        return param_groups
+
+    def _build_optimizer(self):
+        return LaProp(
+            self._build_optimizer_param_groups(),
+            betas=self._opt_betas,
+            eps=self._opt_eps,
+        )
 
     def get_optimizer(self):
         params = [p for p in self.parameters() if p.requires_grad]
@@ -275,16 +340,29 @@ class Dreamer(nn.Module):
         self.clone_and_freeze()
         return self
 
+    def _get_drone_embedding(self, drone_id=None, *, batch_shape=None, frozen=False, device=None):
+        module = self._frozen_drone_embed if frozen else self.drone_embed
+        if drone_id is None:
+            if batch_shape is None:
+                raise ValueError("batch_shape is required when drone_id is not provided.")
+            drone_id = torch.zeros(*batch_shape, dtype=torch.long, device=device or self.device)
+        else:
+            drone_id = drone_id.to(device=device or self.device, dtype=torch.long)
+        return module(drone_id)
+
     @torch.no_grad()
     def act(self, obs, state, eval=False):
         torch.compiler.cudagraph_mark_step_begin()
         p_obs                          = self.preprocess(obs)
         embed                          = self._frozen_encoder(p_obs)
+        d_emb                          = self._get_drone_embedding(
+            obs.get("drone_id"), batch_shape=embed.shape[:-1], frozen=True, device=embed.device
+        )
         prev_stoch, prev_deter, prev_action = (
             state["stoch"], state["deter"], state["prev_action"],
         )
         stoch, deter, _ = self._frozen_rssm.obs_step(
-            prev_stoch, prev_deter, prev_action, embed, obs["is_first"]
+            prev_stoch, prev_deter, prev_action, embed, obs["is_first"], d_emb
         )
         feat         = self._frozen_rssm.get_feat(stoch, deter)
         action_dist  = self._frozen_actor(feat)
@@ -317,20 +395,108 @@ class Dreamer(nn.Module):
             raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
         B     = min(data["action"].shape[0], 6)
         embed = self.encoder(data)
+        d_emb = self._get_drone_embedding(data.get("drone_id"), batch_shape=data["action"].shape[:2], device=embed.device)
         post_stoch, post_deter, _ = self.rssm.observe(
             embed[:B, :5], data["action"][:B, :5],
-            tuple(val[:B] for val in initial), data["is_first"][:B, :5],
+            tuple(val[:B] for val in initial), data["is_first"][:B, :5], d_emb[:B, :5],
         )
         recon               = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
         prior_stoch, prior_deter = self.rssm.imagine_with_action(
-            init_stoch, init_deter, data["action"][:B, 5:],
+            init_stoch, init_deter, data["action"][:B, 5:], d_emb[:B, 5:],
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
         model = torch.cat([recon[:, :5], openl], 1)
         truth = data["image"][:B]
         error = (model - truth + 1.0) / 2.0
         return torch.cat([truth, model, error], 2)
+
+    def build_scheduler(self, optimizer):
+        return LambdaLR(optimizer, lr_lambda=self._lr_lambda)
+
+    def _optimizer_params(self, optimizer):
+        return [param for group in optimizer.param_groups for param in group["params"] if param is not None]
+
+    def train_step(
+        self,
+        data,
+        initial=None,
+        *,
+        optimizer=_DEFAULT,
+        scheduler=_DEFAULT,
+        scaler=_DEFAULT,
+        backward_fn=None,
+        clip_grad_fn=None,
+        grad_params=None,
+        zero_grad_kwargs=None,
+        autocast_enabled=True,
+        post_backward_hook=None,
+    ):
+        if optimizer is _DEFAULT:
+            optimizer = self._optimizer
+        if scheduler is _DEFAULT:
+            scheduler = self._scheduler
+        if scaler is _DEFAULT:
+            scaler = self._scaler
+        zero_grad_kwargs = zero_grad_kwargs or {"set_to_none": True}
+        grad_params = list(grad_params) if grad_params is not None else self._optimizer_params(optimizer)
+
+        metrics = {}
+        old_params = None
+        if self._log_grads:
+            old_params = [param.data.clone().detach() for param in grad_params]
+
+        autocast_context = autocast(
+            device_type=self.device.type,
+            dtype=torch.float16,
+            enabled=autocast_enabled,
+        )
+        with autocast_context:
+            (stoch, deter), loss, mets = self.compute_losses(data, initial)
+
+        if backward_fn is not None:
+            backward_fn(loss)
+        elif scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if scaler is not None:
+            scaler.unscale_(optimizer)
+
+        if post_backward_hook is not None:
+            post_backward_hook()
+
+        if self._log_grads:
+            grads = [param.grad for param in grad_params if param.grad is not None]
+            if grads:
+                mets["opt/grad_norm"] = tools.compute_global_norm(grads)
+                mets["opt/grad_rms"] = tools.compute_rms(grads)
+
+        self._agc(grad_params)
+        if clip_grad_fn is not None:
+            clip_grad_fn(grad_params)
+
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+            mets["opt/grad_scale"] = scaler.get_scale()
+        else:
+            optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()
+            mets["opt/lr"] = scheduler.get_last_lr()[0]
+
+        self.zero_grad(**zero_grad_kwargs)
+
+        if self._log_grads and old_params is not None:
+            updates = [new.detach() - old for new, old in zip(grad_params, old_params)]
+            mets["opt/param_rms"] = tools.compute_rms(grad_params)
+            mets["opt/update_rms"] = tools.compute_rms(updates)
+
+        metrics.update(mets)
+        return (stoch, deter), metrics
 
     def update(self, replay_buffer):
         data, index, initial = replay_buffer.sample()
@@ -339,37 +505,28 @@ class Dreamer(nn.Module):
         self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
-        metrics = {}
-        with autocast(device_type=self.device.type, dtype=torch.float16):
-            (stoch, deter), mets = self._cal_grad(p_data, initial)
-        self._scaler.unscale_(self._optimizer)
-        if self.rep_loss == "dreamerpro" and self._ema_updates < self.freeze_prototypes_iters:
-            self._prototypes.grad.zero_()
-        if self._log_grads:
-            old_params = [p.data.clone().detach() for p in self._named_params.values()]
-            grads      = [p.grad for p in self._named_params.values() if p.grad is not None]
-            grad_norm  = tools.compute_global_norm(grads)
-            grad_rms   = tools.compute_rms(grads)
-            mets["opt/grad_norm"] = grad_norm
-            mets["opt/grad_rms"]  = grad_rms
-        self._agc(self._named_params.values())
-        self._scaler.step(self._optimizer)
-        self._scaler.update()
-        self._scheduler.step()
-        self._optimizer.zero_grad(set_to_none=True)
-        mets["opt/lr"]         = self._scheduler.get_lr()[0]
-        mets["opt/grad_scale"] = self._scaler.get_scale()
-        if self._log_grads:
-            updates    = [(new - old) for (new, old) in zip(self._named_params.values(), old_params)]
-            update_rms = tools.compute_rms(updates)
-            params_rms = tools.compute_rms(self._named_params.values())
-            mets["opt/param_rms"]  = params_rms
-            mets["opt/update_rms"] = update_rms
-        metrics.update(mets)
+
+        def post_backward_hook():
+            if (
+                self.rep_loss == "dreamerpro"
+                and self._ema_updates < self.freeze_prototypes_iters
+                and self._prototypes.grad is not None
+            ):
+                self._prototypes.grad.zero_()
+
+        (stoch, deter), metrics = self.train_step(
+            p_data,
+            initial,
+            optimizer=self._optimizer,
+            scheduler=self._scheduler,
+            scaler=self._scaler,
+            zero_grad_kwargs={"set_to_none": True},
+            post_backward_hook=post_backward_hook,
+        )
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial):
+    def compute_losses(self, data, initial):
         losses  = {}
         metrics = {}
         B, T    = data.shape
@@ -429,8 +586,11 @@ class Dreamer(nn.Module):
                 )
                 ema_proj = self.ema_proj(data_aug)
             embed_aug               = self.encoder(data_aug)
+            d_emb_aug               = self._get_drone_embedding(
+                data_aug.get("drone_id"), batch_shape=data_aug["action"].shape[:2], device=embed_aug.device
+            )
             post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
-                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
+                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"], d_emb_aug
             )
             proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
             losses.update(proto_losses)
@@ -519,7 +679,7 @@ class Dreamer(nn.Module):
         self._scaler.scale(total_loss).backward()
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
-        return (post_stoch, post_deter), metrics
+        return (post_stoch, post_deter), total_loss, metrics
 
     @torch.no_grad()
     def _imagine(self, start, imag_horizon, d_emb):

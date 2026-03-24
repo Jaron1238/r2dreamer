@@ -289,9 +289,6 @@ class OfflineTrainer:
             },
             batch_size=[batch_size, time_steps],
         )
-        post, metrics = agent._cal_grad(data, initial=None)
-        loss = metrics.pop("opt/loss")
-        return loss, metrics
 
     def begin(self, agent):
         loader = DataLoader(
@@ -303,7 +300,8 @@ class OfflineTrainer:
             drop_last=True
         )
         optimizer = agent.get_optimizer()
-        agent, optimizer, loader = self.accelerator.prepare(agent, optimizer, loader)
+        scheduler = agent.build_scheduler(optimizer)
+        agent, optimizer, loader, scheduler = self.accelerator.prepare(agent, optimizer, loader, scheduler)
         agent.train()
         
         self.accelerator.print(f"Start Training | Processes: {self.accelerator.num_processes}")
