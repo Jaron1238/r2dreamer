@@ -368,7 +368,10 @@ class Dreamer(nn.Module):
         action_dist  = self._frozen_actor(feat)
         action       = action_dist.mode if eval else action_dist.rsample()
         speed = obs.get("speed", torch.zeros(*action.shape[:-1], 1, device=action.device))
-        safety_score = self.safety_net(p_obs["image"], speed, action)
+        img_t = p_obs["image"].unsqueeze(1)
+        speed_t = speed.unsqueeze(1)
+        action_t = action.unsqueeze(1)
+        safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
         brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
         action = torch.where(safety_score < self.safety_threshold, brake, action)
         return action, TensorDict(
@@ -676,7 +679,6 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
-        self._scaler.scale(total_loss).backward()
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), total_loss, metrics
