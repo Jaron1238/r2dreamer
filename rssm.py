@@ -8,7 +8,7 @@ from tools import rpad, weight_init_
 
 
 class Deter(nn.Module):
-    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, act="SiLU"):
+    def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, d_emb_dim=16, act="SiLU"):
         super().__init__()
         self.blocks = int(blocks)
         self.dynlayers = int(dynlayers)
@@ -23,7 +23,7 @@ class Deter(nn.Module):
             nn.Linear(act_dim, hidden, bias=True), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act())
 
         self._dyn_in3 = nn.Sequential(
-            nn.Linear(16, hidden), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()) 
+            nn.Linear(d_emb_dim, hidden), nn.RMSNorm(hidden, eps=1e-04, dtype=torch.float32), act()) 
 
         
         self._dyn_hid = nn.Sequential()
@@ -92,6 +92,7 @@ class RSSM(nn.Module):
             self._hidden,
             blocks=self._blocks,
             dynlayers=self._dyn_layers,
+            d_emb_dim=self._d_emb_dim,
             act=config.act,
         )
 
