@@ -7,6 +7,8 @@ compile: True
 log_grads: False
 device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+safety_input_key: "image"
+safety_in_channels: 1
 
 lr: 4e-5
 agc: 0.3

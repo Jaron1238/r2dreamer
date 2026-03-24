@@ -2,6 +2,7 @@ import pathlib
 import torch
 import numpy as np
 import torch.nn.functional as F
+from PIL import Image
 from tensordict import TensorDict
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from accelerate import Accelerator
@@ -86,8 +87,14 @@ class FPVDataset(IterableDataset):
         self.require_osd  = require_osd
         self.use_depth = bool(getattr(config, "use_depth", False))
         self.action_dim = int(getattr(config.model, "act_dim", 4))
+        self.raw_image_mode = str(getattr(config.dataset, "raw_image_mode", "grayscale"))
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
+        self.raw_source = SafetyRawImageSource(
+            config.dataset.get("raw_dataset", None),
+            output_size=(self.img_height, self.img_width),
+            raw_image_mode=self.raw_image_mode,
+        )
         self.depth_preprocessor = DepthPreprocessor(
             use_depth=self.use_depth,
             output_size=min(self.img_height, self.img_width),
@@ -115,11 +122,13 @@ class FPVDataset(IterableDataset):
             frames = torch.from_numpy(np.array(sample["frames"])).float()
             if frames.ndim >= 4 and frames.shape[-1] in (3, 4) and frames.max() > 1.5:
                 frames = frames / 255.0
+            raw_image = self._build_raw_image(frames)
             T = frames.shape[0]
             start = 0
             if T > self.batch_length:
                 start = torch.randint(0, T - self.batch_length, (1,)).item()
                 frames = frames[start : start + self.batch_length]
+                raw_image = raw_image[start : start + self.batch_length]
             elif T < self.batch_length:
                 continue
             if self.use_depth:
@@ -132,6 +141,9 @@ class FPVDataset(IterableDataset):
                 diff = torch.zeros_like(frames)
                 diff[1:] = frames[1:] - frames[:-1]
                 image = torch.cat([frames, diff], dim=-1)
+            safety = self.raw_source.sample_sequence(self.batch_length)
+            if safety is not None:
+                raw_image = safety["raw_image"]
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True
             is_last = torch.zeros(self.batch_length, dtype=torch.bool)
@@ -153,6 +165,7 @@ class FPVDataset(IterableDataset):
 
             yield {
                 "image": image,
+                "raw_image": raw_image,
                 "is_first": is_first,
                 "is_last": is_last,
                 "is_terminal": is_terminal,
@@ -160,8 +173,137 @@ class FPVDataset(IterableDataset):
                 "action": actions,
                 "drone_id": drone_id,
                 "speed": torch.zeros(self.batch_length, 1, dtype=torch.float32),
-                "crash": is_terminal.float().unsqueeze(-1),
+                "crash": safety["crash"] if safety is not None else is_terminal.float().unsqueeze(-1),
             }
+
+    def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim == 3:
+            return frames[..., None]
+        if frames.shape[-1] in (1, 2):
+            return frames[..., :1]
+        if self.raw_image_mode == "rgb":
+            return frames[..., :3]
+        return frames[..., :3].mean(dim=-1, keepdim=True)
+
+
+class SafetyRawImageSource:
+    def __init__(self, raw_cfg, output_size, raw_image_mode: str):
+        self.output_size = tuple(output_size)
+        self.raw_image_mode = raw_image_mode
+        self.enabled = bool(raw_cfg and raw_cfg.get("enabled", False))
+        self.source = None
+        self.good_files = []
+        self.bad_files = []
+        self.hf_ds = None
+        self.hf_iter = None
+        if not self.enabled:
+            return
+        self.source = str(raw_cfg.get("source", "folders"))
+        if self.source == "folders":
+            root = pathlib.Path(raw_cfg.get("root", ""))
+            self.good_files = sorted((root / "good").glob("*"))
+            self.bad_files = sorted((root / "bad").glob("*"))
+            if not self.good_files and not self.bad_files:
+                self.enabled = False
+        elif self.source == "streaming":
+            from datasets import load_dataset
+
+            repo = raw_cfg.get("hf_repo", None)
+            split = raw_cfg.get("split", "train")
+            if not repo:
+                self.enabled = False
+                return
+            stream = bool(raw_cfg.get("streaming", True))
+            self.hf_ds = load_dataset(repo, split=split, streaming=stream)
+            self.hf_iter = iter(self.hf_ds)
+        else:
+            self.enabled = False
+
+    def sample_sequence(self, length: int):
+        if not self.enabled:
+            return None
+        if self.source == "folders":
+            raw_frames = []
+            crash = []
+            for _ in range(length):
+                is_bad = bool(torch.rand(1).item() > 0.5)
+                path = self._choose_file(is_bad)
+                raw_frames.append(self._load_local_image(path))
+                crash.append([1.0 if is_bad else 0.0])
+            return {
+                "raw_image": torch.stack(raw_frames, dim=0),
+                "crash": torch.tensor(crash, dtype=torch.float32),
+            }
+        if self.source == "streaming":
+            raw_frames = []
+            crash = []
+            for _ in range(length):
+                item = self._next_stream_item()
+                img = self._stream_item_to_image(item)
+                raw_frames.append(img)
+                label = float(item.get("crash", item.get("label", 0.0)))
+                crash.append([label])
+            return {
+                "raw_image": torch.stack(raw_frames, dim=0),
+                "crash": torch.tensor(crash, dtype=torch.float32),
+            }
+        return None
+
+    def _choose_file(self, is_bad: bool):
+        files = self.bad_files if is_bad and self.bad_files else self.good_files
+        if not files:
+            files = self.bad_files or self.good_files
+        idx = torch.randint(0, len(files), (1,)).item()
+        return files[idx]
+
+    def _load_local_image(self, path: pathlib.Path):
+        image = Image.open(path).convert("RGB")
+        arr = torch.from_numpy(np.array(image)).float() / 255.0
+        return self._postprocess(arr)
+
+    def _next_stream_item(self):
+        assert self.hf_iter is not None
+        try:
+            return next(self.hf_iter)
+        except StopIteration:
+            if self.hf_ds is None:
+                raise
+            self.hf_iter = iter(self.hf_ds)
+            return next(self.hf_iter)
+
+    def _stream_item_to_image(self, item):
+        if "image" in item:
+            image = item["image"]
+            if isinstance(image, Image.Image):
+                arr = torch.from_numpy(np.array(image.convert("RGB"))).float() / 255.0
+            else:
+                arr = torch.from_numpy(np.array(image)).float()
+        elif "frames" in item:
+            frames = np.array(item["frames"])
+            arr = torch.from_numpy(frames[0]).float()
+        else:
+            arr = torch.zeros(*self.output_size, 3, dtype=torch.float32)
+        if arr.max() > 1.5:
+            arr = arr / 255.0
+        return self._postprocess(arr)
+
+    def _postprocess(self, arr: torch.Tensor):
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim == 3 and arr.shape[-1] not in (1, 3):
+            arr = arr[..., :3]
+        if self.raw_image_mode == "grayscale" and arr.shape[-1] == 3:
+            arr = arr.mean(dim=-1, keepdim=True)
+        if self.raw_image_mode == "rgb" and arr.shape[-1] == 1:
+            arr = arr.repeat(1, 1, 3)
+        if arr.shape[:2] != self.output_size:
+            arr = F.interpolate(
+                arr.permute(2, 0, 1).unsqueeze(0),
+                size=self.output_size,
+                mode="bilinear",
+                align_corners=False,
+            )[0].permute(1, 2, 0)
+        return arr.clamp(0.0, 1.0)
 
 class Augmentation:
     def __init__(self, config):
@@ -286,6 +428,7 @@ class OfflineTrainer:
         data = TensorDict(
             {
                 "image": image,
+                "raw_image": batch["raw_image"],
                 "is_first": batch["is_first"],
                 "is_last": batch["is_last"],
                 "is_terminal": batch["is_terminal"],
@@ -400,6 +543,7 @@ class OnlineTrainer:
             transition = TensorDict(
                 {
                     "image": obs["image"],
+                    "raw_image": obs.get("raw_image", obs["image"]),
                     "is_first": obs["is_first"],
                     "is_last": torch.tensor([done], dtype=torch.bool, device=self.accelerator.device),
                     "is_terminal": torch.tensor([bool(terminated)], dtype=torch.bool, device=self.accelerator.device),
@@ -443,7 +587,7 @@ class OnlineTrainer:
                 tensor = tensor.long()
             else:
                 tensor = tensor.float()
-            if key == "image" and tensor.ndim == 3:
+            if key in ("image", "raw_image") and tensor.ndim == 3:
                 tensor = tensor.unsqueeze(0)
             elif tensor.ndim == 0:
                 tensor = tensor.unsqueeze(0)

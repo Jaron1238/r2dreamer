@@ -35,11 +35,19 @@ class Dreamer(nn.Module):
         self.phase         = int(getattr(config, "phase", 1))
         self.use_depth     = bool(getattr(config, "use_depth", False))
         self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
+        self.safety_input_key = str(getattr(config, "safety_input_key", "image"))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
+        self.drone_embed_dim = 16
 
         shapes = {
             "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
         }
+        if self.safety_input_key == "raw_image":
+            shapes["raw_image"] = (
+                int(config.img_height),
+                int(config.img_width),
+                int(getattr(config, "safety_in_channels", 1)),
+            )
 
         self.encoder    = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
@@ -51,24 +59,24 @@ class Dreamer(nn.Module):
         config.actor.dist    = config.actor.dist.cont
         self.act_discrete    = False
 
-        self.actor      = networks.MLPHead(config.actor, self.rssm.feat_size)
-        self.value      = networks.MLPHead(config.critic, self.rssm.feat_size)
+        self._loss_scales = dict(config.loss_scales)
+        self._log_grads   = bool(config.log_grads)
+        self.num_drones = int(config.get("num_drone_classes", 10))
+        self.drone_embed = nn.Embedding(self.num_drones, self.drone_embed_dim)
+        self.safety_net = networks.SafetyNet(
+            in_channels=shapes[self.safety_input_key][-1],
+            action_dim=self.act_dim,
+            speed_dim=1,
+        )
+        actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
+        self.actor = networks.MLPHead(config.actor, actor_input_dim)
+        self.value = networks.MLPHead(config.critic, actor_input_dim)
         self.slow_target_update    = int(config.slow_target_update)
         self.slow_target_fraction  = float(config.slow_target_fraction)
         self._slow_value           = copy.deepcopy(self.value)
         for param in self._slow_value.parameters():
             param.requires_grad = False
         self._slow_value_updates = 0
-
-        self._loss_scales = dict(config.loss_scales)
-        self._log_grads   = bool(config.log_grads)
-        self.num_drones = int(config.get("num_drone_classes", 10))
-        self.drone_embed = nn.Embedding(self.num_drones, 16)
-        self.safety_net = networks.SafetyNet(
-            in_channels=shapes["image"][-1],
-            action_dim=self.act_dim,
-            speed_dim=1,
-        )
         modules = {
             "rssm":    self.rssm,
             "actor":   self.actor,
@@ -89,8 +97,9 @@ class Dreamer(nn.Module):
             modules.update({"decoder": self.decoder})
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
             self.prj          = Projector(self.rssm.feat_size, self.embed_size)
+            self.prj_target   = Projector(self.embed_size, self.embed_size)
             self.barlow_lambd = float(config.r2dreamer.lambd)
-            modules.update({"projector": self.prj})
+            modules.update({"projector": self.prj, "projector_target": self.prj_target})
         elif self.rep_loss == "dreamerpro":
             dpc                         = config.dreamer_pro
             self.warm_up                = int(dpc.warm_up)
@@ -203,20 +212,20 @@ class Dreamer(nn.Module):
         if not encoder_named_params:
             return []
 
-        stem_params = [
+        backbone_params = [
             param for name, param in encoder_named_params
-            if ".backbone.0.0." in name
+            if ".backbone." in name
         ]
-        other_encoder_params = [
+        adapter_params = [
             param for name, param in encoder_named_params
-            if ".backbone.0.0." not in name
+            if ".backbone." not in name
         ]
 
         param_groups = []
-        if stem_params:
-            param_groups.append({"params": stem_params, "lr": self._base_lr * 10})
-        if other_encoder_params:
-            param_groups.append({"params": other_encoder_params, "lr": self._base_lr})
+        if backbone_params:
+            param_groups.append({"params": backbone_params, "lr": self._base_lr * 0.3})
+        if adapter_params:
+            param_groups.append({"params": adapter_params, "lr": self._base_lr})
         return param_groups
 
     def _build_optimizer_param_groups(self):
@@ -364,10 +373,12 @@ class Dreamer(nn.Module):
             prev_stoch, prev_deter, prev_action, embed, obs["is_first"], d_emb
         )
         feat         = self._frozen_rssm.get_feat(stoch, deter)
-        action_dist  = self._frozen_actor(feat)
+        policy_input = torch.cat([feat, d_emb], dim=-1)
+        action_dist  = self._frozen_actor(policy_input)
         action       = action_dist.mode if eval else action_dist.rsample()
         speed = obs.get("speed", torch.zeros(*action.shape[:-1], 1, device=action.device))
-        img_t = p_obs["image"].unsqueeze(1)
+        safety_image = p_obs.get(self.safety_input_key, p_obs["image"])
+        img_t = safety_image.unsqueeze(1)
         speed_t = speed.unsqueeze(1)
         action_t = action.unsqueeze(1)
         safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
@@ -561,7 +572,7 @@ class Dreamer(nn.Module):
             losses.update(recon_losses)
         elif self.rep_loss == "r2dreamer":
             x1      = self.prj(feat[:, :].reshape(B * T, -1))
-            x2      = embed.reshape(B * T, -1).detach()
+            x2      = self.prj_target(embed.reshape(B * T, -1).detach())
             x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
             x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
             c       = torch.mm(x1_norm.T, x2_norm) / (B * T)
@@ -607,12 +618,14 @@ class Dreamer(nn.Module):
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
 
         if self.phase == 2:
-            actor_dist = self.actor(feat.detach())
+            policy_input = torch.cat([feat.detach(), d_emb.detach()], dim=-1)
+            actor_dist = self.actor(policy_input)
             actor_mode = actor_dist.mode
             losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
-            safety_pred = self.safety_net(data["image"], speed, data["action"])
+            safety_image = data.get(self.safety_input_key, data["image"])
+            safety_pred = self.safety_net(safety_image, speed, data["action"])
             losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
             metrics["safety/score_mean"] = safety_pred.mean()
             metrics["bc/mse"] = losses["bc"].detach()
@@ -626,8 +639,10 @@ class Dreamer(nn.Module):
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_reward = self._frozen_reward(imag_feat).mode
             imag_cont = self._frozen_cont(imag_feat).mean
-            imag_value = self._frozen_value(imag_feat).mode
-            imag_slow_value = self._frozen_slow_value(imag_feat).mode
+            imag_d_emb = d_emb_imag.unsqueeze(1).expand(-1, imag_feat.shape[1], -1)
+            imag_policy_input = torch.cat([imag_feat, imag_d_emb], dim=-1)
+            imag_value = self._frozen_value(imag_policy_input).mode
+            imag_slow_value = self._frozen_slow_value(imag_policy_input).mode
             disc = 1 - 1 / self.horizon
             weight = torch.cumprod(imag_cont * disc, dim=1)
             last = torch.zeros_like(imag_cont)
@@ -635,11 +650,11 @@ class Dreamer(nn.Module):
             ret = self._lambda_return(last, term, imag_reward, imag_value, imag_value, disc, self.lamb)
             ret_offset, ret_scale = self.return_ema(ret)
             adv = (ret - imag_value[:, :-1]) / ret_scale
-            policy = self.actor(imag_feat)
+            policy = self.actor(imag_policy_input)
             logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
             entropy = policy.entropy()[:, :-1].unsqueeze(-1)
             losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
-            imag_value_dist = self.value(imag_feat)
+            imag_value_dist = self.value(imag_policy_input)
             tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
             losses["value"] = torch.mean(
                 weight[:, :-1].detach()
@@ -662,13 +677,14 @@ class Dreamer(nn.Module):
             last, term, reward = (to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]))
             feat = self.rssm.get_feat(post_stoch, post_deter)
             boot = ret[:, 0].reshape(B, T, 1)
-            value = self._frozen_value(feat).mode
-            slow_value = self._frozen_slow_value(feat).mode
+            replay_policy_input = torch.cat([feat, d_emb], dim=-1)
+            value = self._frozen_value(replay_policy_input).mode
+            slow_value = self._frozen_slow_value(replay_policy_input).mode
             disc = 1 - 1 / self.horizon
             weight = 1.0 - last
             ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
             ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-            value_dist = self.value(feat)
+            value_dist = self.value(replay_policy_input)
             losses["repval"] = torch.mean(
                 weight[:, :-1]
                 * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(-1)
@@ -689,7 +705,8 @@ class Dreamer(nn.Module):
         stoch, deter = start
         for _ in range(imag_horizon):
             feat   = self._frozen_rssm.get_feat(stoch, deter)
-            action = self._frozen_actor(feat).rsample()
+            policy_input = torch.cat([feat, d_emb], dim=-1)
+            action = self._frozen_actor(policy_input).rsample()
             feats.append(feat)
             actions.append(action)
             stoch, deter = self._frozen_rssm.img_step(stoch, deter, action, d_emb)
@@ -713,6 +730,11 @@ class Dreamer(nn.Module):
             if torch.max(image) > 1.5:
                 image = image / 255.0
             data["image"] = image
+        if "raw_image" in data:
+            raw_image = to_f32(data["raw_image"])
+            if torch.max(raw_image) > 1.5:
+                raw_image = raw_image / 255.0
+            data["raw_image"] = raw_image
         return data
 
     def _configure_trainable_modules(self):

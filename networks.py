@@ -218,14 +218,8 @@ class ConvEncoder(nn.Module):
                 repeated = old_conv.weight.repeat(1, repeat, 1, 1)[:, :self.input_ch]
                 backbone.features[0][0].weight.copy_(repeated)
 
-        # Einfrieren: Layer 1-3 (low-level Features)
-        for param in backbone.features[1:4].parameters():
-            param.requires_grad = False
-
-        # Trainierbar: Layer 0 (6 Kanäle) + Layer 4-8 (high-level)
-        for param in backbone.features[0].parameters():
-            param.requires_grad = True
-        for param in backbone.features[4:].parameters():
+        # Modality-shift (RGB -> Depth/Flow): kompletten Backbone feinjustieren.
+        for param in backbone.features.parameters():
             param.requires_grad = True
 
         # Classifier-Head entfernen
