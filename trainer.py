@@ -39,9 +39,23 @@ class DepthPreprocessor:
 
     @torch.no_grad()
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        # frames: (T, H, W, 3), float32 in [0, 1]
+        # frames can be:
+        # - RGB:            (T, H, W, 3)
+        # - depth only:     (T, H, W) or (T, H, W, 1)
+        # - depth + diff:   (T, H, W, 2)
         if not self.use_depth:
             return frames
+        if frames.ndim == 3:
+            # Already depth maps without channel dimension.
+            if frames.max() > 1.5:
+                frames = frames / 255.0
+            return torch.stack([self._resize_depth(frames[t]) for t in range(frames.shape[0])], dim=0)
+        if frames.ndim == 4 and frames.shape[-1] in (1, 2):
+            # Already depth-like input (depth or depth+diff). Keep only depth channel.
+            depth = frames[..., 0]
+            if depth.max() > 1.5:
+                depth = depth / 255.0
+            return torch.stack([self._resize_depth(depth[t]) for t in range(depth.shape[0])], dim=0)
         if self._depth_model is None:
             gray = frames.mean(dim=-1)
             return torch.stack([self._resize_depth(gray[t]) for t in range(gray.shape[0])], dim=0)
@@ -92,7 +106,9 @@ class FPVDataset(IterableDataset):
 
     def __iter__(self):
         for sample in self.ds:
-            frames = torch.from_numpy(np.array(sample["frames"])).float() / 255.0
+            frames = torch.from_numpy(np.array(sample["frames"])).float()
+            if frames.ndim >= 4 and frames.shape[-1] in (3, 4) and frames.max() > 1.5:
+                frames = frames / 255.0
             T = frames.shape[0]
             start = 0
             if T > self.batch_length:
