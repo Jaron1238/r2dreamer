@@ -7,7 +7,7 @@ defaults:
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
-device: 'cuda:0'
+device: 'mps'
 phase: 1
 use_depth: True
 
@@ -31,7 +31,7 @@ buffer:
   batch_length: ${batch_length}
   max_size: 5e5
   device: ${device}
-  storage_device: 'cuda:0'
+  storage_device: 'cpu'
 
 trainer:
   steps: 100000
@@ -41,6 +41,7 @@ trainer:
   log_every: 50
   num_workers: 4
   accumulation_steps: 16
+  burn_in_steps: 5
   augmentation:
     noise_std: 0.05
     depth_noise_std: 0.02
@@ -74,3 +75,4 @@ model:
   use_depth: ${use_depth}
   safety_input_key: "raw_image" # image|raw_image
   safety_in_channels: 1
+  infonce_temperature: 0.07

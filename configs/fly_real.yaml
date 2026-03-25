@@ -1,0 +1,31 @@
+defaults:
+  - model: size100M
+  - _self_
+
+device: 'mps'
+checkpoint: 'logdir/latest.pt'
+phase: 3
+
+model:
+  img_height: 256
+  img_width: 256
+  act_dim: 4
+  use_depth: false
+  safety_input_key: 'image'
+  safety_in_channels: 3
+  hover_throttle: 0.52
+  safety_threshold: 0.4
+
+stream:
+  port: 5600
+  pi_host: '192.168.1.50'
+
+drone:
+  protocol: 'mavlink'
+  connection: 'udp:0.0.0.0:14550'
+  hover_throttle: 0.52
+
+safety:
+  max_vibration: 30.0
+  min_altitude: 0.3
+  min_battery: 15

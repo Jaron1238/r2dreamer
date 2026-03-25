@@ -90,6 +90,7 @@ class FPVDataset(IterableDataset):
         self.raw_image_mode = str(getattr(config.dataset, "raw_image_mode", "grayscale"))
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
+        self.burn_in_steps = int(getattr(config.trainer, "burn_in_steps", 5))
         self.raw_source = SafetyRawImageSource(
             config.dataset.get("raw_dataset", None),
             output_size=(self.img_height, self.img_width),
@@ -146,6 +147,8 @@ class FPVDataset(IterableDataset):
                 raw_image = safety["raw_image"]
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True
+            burn_in_mask = torch.ones(self.batch_length, dtype=torch.bool)
+            burn_in_mask[: min(self.burn_in_steps, self.batch_length)] = False
             is_last = torch.zeros(self.batch_length, dtype=torch.bool)
             is_last[-1] = True
             is_terminal = torch.zeros(self.batch_length, dtype=torch.bool)
@@ -167,6 +170,7 @@ class FPVDataset(IterableDataset):
                 "image": image,
                 "raw_image": raw_image,
                 "is_first": is_first,
+                "burn_in_mask": burn_in_mask,
                 "is_last": is_last,
                 "is_terminal": is_terminal,
                 "reward": reward,
@@ -404,6 +408,7 @@ class OfflineTrainer:
         self.num_workers = int(config.num_workers)
         self.augmentation = Augmentation(config.augmentation)
         self.accumulation_steps = config.get("accumulation_steps", 8)
+        self.eval_batches = int(config.get("eval_batches", 8))
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.accumulation_steps,
             mixed_precision="fp16"
@@ -430,6 +435,7 @@ class OfflineTrainer:
                 "image": image,
                 "raw_image": batch["raw_image"],
                 "is_first": batch["is_first"],
+                "burn_in_mask": batch["burn_in_mask"],
                 "is_last": batch["is_last"],
                 "is_terminal": batch["is_terminal"],
                 "reward": batch["reward"],
@@ -441,6 +447,42 @@ class OfflineTrainer:
         (_, _), total_loss, metrics = agent.compute_losses(data, initial=None)
         return total_loss, metrics
 
+    @torch.no_grad()
+    def _eval(self, agent, step):
+        agent.eval()
+        total_reward = 0.0
+        count = 0
+        eval_iter = iter(self.dataset)
+        for _ in range(self.eval_batches):
+            batch = next(eval_iter)
+            image = batch["image"].unsqueeze(0).to(self.accelerator.device)
+            raw_image = batch["raw_image"].unsqueeze(0).to(self.accelerator.device)
+            batch_size, time_steps = image.shape[:2]
+            data = TensorDict(
+                {
+                    "image": image,
+                    "raw_image": raw_image,
+                    "is_first": batch["is_first"].unsqueeze(0).to(self.accelerator.device),
+                    "burn_in_mask": batch["burn_in_mask"].unsqueeze(0).to(self.accelerator.device),
+                    "is_last": batch["is_last"].unsqueeze(0).to(self.accelerator.device),
+                    "is_terminal": batch["is_terminal"].unsqueeze(0).to(self.accelerator.device),
+                    "reward": batch["reward"].unsqueeze(0).to(self.accelerator.device),
+                    "action": batch["action"].unsqueeze(0).to(self.accelerator.device),
+                    "drone_id": batch["drone_id"].unsqueeze(0).to(self.accelerator.device),
+                    "speed": batch["speed"].unsqueeze(0).to(self.accelerator.device),
+                    "crash": batch["crash"].unsqueeze(0).to(self.accelerator.device),
+                },
+                batch_size=[batch_size, time_steps],
+            )
+            (_, _), _, metrics = agent.compute_losses(agent.preprocess(data), initial=None)
+            rew = metrics.get("rew", 0.0)
+            total_reward += float(rew.item() if hasattr(rew, "item") else rew)
+            count += 1
+        agent.train()
+        if self.accelerator.is_main_process:
+            self.logger.scalar("eval/reward", total_reward / max(count, 1))
+            self.logger.write(step)
+
     def begin(self, agent):
         loader = DataLoader(
             self.dataset,
@@ -450,8 +492,8 @@ class OfflineTrainer:
             pin_memory=True,
             drop_last=True
         )
-        optimizer = agent.get_optimizer()
-        scheduler = agent.build_scheduler(optimizer)
+        optimizer = agent._optimizer
+        scheduler = agent._scheduler
         agent, optimizer, loader, scheduler = self.accelerator.prepare(agent, optimizer, loader, scheduler)
         agent.train()
         
@@ -505,6 +547,7 @@ class OfflineTrainer:
                     self.accelerator.wait_for_everyone()
                     if self.accelerator.is_main_process:
                         self._save_checkpoint(step)
+                    self._eval(agent, step)
 
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
@@ -526,7 +569,7 @@ class OnlineTrainer:
 
     def begin(self, agent, env):
         replay_buffer = Buffer(agent.config.buffer)
-        optimizer = agent.get_optimizer()
+        optimizer = agent._optimizer
         agent, optimizer = self.accelerator.prepare(agent, optimizer)
         state = agent.get_initial_state(B=1).to(self.accelerator.device)
         obs, _ = env.reset()
