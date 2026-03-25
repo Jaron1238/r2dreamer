@@ -1,87 +1,118 @@
-# R2-Dreamer: Redundancy-Reduced World Models without Decoders or Augmentation
+# R2Dreamer (FPV/Drone Fork)
 
-This repository provides a PyTorch implementation of [R2-Dreamer][r2dreamer] (ICLR 2026), a computationally efficient world model that achieves high performance on continuous control benchmarks. It also includes an efficient PyTorch DreamerV3 reproduction that trains **~5x faster** than a widely used [codebase][dreamerv3-torch], along with other baselines. Selecting R2-Dreamer via the config provides an additional **~1.6x speedup** over this baseline.
+This repository is a **project-specific fork** of R2-Dreamer.
+In addition to the original world-model components, it includes a multi-phase workflow for FPV/drone use cases with streaming datasets, safety signals, and (from Phase 3) online interaction.
 
-## Instructions
+## What this project currently does
 
-Install dependencies. This repository is tested with Ubuntu 24.04 and Python 3.11.
+- **Hydra-based training** via `train.py`.
+- **Offline training with Hugging Face streaming datasets** (`FPVDataset`), including optional OSD filtering.
+- **Depth/raw-image path** for safety-related inputs (`raw_image`, `crash`).
+- **Phase-based setup**:
+  - **Phase 1**: World-model training (Actor/Value frozen).
+  - **Phase 2**: Encoder/RSSM frozen, behavior cloning + safety learning.
+  - **Phase 3**: Online training via `envs/drone_sim.py` (adapter placeholder).
+  - **Phase 4**: Real deployment scaffold in `fly_real.py`.
 
-If you prefer Docker, follow [`docs/docker.md`](docs/docker.md).
+## Project structure (key files)
+
+- `train.py` – entry point (Hydra config, trainer selection, checkpoint load/save)
+- `trainer.py` – `FPVDataset`, offline/online trainers, safety raw-image sources
+- `dreamer.py` – core model with phase logic and safety head
+- `configs/configs.yaml` – central project configuration
+- `envs/drone_sim.py` – lightweight Gymnasium adapter for Phase 3
+- `fly_real.py` – integration scaffold for real flights (MAVSDK pipeline)
+- `runs/*.sh` – batch scripts for classic benchmarks (DMC, Atari, Crafter, ...)
+
+## Setup
+
+Tested with Ubuntu 24.04 and Python 3.11.
 
 ```bash
-# Installing via a virtual env like uv is recommended.
 pip install -r requirements.txt
 ```
 
-Run training on default settings:
+Optional (Docker): see [`docs/docker.md`](docs/docker.md).
+
+## Quickstart
+
+### 1) Default run
 
 ```bash
 python3 train.py logdir=./logdir/test
 ```
 
-Monitoring results:
+### 2) TensorBoard
+
 ```bash
 tensorboard --logdir ./logdir
 ```
 
-Switching algorithms:
+### 3) Resume from checkpoint
 
 ```bash
-# Choose an algorithm via model.rep_loss:
-# r2dreamer|dreamer|infonce|dreamerpro
-python3 train.py model.rep_loss=r2dreamer
+python3 train.py checkpoint=/path/to/latest.pt logdir=./logdir/resume
 ```
 
-For easier code reading, inline tensor shape annotations are provided. See [`docs/tensor_shapes.md`](docs/tensor_shapes.md).
+## Important configuration for this project
 
+Core project settings are in `configs/configs.yaml`:
 
-## Available Benchmarks
-At the moment, the following benchmarks are available in this repository.
+- `phase`: training phase (1/2/3)
+- `use_depth`: enables depth preprocessing
+- `dataset.mode`: typically `streaming`
+- `dataset.hf_repo`: Hugging Face dataset repo (set this to your repo)
+- `dataset.require_osd`: uses OSD samples (if available)
+- `dataset.raw_image_mode`: `grayscale` or `rgb`
+- `dataset.raw_dataset.*`: additional safety raw-image source (folders or streaming)
+- `model.safety_input_key`: `image` or `raw_image`
 
-| Environment        | Observation | Action | Budget | Description |
-|-------------------|---|---|---|-----------------------|
-| [Meta-World](https://github.com/Farama-Foundation/Metaworld) | Image | Continuous | 1M | Robotic manipulation with complex contact interactions.|
-| [DMC Proprio](https://github.com/deepmind/dm_control) | State | Continuous | 500K | DeepMind Control Suite with low-dimensional inputs. |
-| [DMC Vision](https://github.com/deepmind/dm_control) | Image | Continuous |1M| DeepMind Control Suite with high-dimensional images inputs. |
-| [DMC Subtle](envs/dmc_subtle.py) | Image | Continuous |1M| DeepMind Control Suite with tiny task-relevant objects. |
-| [Atari 100k](https://github.com/Farama-Foundation/Arcade-Learning-Environment) | Image | Discrete |400K| 26 Atari games. |
-| [Crafter](https://github.com/danijar/crafter) | Image | Discrete |1M| Survival environment to evaluates diverse agent abilities.|
-| [Memory Maze](https://github.com/jurgisp/memory-maze) | Image |Discrete |100M| 3D mazes to evaluate RL agents' long-term memory.|
-
-Use Hydra to select a benchmark and a specific task using `env` and `env.task`, respectively.
+Example:
 
 ```bash
-python3 train.py ... env=dmc_vision env.task=dmc_walker_walk
+python3 train.py \
+  phase=2 \
+  use_depth=true \
+  dataset.hf_repo='your_user/your_fpv_dataset' \
+  dataset.require_osd=true \
+  model.safety_input_key=raw_image \
+  logdir=./logdir/phase2_run
 ```
 
-## Headless rendering
+## Recommended phase workflow
 
-If you run MuJoCo-based environments (DMC / MetaWorld) on headless machines, you may need to set `MUJOCO_GL` for offscreen rendering. **Using EGL is recommended** as it accelerates rendering, leading to faster simulation throughput.
+1. **Phase 1 (World model pretraining)**
+   - Focus on representation and dynamics learning.
+2. **Phase 2 (Policy/safety adaptation)**
+   - Uses safety signal (`crash`) and BC-like components.
+3. **Phase 3 (Online simulation)**
+   - Connect simulator/bridge through `DroneSimEnv`.
+4. **Phase 4 (Real flight scaffold)**
+   - `fly_real.py` as integration point for camera + MAVSDK + exported models.
 
-```bash
-# For example, when using EGL (GPU)
-export MUJOCO_GL=egl
-# (optional) Choose which GPU EGL uses
-export MUJOCO_EGL_DEVICE_ID=0
-```
+## Classic R2-Dreamer benchmarks (optional)
 
-More details: [Working with MuJoCo-based environments](https://docs.pytorch.org/rl/stable/reference/generated/knowledge_base/MUJOCO_INSTALLATION.html)
+Original benchmark scripts are still available, for example:
 
-## Code formatting
+- `runs/dmc.sh`
+- `runs/atari.sh`
+- `runs/crafter.sh`
+- `runs/memorymaze.sh`
+- `runs/metaworld.sh`
 
-If you want automatic formatting/basic checks before commits, you can enable `pre-commit`:
+Use these if you still need classic comparison experiments.
+
+## Development / formatting
 
 ```bash
 pip install pre-commit
-# This sets up a pre-commit hook so that checks are run every time you commit
 pre-commit install
-# Manual pre-commit run on all files
 pre-commit run --all-files
 ```
 
 ## Citation
 
-If you find this code useful, please consider citing:
+If you use the R2-Dreamer base, please cite:
 
 ```bibtex
 @inproceedings{
@@ -94,5 +125,4 @@ url={https://openreview.net/forum?id=Je2QqXrcQq}
 }
 ```
 
-[r2dreamer]: https://openreview.net/forum?id=Je2QqXrcQq&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2026%2FConference%2FAuthors%23your-submissions)
-[dreamerv3-torch]: https://github.com/NM512/dreamerv3-torch
+Original paper: https://openreview.net/forum?id=Je2QqXrcQq
