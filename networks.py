@@ -237,7 +237,13 @@ class ConvEncoder(nn.Module):
     def forward(self, obs):
         """Encode image-like observations mit EfficientNet-B0."""
         # (B, T, H, W, C)
-        obs = obs - 0.5
+        channels = obs.shape[-1]
+        if channels <= 3:
+            obs = obs - 0.5
+        else:
+            rgb = obs[..., :3] - 0.5
+            diff = obs[..., 3:] / 2.0
+            obs = torch.cat([rgb, diff], dim=-1)
         x = obs.reshape(-1, *obs.shape[-3:])
         x = x.permute(0, 3, 1, 2)
         # (B*T, 1280)
