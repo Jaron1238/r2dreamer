@@ -34,6 +34,10 @@ pip install -r requirements.txt
 
 Optional (Docker): see [`docs/docker.md`](docs/docker.md).
 
+Depth preprocessing works without `depth-anything-v2` (grayscale fallback is built in).
+If you want the Depth Anything backend, install it separately in an environment that
+uses a compatible PyTorch/TorchVision pair.
+
 ## Quickstart
 
 ### 1) Default run
