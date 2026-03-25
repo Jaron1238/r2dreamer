@@ -23,6 +23,8 @@ class Buffer:
         # This is batched data and lifted for storage.
         # (B, ...) -> (B, 1, ...)
         self._buffer.extend(data.unsqueeze(1))
+        if "is_last" in data and data["is_last"].any():
+            self.num_eps += int(data["is_last"].sum().item())
 
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)
@@ -56,3 +58,6 @@ class Buffer:
         if self._buffer.storage.shape is None:
             return 0
         return self._buffer.storage.shape.numel()
+
+    def episode_count(self) -> int:
+        return self.num_eps

@@ -9,6 +9,9 @@ device: ${device}
 rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
 safety_input_key: "image"
 safety_in_channels: 1
+drone_embed_dim: 16
+infonce_temperature: 0.1
+video_pred_batch: 6
 
 lr: 4e-5
 agc: 0.3
@@ -69,6 +72,7 @@ rssm:
   unimix_ratio: 0.01
   initial: 'learned'
   device: ${device}
+  d_emb_dim: ${model.drone_embed_dim}
 
 encoder:
   mlp_keys: ${env.encoder.mlp_keys}

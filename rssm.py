@@ -82,7 +82,7 @@ class RSSM(nn.Module):
         self._img_layers = int(config.img_layers)
         self._dyn_layers = int(config.dyn_layers)
         self._blocks = int(config.blocks)
-        self._d_emb_dim = 16
+        self._d_emb_dim = int(getattr(config, "d_emb_dim", 16))
         self.flat_stoch = self._stoch * self._discrete
         self.feat_size = self.flat_stoch + self._deter
         self._deter_net = Deter(

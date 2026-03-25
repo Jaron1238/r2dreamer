@@ -36,8 +36,13 @@ class Dreamer(nn.Module):
         self.use_depth     = bool(getattr(config, "use_depth", False))
         self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
         self.safety_input_key = str(getattr(config, "safety_input_key", "image"))
+        hover_throttle = float(getattr(config, "hover_throttle", 0.5))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
-        self.drone_embed_dim = 16
+        if self.act_dim > 0:
+            self.brake_vector[0] = hover_throttle
+        self.drone_embed_dim = int(getattr(config, "drone_embed_dim", 16))
+        self.infonce_temperature = float(getattr(config, "infonce_temperature", 0.1))
+        self.video_pred_batch = int(getattr(config, "video_pred_batch", 6))
 
         shapes = {
             "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
@@ -51,6 +56,7 @@ class Dreamer(nn.Module):
 
         self.encoder    = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
+        config.rssm.d_emb_dim = self.drone_embed_dim
         self.rssm       = rssm.RSSM(config.rssm, self.embed_size, self.act_dim)
         self.reward     = networks.MLPHead(config.reward, self.rssm.feat_size)
         self.cont       = networks.MLPHead(config.cont, self.rssm.feat_size)
@@ -257,14 +263,6 @@ class Dreamer(nn.Module):
             eps=self._opt_eps,
         )
 
-    def get_optimizer(self):
-        params = [p for p in self.parameters() if p.requires_grad]
-        return LaProp(
-            [{"params": params, "lr": self._base_lr}],
-            betas=(0.9, 0.999),
-            eps=1e-8,
-        )
-
     def _update_slow_target(self):
         if self._slow_value_updates % self.slow_target_update == 0:
             with torch.no_grad():
@@ -273,80 +271,26 @@ class Dreamer(nn.Module):
                     s.data.copy_(mix * v.data + (1 - mix) * s.data)
         self._slow_value_updates += 1
 
+    def _freeze_copy(self, module):
+        frozen = copy.deepcopy(module)
+        for param in frozen.parameters():
+            param.requires_grad_(False)
+        return frozen
+
     def train(self, mode=True):
         super().train(mode)
         self._slow_value.train(False)
         return self
 
     def clone_and_freeze(self):
-        self._frozen_encoder = copy.deepcopy(self.encoder)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.encoder.named_parameters(), self._frozen_encoder.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_rssm = copy.deepcopy(self.rssm)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.rssm.named_parameters(), self._frozen_rssm.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_reward = copy.deepcopy(self.reward)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.reward.named_parameters(), self._frozen_reward.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_cont = copy.deepcopy(self.cont)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.cont.named_parameters(), self._frozen_cont.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_actor = copy.deepcopy(self.actor)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.actor.named_parameters(), self._frozen_actor.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_value = copy.deepcopy(self.value)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.value.named_parameters(), self._frozen_value.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-        self._frozen_slow_value = copy.deepcopy(self._slow_value)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self._slow_value.named_parameters(), self._frozen_slow_value.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-        
-        self._frozen_drone_embed = copy.deepcopy(self.drone_embed)
-        for (name_orig, param_orig), (name_new, param_new) in zip(
-            self.drone_embed.named_parameters(), self._frozen_drone_embed.named_parameters()
-        ):
-            assert name_orig == name_new
-            param_new.data = param_orig.data
-            param_new.requires_grad_(False)
-
-    def to(self, *args, **kwargs):
-        super().to(*args, **kwargs)
-        self.clone_and_freeze()
-        return self
+        self._frozen_encoder = self._freeze_copy(self.encoder)
+        self._frozen_rssm = self._freeze_copy(self.rssm)
+        self._frozen_reward = self._freeze_copy(self.reward)
+        self._frozen_cont = self._freeze_copy(self.cont)
+        self._frozen_actor = self._freeze_copy(self.actor)
+        self._frozen_value = self._freeze_copy(self.value)
+        self._frozen_slow_value = self._freeze_copy(self._slow_value)
+        self._frozen_drone_embed = self._freeze_copy(self.drone_embed)
 
     def _get_drone_embedding(self, drone_id=None, *, batch_shape=None, frozen=False, device=None):
         module = self._frozen_drone_embed if frozen else self.drone_embed
@@ -406,7 +350,7 @@ class Dreamer(nn.Module):
     def _video_pred(self, data, initial):
         if self.rep_loss != "dreamer":
             raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
-        B     = min(data["action"].shape[0], 6)
+        B     = min(data["action"].shape[0], self.video_pred_batch)
         embed = self.encoder(data)
         d_emb = self._get_drone_embedding(data.get("drone_id"), batch_shape=data["action"].shape[:2], device=embed.device)
         post_stoch, post_deter, _ = self.rssm.observe(
@@ -560,8 +504,16 @@ class Dreamer(nn.Module):
             )
         _, prior_logit    = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
-        losses["dyn"]     = torch.mean(dyn_loss)
-        losses["rep"]     = torch.mean(rep_loss)
+        burn_in_mask = data.get("burn_in_mask", None)
+        if burn_in_mask is not None:
+            mask = burn_in_mask
+            if mask.ndim == 2:
+                mask = mask[0]
+            losses["dyn"] = torch.mean(dyn_loss[:, mask])
+            losses["rep"] = torch.mean(rep_loss[:, mask])
+        else:
+            losses["dyn"] = torch.mean(dyn_loss)
+            losses["rep"] = torch.mean(rep_loss)
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
         if self.rep_loss == "dreamer":
@@ -573,20 +525,14 @@ class Dreamer(nn.Module):
         elif self.rep_loss == "r2dreamer":
             x1      = self.prj(feat[:, :].reshape(B * T, -1))
             x2      = self.prj_target(embed.reshape(B * T, -1).detach())
-            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-            c       = torch.mm(x1_norm.T, x2_norm) / (B * T)
-            invariance_loss  = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask    = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
-            redundancy_loss  = c[off_diag_mask].pow(2).sum()
-            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
-            metrics["barlow/invariance"] = invariance_loss.item()
-            metrics["barlow/redundancy"] = redundancy_loss.item()
-            metrics["barlow/std_mean"]   = x1_norm.std(0).mean().item()
+            losses["barlow"], barlow_metrics = self.barlow_loss(x1, x2)
+            metrics.update(barlow_metrics)
         elif self.rep_loss == "infonce":
             x1          = self.prj(feat[:, :].reshape(B * T, -1))
-            x2          = embed.reshape(B * T, -1).detach()
-            logits      = torch.matmul(x1, x2.T)
+            x2          = self.prj_target(embed.reshape(B * T, -1).detach())
+            x1          = F.normalize(x1, dim=-1)
+            x2          = F.normalize(x2, dim=-1)
+            logits      = torch.matmul(x1, x2.T) / self.infonce_temperature
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
             labels      = torch.arange(norm_logits.shape[0]).long().to(self.device)
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
@@ -634,8 +580,14 @@ class Dreamer(nn.Module):
                 post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
                 post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
             )
+            if self.num_drones > 1:
+                assert (data["drone_id"] == data["drone_id"][:, :1]).all(), (
+                    "Drone-ID wechselt innerhalb einer Sequenz — d_emb_imag wäre falsch"
+                )
             d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0)
-            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
+            with torch.no_grad():
+                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
+                    imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
             imag_reward = self._frozen_reward(imag_feat).mode
             imag_cont = self._frozen_cont(imag_feat).mean
@@ -725,14 +677,17 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def preprocess(self, data):
+        data = data.copy()
         if "image" in data:
-            image = to_f32(data["image"])
-            if torch.max(image) > 1.5:
+            image_in = data["image"]
+            image = to_f32(image_in)
+            if not torch.is_floating_point(image_in):
                 image = image / 255.0
             data["image"] = image
         if "raw_image" in data:
-            raw_image = to_f32(data["raw_image"])
-            if torch.max(raw_image) > 1.5:
+            raw_image_in = data["raw_image"]
+            raw_image = to_f32(raw_image_in)
+            if not torch.is_floating_point(raw_image_in):
                 raw_image = raw_image / 255.0
             data["raw_image"] = raw_image
         return data
@@ -757,7 +712,7 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def augment_data(self, data):
-        data_aug        = {k: torch.cat([v, v], axis=0) for k, v in data.items()}
+        data_aug = data.apply(lambda value: torch.cat([value, value], dim=0))
         image           = data_aug["image"].permute(0, 1, 4, 2, 3)
         data_aug["image"] = self.random_translate(
             image, self.aug_max_delta,

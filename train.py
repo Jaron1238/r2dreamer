@@ -38,8 +38,14 @@ def main(config):
         ckpt_path = pathlib.Path(config.checkpoint).expanduser()
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location=config.device)
+            ckpt_phase = ckpt.get("phase", None)
+            if ckpt_phase is not None and int(ckpt_phase) != int(config.phase):
+                raise ValueError(
+                    f"Checkpoint Phase {ckpt_phase} != Config Phase {config.phase}. "
+                    f"Entweder phase: {ckpt_phase} in der Config setzen oder Checkpoint prüfen."
+                )
             agent.load_state_dict(ckpt["model"])
-            print(f"Checkpoint geladen: {ckpt_path}")
+            print(f"Checkpoint geladen: {ckpt_path} (Phase {ckpt_phase})")
 
     if int(getattr(config, "phase", 1)) >= 3:
         from envs.drone_sim import DroneSimEnv
@@ -56,7 +62,7 @@ def main(config):
         trainer.begin(agent)
 
     torch.save(
-        {"model": agent.state_dict()},
+        {"model": agent.state_dict(), "phase": config.phase},
         logdir / "latest.pt",
     )
 
