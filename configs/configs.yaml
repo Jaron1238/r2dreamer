@@ -7,7 +7,7 @@ defaults:
 logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
-device: 'mps'
+device: 'cuda'
 phase: 1
 use_depth: True
 
