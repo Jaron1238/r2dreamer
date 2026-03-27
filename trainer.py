@@ -65,8 +65,6 @@ class DepthPreprocessor:
         # Depth Anything path (best effort in offline preprocessing).
         # In constrained environments we gracefully fallback to grayscale.
         try:
-            import cv2  # type: ignore
-
             outs = []
             for t in range(frames.shape[0]):
                 rgb = (frames[t].cpu().numpy() * 255.0).astype(np.uint8)
@@ -121,7 +119,9 @@ class FPVDataset(IterableDataset):
             ds_iter = ds_iter.shard(num_shards=worker_info.num_workers, index=worker_info.id)
         for sample in ds_iter:
             gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
+            gray_full = self._ensure_channel_last(gray_full)
             depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
+            depth_full = self._ensure_channel_last(depth_full)
             is_terminal_full = torch.from_numpy(np.array(sample["is_terminal"][0])).bool()
 
             T = gray_full.shape[0]
@@ -134,12 +134,28 @@ class FPVDataset(IterableDataset):
                 start = torch.randint(0, T - self.batch_length + 1, (1,)).item()
 
             raw_image = gray_full[start : start + self.batch_length]
+            raw_image = self._resize_sequence(raw_image)
+            raw_image = self._build_raw_image(raw_image)
+
             depth = depth_full[start : start + self.batch_length]
             is_terminal = is_terminal_full[start : start + self.batch_length]
-
-            diff = torch.zeros_like(depth)
-            diff[1:] = depth[1:] - depth[:-1]
-            image = torch.cat([depth, diff], dim=-1)
+            if self.use_depth:
+                depth_map = self.depth_preprocessor(depth)
+                if depth_map.ndim == 3:
+                    depth_map = depth_map.unsqueeze(-1)
+                depth_map = self._resize_sequence(depth_map)
+                diff = torch.zeros_like(depth_map)
+                diff[1:] = depth_map[1:] - depth_map[:-1]
+                image = torch.cat([depth_map, diff], dim=-1)
+            else:
+                image = self._resize_sequence(raw_image)
+                if image.shape[-1] == 1:
+                    image = image.repeat(1, 1, 1, 3)
+                elif image.shape[-1] > 3:
+                    image = image[..., :3]
+                diff = torch.zeros_like(image)
+                diff[1:] = image[1:] - image[:-1]
+                image = torch.cat([image, diff], dim=-1)
 
             reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
             if is_terminal.any():
@@ -212,6 +228,22 @@ class FPVDataset(IterableDataset):
         if self.raw_image_mode == "rgb":
             return frames[..., :3]
         return frames[..., :3].mean(dim=-1, keepdim=True)
+
+    def _ensure_channel_last(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.ndim == 3:
+            return frames[..., None]
+        return frames
+
+    def _resize_sequence(self, frames: torch.Tensor) -> torch.Tensor:
+        if frames.shape[1:3] == (self.img_height, self.img_width):
+            return frames
+        resized = F.interpolate(
+            frames.permute(0, 3, 1, 2),
+            size=(self.img_height, self.img_width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.permute(0, 2, 3, 1)
 
 
 class SafetyRawImageSource:
