@@ -120,52 +120,63 @@ class FPVDataset(IterableDataset):
         if worker_info is not None and worker_info.num_workers > 1:
             ds_iter = ds_iter.shard(num_shards=worker_info.num_workers, index=worker_info.id)
         for sample in ds_iter:
-            frames = torch.from_numpy(np.array(sample["frames"])).float()
-            if frames.ndim >= 4 and frames.shape[-1] in (3, 4) and frames.max() > 1.5:
-                frames = frames / 255.0
-            raw_image = self._build_raw_image(frames)
-            T = frames.shape[0]
-            start = 0
-            if T > self.batch_length:
-                # torch.randint uses an exclusive upper bound.
-                start = torch.randint(0, T - self.batch_length + 1, (1,)).item()
-                frames = frames[start : start + self.batch_length]
-                raw_image = raw_image[start : start + self.batch_length]
-            elif T < self.batch_length:
+            gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
+            depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
+            is_terminal_full = torch.from_numpy(np.array(sample["is_terminal"][0])).bool()
+
+            T = gray_full.shape[0]
+            if T < self.batch_length:
                 continue
-            if self.use_depth:
-                depth = self.depth_preprocessor(frames)  # (T, 256, 256)
-                depth = depth[..., None]
-                diff = torch.zeros_like(depth)
-                diff[1:] = depth[1:] - depth[:-1]
-                image = torch.cat([depth, diff], dim=-1)
+
+            if T == self.batch_length:
+                start = 0
             else:
-                diff = torch.zeros_like(frames)
-                diff[1:] = frames[1:] - frames[:-1]
-                image = torch.cat([frames, diff], dim=-1)
+                start = torch.randint(0, T - self.batch_length + 1, (1,)).item()
+
+            raw_image = gray_full[start : start + self.batch_length]
+            depth = depth_full[start : start + self.batch_length]
+            is_terminal = is_terminal_full[start : start + self.batch_length]
+
+            diff = torch.zeros_like(depth)
+            diff[1:] = depth[1:] - depth[:-1]
+            image = torch.cat([depth, diff], dim=-1)
+
+            reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
+            if is_terminal.any():
+                crash_idx = torch.where(is_terminal)[0]
+                reward[crash_idx] = -1.0
+
             safety = self.raw_source.sample_sequence(self.batch_length)
-            if safety is not None:
-                raw_image = safety["raw_image"]
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True
             burn_in_mask = torch.ones(self.batch_length, dtype=torch.bool)
             burn_in_mask[: min(self.burn_in_steps, self.batch_length)] = False
             is_last = torch.zeros(self.batch_length, dtype=torch.bool)
             is_last[-1] = True
-            is_terminal = torch.zeros(self.batch_length, dtype=torch.bool)
-            reward = torch.zeros(self.batch_length, 1, dtype=torch.float32)
 
             if self.require_osd and sample.get("has_osd", False):
-                actions = torch.tensor(sample["actions"], dtype=torch.float32)[start : start + self.batch_length]
-                if actions.shape[0] < self.batch_length:
-                    action_dim = actions.shape[-1]
-                    pad_act = torch.zeros((self.batch_length - actions.shape[0], action_dim), dtype=torch.float32)
-                    actions = torch.cat([actions, pad_act], dim=0)
+                actions_full = torch.from_numpy(np.array(sample["actions"][0])).float()
+                actions = actions_full[start : start + self.batch_length]
             else:
                 actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
 
-            drone_id = int(sample.get("drone_id", 0))
+            speed_full = torch.from_numpy(np.array(sample["speeds"][0])).float() if "speeds" in sample else None
+            speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
+                self.batch_length, 1, dtype=torch.float32
+            )
+
+            drone_value = sample.get("drone_id", 0)
+            if isinstance(drone_value, (list, tuple, np.ndarray)):
+                drone_value = drone_value[0]
+            drone_id = int(drone_value)
             drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
+
+            if safety is not None:
+                inj_raw_image = safety["raw_image"]
+                inj_crash = safety["crash"]
+            else:
+                inj_raw_image = torch.zeros_like(raw_image)
+                inj_crash = torch.zeros_like(is_terminal.float().unsqueeze(-1))
 
             yield {
                 "image": image,
@@ -177,8 +188,10 @@ class FPVDataset(IterableDataset):
                 "reward": reward,
                 "action": actions,
                 "drone_id": drone_id,
-                "speed": torch.zeros(self.batch_length, 1, dtype=torch.float32),
-                "crash": safety["crash"] if safety is not None else is_terminal.float().unsqueeze(-1),
+                "speed": speed,
+                "crash": is_terminal.float().unsqueeze(-1),
+                "inj_raw_image": inj_raw_image,
+                "inj_crash": inj_crash,
             }
 
     def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
@@ -206,8 +219,17 @@ class SafetyRawImageSource:
         self.source = str(raw_cfg.get("source", "folders"))
         if self.source == "folders":
             root = pathlib.Path(raw_cfg.get("root", ""))
-            self.good_files = sorted((root / "good").glob("*"))
-            self.bad_files = sorted((root / "bad").glob("*"))
+            good_dir = root / "good"
+            bad_dir = root / "bad"
+            if good_dir.exists() or bad_dir.exists():
+                self.good_files = sorted(good_dir.glob("*"))
+                self.bad_files = sorted(bad_dir.glob("*"))
+            else:
+                crash_gray_dir = root / "gray"
+                if crash_gray_dir.exists():
+                    self.bad_files = sorted(crash_gray_dir.glob("*"))
+                else:
+                    self.bad_files = sorted(root.glob("*"))
             if not self.good_files and not self.bad_files:
                 self.enabled = False
         elif self.source == "streaming":
@@ -442,6 +464,10 @@ class OfflineTrainer:
                 "reward": batch["reward"],
                 "action": batch["action"],
                 "drone_id": batch["drone_id"],
+                "speed": batch["speed"],
+                "crash": batch["crash"],
+                "inj_raw_image": batch["inj_raw_image"],
+                "inj_crash": batch["inj_crash"],
             },
             batch_size=[batch_size, time_steps],
         )

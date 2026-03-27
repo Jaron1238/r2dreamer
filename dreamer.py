@@ -568,11 +568,20 @@ class Dreamer(nn.Module):
             actor_dist = self.actor(policy_input)
             actor_mode = actor_dist.mode
             losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
+
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
             safety_image = data.get(self.safety_input_key, data["image"])
             safety_pred = self.safety_net(safety_image, speed, data["action"])
             losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
+
+            if "inj_raw_image" in data:
+                inj_speed = torch.zeros_like(speed)
+                inj_action = torch.zeros_like(data["action"])
+                inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
+                inj_loss = F.binary_cross_entropy(inj_pred, data["inj_crash"])
+                losses["safety"] = losses["safety"] + inj_loss
+
             metrics["safety/score_mean"] = safety_pred.mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
