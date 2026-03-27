@@ -127,7 +127,8 @@ class FPVDataset(IterableDataset):
             T = frames.shape[0]
             start = 0
             if T > self.batch_length:
-                start = torch.randint(0, T - self.batch_length, (1,)).item()
+                # torch.randint uses an exclusive upper bound.
+                start = torch.randint(0, T - self.batch_length + 1, (1,)).item()
                 frames = frames[start : start + self.batch_length]
                 raw_image = raw_image[start : start + self.batch_length]
             elif T < self.batch_length:
