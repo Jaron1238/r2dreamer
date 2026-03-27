@@ -60,9 +60,9 @@ dataset:
   shuffle_buffer: 10000
   raw_image_mode: 'grayscale' # grayscale|rgb
   raw_dataset:
-    enabled: false
+    enabled: true
     source: "folders" # folders|streaming
-    root: "./data/safety_raw" # expects ./good and ./bad
+    root: "./dataset_temp/event_clips/crashes"
     hf_repo: ""
     split: "train"
     streaming: true

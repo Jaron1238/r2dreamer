@@ -23,51 +23,53 @@ _DEFAULT = object()
 class Dreamer(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.device        = torch.device(config.device)
-        self.act_entropy   = float(config.act_entropy)
-        self.kl_free       = float(config.kl_free)
-        self.imag_horizon  = int(config.imag_horizon)
-        self.horizon       = int(config.horizon)
-        self.lamb          = float(config.lamb)
+        self.config = config
+        cfg = config.model if hasattr(config, "model") else config
+        self.device        = torch.device(getattr(config, "device", getattr(cfg, "device", "cpu")))
+        self.act_entropy   = float(cfg.act_entropy)
+        self.kl_free       = float(cfg.kl_free)
+        self.imag_horizon  = int(cfg.imag_horizon)
+        self.horizon       = int(cfg.horizon)
+        self.lamb          = float(cfg.lamb)
         self.return_ema    = networks.ReturnEMA(device=self.device)
-        self.act_dim       = int(config.act_dim)
-        self.rep_loss      = str(config.rep_loss)
-        self.phase         = int(getattr(config, "phase", 1))
-        self.use_depth     = bool(getattr(config, "use_depth", False))
-        self.safety_threshold = float(getattr(config, "safety_threshold", 0.4))
-        self.safety_input_key = str(getattr(config, "safety_input_key", "image"))
-        hover_throttle = float(getattr(config, "hover_throttle", 0.5))
+        self.act_dim       = int(cfg.act_dim)
+        self.rep_loss      = str(cfg.rep_loss)
+        self.phase         = int(getattr(config, "phase", getattr(cfg, "phase", 1)))
+        self.use_depth     = bool(getattr(config, "use_depth", getattr(cfg, "use_depth", False)))
+        self.safety_threshold = float(getattr(cfg, "safety_threshold", 0.4))
+        self.safety_input_key = str(getattr(cfg, "safety_input_key", "image"))
+        hover_throttle = float(getattr(cfg, "hover_throttle", 0.5))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
         if self.act_dim > 0:
             self.brake_vector[0] = hover_throttle
-        self.drone_embed_dim = int(getattr(config, "drone_embed_dim", 16))
-        self.infonce_temperature = float(getattr(config, "infonce_temperature", 0.1))
-        self.video_pred_batch = int(getattr(config, "video_pred_batch", 6))
+        self.drone_embed_dim = int(getattr(cfg, "drone_embed_dim", 16))
+        self.infonce_temperature = float(getattr(cfg, "infonce_temperature", 0.1))
+        self.video_pred_batch = int(getattr(cfg, "video_pred_batch", 6))
 
         shapes = {
-            "image": (int(config.img_height), int(config.img_width), 2 if self.use_depth else 6)
+            "image": (int(cfg.img_height), int(cfg.img_width), 2 if self.use_depth else 6)
         }
         if self.safety_input_key == "raw_image":
             shapes["raw_image"] = (
-                int(config.img_height),
-                int(config.img_width),
-                int(getattr(config, "safety_in_channels", 1)),
+                int(cfg.img_height),
+                int(cfg.img_width),
+                int(getattr(cfg, "safety_in_channels", 1)),
             )
 
-        self.encoder    = networks.MultiEncoder(config.encoder, shapes)
+        self.encoder    = networks.MultiEncoder(cfg.encoder, shapes)
         self.embed_size = self.encoder.out_dim
-        config.rssm.d_emb_dim = self.drone_embed_dim
-        self.rssm       = rssm.RSSM(config.rssm, self.embed_size, self.act_dim)
-        self.reward     = networks.MLPHead(config.reward, self.rssm.feat_size)
-        self.cont       = networks.MLPHead(config.cont, self.rssm.feat_size)
+        cfg.rssm.d_emb_dim = self.drone_embed_dim
+        self.rssm       = rssm.RSSM(cfg.rssm, self.embed_size, self.act_dim)
+        self.reward     = networks.MLPHead(cfg.reward, self.rssm.feat_size)
+        self.cont       = networks.MLPHead(cfg.cont, self.rssm.feat_size)
 
-        config.actor.shape   = (self.act_dim,)
-        config.actor.dist    = config.actor.dist.cont
+        cfg.actor.shape   = (self.act_dim,)
+        cfg.actor.dist    = cfg.actor.dist.cont
         self.act_discrete    = False
 
-        self._loss_scales = dict(config.loss_scales)
-        self._log_grads   = bool(config.log_grads)
-        self.num_drones = int(config.get("num_drone_classes", 10))
+        self._loss_scales = dict(cfg.loss_scales)
+        self._log_grads   = bool(cfg.log_grads)
+        self.num_drones = int(cfg.get("num_drone_classes", 10))
         self.drone_embed = nn.Embedding(self.num_drones, self.drone_embed_dim)
         self.safety_net = networks.SafetyNet(
             in_channels=shapes[self.safety_input_key][-1],
@@ -75,10 +77,10 @@ class Dreamer(nn.Module):
             speed_dim=1,
         )
         actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
-        self.actor = networks.MLPHead(config.actor, actor_input_dim)
-        self.value = networks.MLPHead(config.critic, actor_input_dim)
-        self.slow_target_update    = int(config.slow_target_update)
-        self.slow_target_fraction  = float(config.slow_target_fraction)
+        self.actor = networks.MLPHead(cfg.actor, actor_input_dim)
+        self.value = networks.MLPHead(cfg.critic, actor_input_dim)
+        self.slow_target_update    = int(cfg.slow_target_update)
+        self.slow_target_fraction  = float(cfg.slow_target_fraction)
         self._slow_value           = copy.deepcopy(self.value)
         for param in self._slow_value.parameters():
             param.requires_grad = False
@@ -96,7 +98,7 @@ class Dreamer(nn.Module):
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
-                config.decoder, self.rssm._deter, self.rssm.flat_stoch, shapes,
+                cfg.decoder, self.rssm._deter, self.rssm.flat_stoch, shapes,
             )
             recon = self._loss_scales.pop("recon")
             self._loss_scales.update({k: recon for k in self.decoder.all_keys})
@@ -104,10 +106,10 @@ class Dreamer(nn.Module):
         elif self.rep_loss == "r2dreamer" or self.rep_loss == "infonce":
             self.prj          = Projector(self.rssm.feat_size, self.embed_size)
             self.prj_target   = Projector(self.embed_size, self.embed_size)
-            self.barlow_lambd = float(config.r2dreamer.lambd)
+            self.barlow_lambd = float(cfg.r2dreamer.lambd)
             modules.update({"projector": self.prj, "projector_target": self.prj_target})
         elif self.rep_loss == "dreamerpro":
-            dpc                         = config.dreamer_pro
+            dpc                         = cfg.dreamer_pro
             self.warm_up                = int(dpc.warm_up)
             self.num_prototypes         = int(dpc.num_prototypes)
             self.proto_dim              = int(dpc.proto_dim)
@@ -148,18 +150,18 @@ class Dreamer(nn.Module):
         print(f"Optimizer has: {sum(p.numel() for p in self._named_params.values())} parameters.")
 
         def _agc(params):
-            clip_grad_agc_(params, float(config.agc), float(config.pmin), foreach=True)
+            clip_grad_agc_(params, float(cfg.agc), float(cfg.pmin), foreach=True)
 
         self._agc       = _agc
-        self._base_lr   = float(config.lr)
-        self._opt_betas = (float(config.beta1), float(config.beta2))
-        self._opt_eps   = float(config.eps)
+        self._base_lr   = float(cfg.lr)
+        self._opt_betas = (float(cfg.beta1), float(cfg.beta2))
+        self._opt_eps   = float(cfg.eps)
         self._optimizer = self._build_optimizer()
         self._scaler = GradScaler()
 
         def lr_lambda(step):
-            if config.warmup:
-                return min(1.0, (step + 1) / config.warmup)
+            if cfg.warmup:
+                return min(1.0, (step + 1) / cfg.warmup)
             return 1.0
 
         self._lr_lambda = lr_lambda
@@ -168,7 +170,7 @@ class Dreamer(nn.Module):
         self.train()
         self._configure_trainable_modules()
         self.clone_and_freeze()
-        if config.compile:
+        if cfg.compile:
             print("Compiling loss computation with torch.compile...")
             self.compute_losses = torch.compile(self.compute_losses, mode="reduce-overhead")
 
@@ -568,11 +570,20 @@ class Dreamer(nn.Module):
             actor_dist = self.actor(policy_input)
             actor_mode = actor_dist.mode
             losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
+
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
             safety_image = data.get(self.safety_input_key, data["image"])
             safety_pred = self.safety_net(safety_image, speed, data["action"])
             losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
+
+            if "inj_raw_image" in data:
+                inj_speed = torch.zeros_like(speed)
+                inj_action = torch.zeros_like(data["action"])
+                inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
+                inj_loss = F.binary_cross_entropy(inj_pred, data["inj_crash"])
+                losses["safety"] = losses["safety"] + inj_loss
+
             metrics["safety/score_mean"] = safety_pred.mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
