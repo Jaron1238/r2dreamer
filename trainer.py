@@ -65,8 +65,6 @@ class DepthPreprocessor:
         # Depth Anything path (best effort in offline preprocessing).
         # In constrained environments we gracefully fallback to grayscale.
         try:
-            import cv2  # type: ignore
-
             outs = []
             for t in range(frames.shape[0]):
                 rgb = (frames[t].cpu().numpy() * 255.0).astype(np.uint8)
@@ -139,7 +137,7 @@ class FPVDataset(IterableDataset):
 
             diff = torch.zeros_like(depth)
             diff[1:] = depth[1:] - depth[:-1]
-            image = torch.cat([depth, diff], dim=-1)
+            image = torch.stack([depth, diff], dim=-1)
 
             reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
             if is_terminal.any():
