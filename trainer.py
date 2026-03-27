@@ -164,6 +164,14 @@ class FPVDataset(IterableDataset):
             speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
                 self.batch_length, 1, dtype=torch.float32
             )
+            altitude_full = torch.from_numpy(np.array(sample["altitudes"][0])).float() if "altitudes" in sample else None
+            altitude = altitude_full[start : start + self.batch_length] if altitude_full is not None else torch.zeros(
+                self.batch_length, 1, dtype=torch.float32
+            )
+            battery_full = torch.from_numpy(np.array(sample["batteries"][0])).float() if "batteries" in sample else None
+            battery = battery_full[start : start + self.batch_length] if battery_full is not None else torch.zeros(
+                self.batch_length, 1, dtype=torch.float32
+            )
 
             drone_value = sample.get("drone_id", 0)
             if isinstance(drone_value, (list, tuple, np.ndarray)):
@@ -189,6 +197,8 @@ class FPVDataset(IterableDataset):
                 "action": actions,
                 "drone_id": drone_id,
                 "speed": speed,
+                "altitude": altitude,
+                "battery": battery,
                 "crash": is_terminal.float().unsqueeze(-1),
                 "inj_raw_image": inj_raw_image,
                 "inj_crash": inj_crash,
@@ -465,12 +475,15 @@ class OfflineTrainer:
                 "action": batch["action"],
                 "drone_id": batch["drone_id"],
                 "speed": batch["speed"],
+                "altitude": batch["altitude"],
+                "battery": batch["battery"],
                 "crash": batch["crash"],
                 "inj_raw_image": batch["inj_raw_image"],
                 "inj_crash": batch["inj_crash"],
             },
             batch_size=[batch_size, time_steps],
         )
+        data = agent.preprocess(data)
         (_, _), total_loss, metrics = agent.compute_losses(data, initial=None)
         return total_loss, metrics
 

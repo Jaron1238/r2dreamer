@@ -137,8 +137,8 @@ class DroneClassifier:
 
     def classify(self, fingerprint: np.ndarray) -> int:
         self._fingerprints.append(fingerprint)
-        X = np.stack(self._fingerprints, axis=0)
-        if len(self._fingerprints) >= max(8, self.num_classes):
+        if (not self._fitted) and len(self._fingerprints) >= max(8, self.num_classes):
+            X = np.stack(self._fingerprints, axis=0)
             Z = self.pipeline.fit_transform(X)
             n_comp = min(self.num_classes, len(Z))
             if self.gmm.n_components != n_comp:
@@ -172,23 +172,35 @@ class StickTracker:
         roi = frame_bgr[y0:y1, x0:x1]
         if roi.size == 0:
             return (np.nan, np.nan, np.nan, np.nan)
+
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
+        color_mask = cv2.inRange(hsv, self.hsv_low, self.hsv_high)
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        bright_mask = cv2.inRange(gray, 180, 255)
+        mask = cv2.bitwise_and(color_mask, bright_mask)
+        ys, xs = np.where(mask > 0)
+        if len(xs) < 2:
             return (np.nan, np.nan, np.nan, np.nan)
-        cnts = sorted(contours, key=cv2.contourArea, reverse=True)[:2]
-        centers = []
-        for c in cnts:
-            m = cv2.moments(c)
-            if m["m00"] <= 1e-6:
+
+        vals = gray[ys, xs].astype(np.float32)
+        idx = np.argsort(vals)[::-1]
+        points = np.stack([xs[idx], ys[idx]], axis=1)
+        picked: List[np.ndarray] = []
+        min_dist2 = 20.0 ** 2
+        for p in points:
+            if not picked:
+                picked.append(p)
                 continue
-            cx = float(m["m10"] / m["m00"])
-            cy = float(m["m01"] / m["m00"])
-            centers.append((cx, cy))
-        if len(centers) < 2:
+            d2 = np.sum((picked[0] - p) ** 2)
+            if d2 >= min_dist2:
+                picked.append(p)
+                break
+        if len(picked) < 2:
             return (np.nan, np.nan, np.nan, np.nan)
-        centers = sorted(centers, key=lambda p: p[0])
+
+        p0 = picked[0].astype(np.float32)
+        p1 = picked[1].astype(np.float32)
+        centers = sorted([(p0[0], p0[1]), (p1[0], p1[1])], key=lambda p: p[0])
         (lx, ly), (rx, ry) = centers[0], centers[1]
         w = max(1.0, float(roi.shape[1] - 1))
         h = max(1.0, float(roi.shape[0] - 1))
@@ -302,13 +314,12 @@ class CrashDetector:
 
 class DepthEstimator:
     def __init__(self, model_id: str, batch_size: int, device: Optional[str] = None):
-        from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+        from transformers import pipeline
 
         self.batch_size = batch_size
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = AutoImageProcessor.from_pretrained(model_id)
-        self.model = AutoModelForDepthEstimation.from_pretrained(model_id).to(self.device)
-        self.model.eval()
+        device_idx = 0 if self.device == "cuda" else -1
+        self.pipe = pipeline("depth-estimation", model=model_id, device=device_idx)
 
     @torch.no_grad()
     def estimate(self, frames_bgr: np.ndarray, out_size: Tuple[int, int]) -> np.ndarray:
@@ -317,14 +328,10 @@ class DepthEstimator:
         for i in range(0, len(frames_bgr), self.batch_size):
             chunk = frames_bgr[i : i + self.batch_size]
             rgb = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in chunk]
-            inp = self.processor(images=rgb, return_tensors="pt")
-            inp = {k: v.to(self.device) for k, v in inp.items()}
-            pred = self.model(**inp).predicted_depth
-            pred = torch.nn.functional.interpolate(
-                pred.unsqueeze(1), size=(H, W), mode="bicubic", align_corners=False
-            ).squeeze(1)
-            depth = pred.cpu().numpy()
-            for d in depth:
+            preds = self.pipe(images=rgb, batch_size=len(rgb))
+            for pred in preds:
+                d = np.array(pred["depth"], dtype=np.float32)
+                d = cv2.resize(d, (W, H), interpolation=cv2.INTER_CUBIC)
                 p2, p98 = np.percentile(d, [2, 98])
                 if p98 <= p2:
                     d_norm = np.zeros_like(d, dtype=np.uint8)
@@ -469,12 +476,11 @@ class FPVPreprocessor:
             return None
 
         actions = self.stick_tracker.extract_actions(frames_bgr_seg)
+        speeds, altitudes, batteries, has_osd = self.osd_extractor.extract(frames_bgr_seg)
         masked = mask_handcam(frames_bgr_seg, self.cfg.handcam_roi)
 
         gray = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in masked], axis=0)
         gray = gray[..., None]
-
-        speeds, altitudes, batteries, has_osd = self.osd_extractor.extract(masked)
 
         depth = self.depth_estimator.estimate(masked, (self.cfg.resize_h, self.cfg.resize_w))
 

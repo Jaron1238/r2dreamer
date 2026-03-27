@@ -32,7 +32,7 @@ def main(config):
     logger = tools.Logger(logdir)
     logger.log_hydra_config(config)
 
-    agent = Dreamer(config.model).to(config.device)
+    agent = Dreamer(config).to(config.device)
 
     if config.get("checkpoint", None):
         ckpt_path = pathlib.Path(config.checkpoint).expanduser()
