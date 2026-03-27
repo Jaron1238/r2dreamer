@@ -222,11 +222,17 @@ class FPVDataset(IterableDataset):
 
     def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim == 3:
-            return frames[..., None]
-        if frames.shape[-1] in (1, 2):
-            return frames[..., :1]
+            frames = frames[..., None]
+        if frames.shape[-1] == 2:
+            frames = frames[..., :1]
+
         if self.raw_image_mode == "rgb":
+            if frames.shape[-1] == 1:
+                return frames.repeat(1, 1, 1, 3)
             return frames[..., :3]
+
+        if frames.shape[-1] == 1:
+            return frames
         return frames[..., :3].mean(dim=-1, keepdim=True)
 
     def _ensure_channel_last(self, frames: torch.Tensor) -> torch.Tensor:
