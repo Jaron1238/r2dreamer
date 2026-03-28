@@ -179,6 +179,23 @@ class SafetyMonitor:
         return True
 
 
+def build_model_image(frame: torch.Tensor, prev_frame: torch.Tensor | None, use_depth: bool) -> torch.Tensor:
+    """Build Dreamer input image in expected channel layout.
+
+    - use_depth=True  -> 2 channels: [depth(gray), temporal_diff]
+    - use_depth=False -> 6 channels: [rgb, temporal_diff]
+    """
+    if use_depth:
+        depth = frame.mean(dim=-1, keepdim=True)
+        prev_depth = prev_frame.mean(dim=-1, keepdim=True) if prev_frame is not None else torch.zeros_like(depth)
+        diff = depth - prev_depth
+        return torch.cat([depth, diff], dim=-1)
+
+    prev_rgb = prev_frame if prev_frame is not None else torch.zeros_like(frame)
+    diff = frame - prev_rgb
+    return torch.cat([frame, diff], dim=-1)
+
+
 @hydra.main(version_base=None, config_path="configs", config_name="fly_real")
 def main(config):
     device = torch.device(config.device)
@@ -201,6 +218,7 @@ def main(config):
 
     state = agent.get_initial_state(B=1).to(device)
     step = 0
+    prev_frame = None
 
     print("[fly_real] Inference-Loop gestartet. Ctrl+C zum Beenden.")
     try:
@@ -218,8 +236,10 @@ def main(config):
                 break
 
             speed = torch.tensor([[telem.get("speed", 0.0)]], dtype=torch.float32, device=device)
+            model_image = build_model_image(frame, prev_frame, use_depth=bool(config.model.use_depth))
+            prev_frame = frame
             obs = {
-                "image": frame.unsqueeze(0).to(device),
+                "image": model_image.unsqueeze(0).to(device),
                 "speed": speed,
                 "is_first": torch.tensor([step == 0], dtype=torch.bool, device=device),
             }
