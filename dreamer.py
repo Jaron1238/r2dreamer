@@ -82,6 +82,17 @@ class Dreamer(nn.Module):
         actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
         self.actor = networks.MLPHead(cfg.actor, actor_input_dim)
         self.value = networks.MLPHead(cfg.critic, actor_input_dim)
+        self.latent_goal_buffer_size = int(getattr(cfg, "latent_goal_buffer_size", 65536))
+        self.register_buffer(
+            "_goal_feat_buffer",
+            torch.zeros(self.latent_goal_buffer_size, self.rssm.feat_size, dtype=torch.float32, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_goal_feat_count",
+            torch.zeros(1, dtype=torch.long, device=self.device),
+            persistent=False,
+        )
         self.slow_target_update    = int(cfg.slow_target_update)
         self.slow_target_fraction  = float(cfg.slow_target_fraction)
         self._slow_value           = copy.deepcopy(self.value)
@@ -514,6 +525,7 @@ class Dreamer(nn.Module):
         losses["rep"] = networks.masked_mean(rep_loss, burn_in_mask)
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
+        self._update_goal_feat_buffer(feat.detach().reshape(-1, self.rssm.feat_size))
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key]))
@@ -672,10 +684,31 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), total_loss, metrics
 
     @torch.no_grad()
+    def _update_goal_feat_buffer(self, feat):
+        if feat.numel() == 0:
+            return
+        n = feat.shape[0]
+        count = int(self._goal_feat_count.item())
+        if n >= self.latent_goal_buffer_size:
+            self._goal_feat_buffer.copy_(feat[-self.latent_goal_buffer_size :])
+            self._goal_feat_count[0] = self.latent_goal_buffer_size
+            return
+        write_pos = count % self.latent_goal_buffer_size
+        first = min(self.latent_goal_buffer_size - write_pos, n)
+        self._goal_feat_buffer[write_pos : write_pos + first] = feat[:first]
+        if first < n:
+            self._goal_feat_buffer[: n - first] = feat[first:]
+        self._goal_feat_count[0] = min(count + n, self.latent_goal_buffer_size)
+
+    @torch.no_grad()
     def _sample_goal_feat(self, post_stoch, post_deter, batch_size):
         if not self.use_latent_goals or batch_size == 0:
             return None
-        feat_pool = self.rssm.get_feat(post_stoch, post_deter).reshape(-1, self.rssm.feat_size)
+        count = int(self._goal_feat_count.item())
+        if count > 0:
+            feat_pool = self._goal_feat_buffer[:count]
+        else:
+            feat_pool = self.rssm.get_feat(post_stoch, post_deter).reshape(-1, self.rssm.feat_size)
 
         # Distance-Weighting: prefer goals in the reachable middle range
         current_feat = feat_pool.mean(dim=0, keepdim=True)  # representative current state
