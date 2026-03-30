@@ -676,7 +676,19 @@ class Dreamer(nn.Module):
         if not self.use_latent_goals or batch_size == 0:
             return None
         feat_pool = self.rssm.get_feat(post_stoch, post_deter).reshape(-1, self.rssm.feat_size)
-        idx = torch.randint(0, feat_pool.shape[0], (batch_size,), device=feat_pool.device)
+
+        # Distance-Weighting: prefer goals in the reachable middle range
+        current_feat = feat_pool.mean(dim=0, keepdim=True)  # representative current state
+        dists = 1.0 - F.cosine_similarity(
+            current_feat.expand(feat_pool.shape[0], -1), feat_pool, dim=-1
+        )  # (N,) — 0=identical, 1=opposite
+        weights = torch.zeros_like(dists)
+        mask = (dists > 0.2) & (dists < 0.8)  # Goldilocks zone: not trivial, not impossible
+        weights[mask] = 1.0
+        if weights.sum() == 0:
+            weights = torch.ones_like(dists)  # fallback: uniform sampling
+
+        idx = torch.multinomial(weights, batch_size, replacement=True)
         goals = feat_pool[idx]
         feat_var = torch.var(feat_pool, dim=0, unbiased=False)
         noise = torch.randn_like(goals) * torch.sqrt(feat_var + 1e-6) * self.latent_goal_noise_scale
@@ -704,7 +716,13 @@ class Dreamer(nn.Module):
         goal_reward = None
         if goal_feat is not None:
             goal_feat = goal_feat.unsqueeze(1).expand(-1, feats.shape[1], -1)
-            goal_reward = F.cosine_similarity(feats, goal_feat, dim=-1).unsqueeze(-1)
+            sim = F.cosine_similarity(feats, goal_feat, dim=-1)  # (B, T)
+
+            # Progress bonus: reward getting closer to goal each step
+            progress = sim[:, 1:] - sim[:, :-1]                 # (B, T-1)
+            progress = F.pad(progress, (1, 0), value=0.0)        # (B, T) — first step = 0
+
+            goal_reward = (sim * 0.7 + progress * 0.3).unsqueeze(-1)  # (B, T, 1)
         return feats, actions, goal_reward
 
     @torch.no_grad()
