@@ -51,7 +51,7 @@ class DroneSimEnv(gym.Env):
         self._yaw = 0.0
         self._velocity = np.zeros(2, dtype=np.float32)
         self._prev_action = np.zeros(act_dim, dtype=np.float32)
-        self._prev_depth = np.ones((h, w, 1), dtype=np.float32)
+        self._prev_depth = None
 
         self._obstacles = self._build_obstacles()
         self._colosseum = ColosseumBridge(config)
@@ -104,10 +104,13 @@ class DroneSimEnv(gym.Env):
             image, speed, info = self._colosseum.read_observation(self._h, self._w, is_first=is_first)
             return {"image": image, "is_first": np.array([is_first], dtype=np.bool_), "speed": speed}, info
         depth, nearest = self._render_depth()
-        diff = np.clip(depth - self._prev_depth, -1.0, 1.0)
-        diff = (diff + 1.0) * 0.5
+        if self._prev_depth is None:
+            diff = np.zeros_like(depth)
+        else:
+            diff = np.clip(depth - self._prev_depth, -1.0, 1.0)
+            diff = (diff + 1.0) * 0.5
         image = np.concatenate([depth, diff], axis=-1).astype(np.float32)
-        self._prev_depth = depth
+        self._prev_depth = depth.copy()
         speed = np.array([[float(np.linalg.norm(self._velocity))]], dtype=np.float32)
         obs = {
             "image": image,
@@ -133,7 +136,7 @@ class DroneSimEnv(gym.Env):
         self._yaw = 0.0
         self._velocity = np.zeros(2, dtype=np.float32)
         self._prev_action = np.zeros(self.action_space.shape[0], dtype=np.float32)
-        self._prev_depth = np.ones((self._h, self._w, 1), dtype=np.float32)
+        self._prev_depth = None
         if hasattr(self.reward_fn, "reset"):
             self.reward_fn.reset()
         return self._obs(is_first=True)
@@ -145,12 +148,22 @@ class DroneSimEnv(gym.Env):
         action = np.clip(action, self.action_space.low, self.action_space.high)
         self._step += 1
 
-        throttle = float((action[0] + 1.0) * 0.5 * self._max_speed)
-        yaw_rate = float(action[1] * self._max_yaw_rate) if action.shape[0] > 1 else 0.0
+        roll_cmd = float(action[0]) if action.shape[0] > 0 else 0.0
+        pitch_cmd = float(action[1]) if action.shape[0] > 1 else 0.0
+        yaw_rate = float(action[2] * self._max_yaw_rate) if action.shape[0] > 2 else (
+            float(action[1] * self._max_yaw_rate) if action.shape[0] > 1 else 0.0
+        )
+        throttle = float((action[3] + 1.0) * 0.5 * self._max_speed) if action.shape[0] > 3 else float(
+            (action[0] + 1.0) * 0.5 * self._max_speed
+        )
 
         self._yaw += yaw_rate * self._dt
-        heading = np.array([np.cos(self._yaw), np.sin(self._yaw)], dtype=np.float32)
-        self._velocity = heading * throttle
+        body_vel = np.array([pitch_cmd, roll_cmd], dtype=np.float32) * throttle
+        rot = np.array(
+            [[np.cos(self._yaw), -np.sin(self._yaw)], [np.sin(self._yaw), np.cos(self._yaw)]],
+            dtype=np.float32,
+        )
+        self._velocity = rot @ body_vel
         self._x += float(self._velocity[0] * self._dt)
         self._y += float(self._velocity[1] * self._dt)
 
