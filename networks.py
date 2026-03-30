@@ -10,6 +10,17 @@ import distributions as dists
 from tools import weight_init_
 
 
+def masked_mean(values: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Mean over valid time positions used for context burn-in handling."""
+    if mask is None:
+        return torch.mean(values)
+    while mask.dim() < values.dim():
+        mask = mask.unsqueeze(-1)
+    mask = mask.to(dtype=values.dtype)
+    denom = torch.clamp(mask.sum(), min=1.0)
+    return torch.sum(values * mask) / denom
+
+
 class LambdaLayer(nn.Module):
     """Wrap an arbitrary callable into an ``nn.Module``."""
 
