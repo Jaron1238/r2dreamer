@@ -278,6 +278,26 @@ class CrashDetector:
         self.brightness_drop = brightness_drop
         self.sharpness_drop = sharpness_drop
         self.near_miss_flow_threshold = near_miss_flow_threshold
+        self._raft = None
+        self._raft_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+
+            self._raft = raft_small(weights=Raft_Small_Weights.DEFAULT, progress=False).to(self._raft_device).eval()
+        except Exception:
+            self._raft = None
+
+    @torch.no_grad()
+    def _flow_mag(self, prev: np.ndarray, cur: np.ndarray) -> float:
+        if self._raft is None:
+            flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            return float(np.mean(np.linalg.norm(flow, axis=-1)))
+        p = torch.from_numpy(prev).float().to(self._raft_device) / 255.0
+        c = torch.from_numpy(cur).float().to(self._raft_device) / 255.0
+        p = p.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        c = c.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        flow = self._raft(p, c)[-1]
+        return float(flow.norm(dim=1).mean().item())
 
     def detect(self, frames_gray: np.ndarray) -> Tuple[np.ndarray, List[int], List[int]]:
         n = len(frames_gray)
@@ -293,8 +313,7 @@ class CrashDetector:
 
         for i in range(1, n):
             cur = frames_gray[i]
-            flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            flow_mag = float(np.mean(np.linalg.norm(flow, axis=-1)))
+            flow_mag = self._flow_mag(prev, cur)
             b = float(np.mean(cur))
             s = float(cv2.Laplacian(cur, cv2.CV_32F).var())
 

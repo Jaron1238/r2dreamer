@@ -157,6 +157,26 @@ class DroneInterface:
                 0,
             )
 
+    def send_brake(self):
+        if self.protocol == "mavlink" and self._mav is not None:
+            from pymavlink import mavutil
+
+            self._mav.mav.command_long_send(
+                self._mav.target_system,
+                self._mav.target_component,
+                mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                0,
+                1,
+                17,
+                0,
+                0,
+                0,
+                0,
+                0,
+            )
+        else:
+            self.send_action(torch.zeros(4))
+
 
 class SafetyMonitor:
     """Unabhängige Hardware-Sicherheitsprüfung."""
@@ -207,6 +227,10 @@ def main(config):
         print(f"[WARNUNG] Checkpoint ist aus Phase {ckpt_phase} — unvollständiges Modell!")
     agent.load_state_dict(ckpt["model"])
     agent.eval()
+    if device.type == "cuda":
+        agent.act = torch.compile(agent.act, mode="reduce-overhead")
+    elif device.type == "mps":
+        agent.act = torch.compile(agent.act)
 
     stream = PiVideoStream(
         port=config.stream.port,
@@ -219,6 +243,7 @@ def main(config):
     state = agent.get_initial_state(B=1).to(device)
     step = 0
     prev_frame = None
+    next_is_first = True
 
     print("[fly_real] Inference-Loop gestartet. Ctrl+C zum Beenden.")
     try:
@@ -232,8 +257,19 @@ def main(config):
 
             telem = drone.get_telemetry()
             if not safety.is_safe(telem):
-                drone.emergency_stop()
-                break
+                drone.send_brake()
+                stable_count = 0
+                while stable_count < 10:
+                    time.sleep(0.05)
+                    t = drone.get_telemetry()
+                    speed_ok = float(t.get("speed", 99.0)) < 0.5
+                    roll_ok = abs(float(t.get("roll", 9.9))) < 0.2
+                    pitch_ok = abs(float(t.get("pitch", 9.9))) < 0.2
+                    stable_count = stable_count + 1 if (speed_ok and roll_ok and pitch_ok) else 0
+                state = agent.get_initial_state(B=1).to(device)
+                next_is_first = True
+                prev_frame = None
+                continue
 
             speed = torch.tensor([[telem.get("speed", 0.0)]], dtype=torch.float32, device=device)
             model_image = build_model_image(frame, prev_frame, use_depth=bool(config.model.use_depth))
@@ -241,8 +277,9 @@ def main(config):
             obs = {
                 "image": model_image.unsqueeze(0).to(device),
                 "speed": speed,
-                "is_first": torch.tensor([step == 0], dtype=torch.bool, device=device),
+                "is_first": torch.tensor([next_is_first], dtype=torch.bool, device=device),
             }
+            next_is_first = False
 
             action, state = agent.act(obs, state, eval=True)
             drone.send_action(action.squeeze(0))

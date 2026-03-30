@@ -45,6 +45,9 @@ class Dreamer(nn.Module):
         self.drone_embed_dim = int(getattr(cfg, "drone_embed_dim", 16))
         self.infonce_temperature = float(getattr(cfg, "infonce_temperature", 0.1))
         self.video_pred_batch = int(getattr(cfg, "video_pred_batch", 6))
+        self.motor_inertia_range = tuple(getattr(cfg, "motor_inertia_range", (0.1, 0.8)))
+        self.use_latent_goals = bool(getattr(cfg, "use_latent_goals", True))
+        self.latent_goal_noise_scale = float(getattr(cfg, "latent_goal_noise_scale", 0.2))
 
         shapes = {
             "image": (int(cfg.img_height), int(cfg.img_width), 2 if self.use_depth else 6)
@@ -71,6 +74,13 @@ class Dreamer(nn.Module):
         self._log_grads   = bool(cfg.log_grads)
         self.num_drones = int(cfg.get("num_drone_classes", 10))
         self.drone_embed = nn.Embedding(self.num_drones, self.drone_embed_dim)
+        self.ctx_len = int(getattr(cfg, "ctx_len", 16))
+        self.ctx_consistency_weight = float(getattr(cfg, "ctx_consistency_weight", 0.1))
+        self.ctx_warmup_steps = int(getattr(cfg, "ctx_warmup_steps", 1000))
+        self._ctx_updates = 0
+        self.context_encoder = networks.ContextEncoder(
+            self.rssm.flat_stoch, self.rssm._deter, self.act_dim, ctx_len=self.ctx_len, out_dim=self.drone_embed_dim
+        )
         self.safety_net = networks.SafetyNet(
             in_channels=shapes[self.safety_input_key][-1],
             action_dim=self.act_dim,
@@ -79,6 +89,17 @@ class Dreamer(nn.Module):
         actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
         self.actor = networks.MLPHead(cfg.actor, actor_input_dim)
         self.value = networks.MLPHead(cfg.critic, actor_input_dim)
+        self.latent_goal_buffer_size = int(getattr(cfg, "latent_goal_buffer_size", 65536))
+        self.register_buffer(
+            "_goal_feat_buffer",
+            torch.zeros(self.latent_goal_buffer_size, self.rssm.feat_size, dtype=torch.float32, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_goal_feat_count",
+            torch.zeros(1, dtype=torch.long, device=self.device),
+            persistent=False,
+        )
         self.slow_target_update    = int(cfg.slow_target_update)
         self.slow_target_fraction  = float(cfg.slow_target_fraction)
         self._slow_value           = copy.deepcopy(self.value)
@@ -93,6 +114,7 @@ class Dreamer(nn.Module):
             "cont":    self.cont,
             "encoder": self.encoder,
             "drone_embed": self.drone_embed, 
+            "context_encoder": self.context_encoder,
             "safety_net": self.safety_net,
         }
 
@@ -282,6 +304,9 @@ class Dreamer(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self._slow_value.train(False)
+        if mode and self.phase == 2:
+            self.encoder.eval()
+            self.rssm.eval()
         return self
 
     def clone_and_freeze(self):
@@ -309,14 +334,18 @@ class Dreamer(nn.Module):
         torch.compiler.cudagraph_mark_step_begin()
         p_obs                          = self.preprocess(obs)
         embed                          = self._frozen_encoder(p_obs)
-        d_emb                          = self._get_drone_embedding(
+        teacher_d_emb                  = self._get_drone_embedding(
             obs.get("drone_id"), batch_shape=embed.shape[:-1], frozen=True, device=embed.device
         )
-        prev_stoch, prev_deter, prev_action = (
-            state["stoch"], state["deter"], state["prev_action"],
+        if self.phase >= 3:
+            d_emb = self.context_encoder(state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"])
+        else:
+            d_emb = teacher_d_emb
+        prev_stoch, prev_deter, prev_action, prev_filtered_action = (
+            state["stoch"], state["deter"], state["prev_action"], state["prev_filtered_action"],
         )
-        stoch, deter, _ = self._frozen_rssm.obs_step(
-            prev_stoch, prev_deter, prev_action, embed, obs["is_first"], d_emb
+        stoch, deter, _, filtered_action = self._frozen_rssm.obs_step(
+            prev_stoch, prev_deter, prev_action, embed, obs["is_first"], d_emb, prev_filtered_action
         )
         feat         = self._frozen_rssm.get_feat(stoch, deter)
         policy_input = torch.cat([feat, d_emb], dim=-1)
@@ -330,17 +359,40 @@ class Dreamer(nn.Module):
         safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
         brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
         action = torch.where(safety_score > self.safety_threshold, brake, action)
+        flat_stoch = stoch.reshape(stoch.shape[0], -1)
+        ctx_flat_stoch = torch.cat([state["ctx_flat_stoch"][:, 1:], flat_stoch.unsqueeze(1)], dim=1)
+        ctx_deter = torch.cat([state["ctx_deter"][:, 1:], deter.unsqueeze(1)], dim=1)
+        ctx_action = torch.cat([state["ctx_action"][:, 1:], action.unsqueeze(1)], dim=1)
         return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action},
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action,
+                "prev_filtered_action": filtered_action,
+                "ctx_flat_stoch": ctx_flat_stoch,
+                "ctx_deter": ctx_deter,
+                "ctx_action": ctx_action,
+            },
             batch_size=state.batch_size,
         )
 
     @torch.no_grad()
     def get_initial_state(self, B):
-        stoch, deter = self.rssm.initial(B)
+        stoch, deter, prev_filtered_action = self.rssm.initial(B)
         action       = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
+        ctx_flat_stoch = torch.zeros(B, self.ctx_len, self.rssm.flat_stoch, dtype=torch.float32, device=self.device)
+        ctx_deter = torch.zeros(B, self.ctx_len, self.rssm._deter, dtype=torch.float32, device=self.device)
+        ctx_action = torch.zeros(B, self.ctx_len, self.act_dim, dtype=torch.float32, device=self.device)
         return TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action}, batch_size=(B,)
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action,
+                "prev_filtered_action": prev_filtered_action,
+                "ctx_flat_stoch": ctx_flat_stoch,
+                "ctx_deter": ctx_deter,
+                "ctx_action": ctx_action,
+            }, batch_size=(B,)
         )
 
     @torch.no_grad()
@@ -362,7 +414,7 @@ class Dreamer(nn.Module):
         recon               = self.decoder(post_stoch, post_deter)["image"].mode[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
         prior_stoch, prior_deter = self.rssm.imagine_with_action(
-            init_stoch, init_deter, data["action"][:B, 5:], d_emb[:B, 5:],
+            init_stoch, init_deter, data["action"][:B, 5:], d_emb[:B, 5:]
         )
         openl = self.decoder(prior_stoch, prior_deter)["image"].mode
         model = torch.cat([recon[:, :5], openl], 1)
@@ -507,17 +559,14 @@ class Dreamer(nn.Module):
         _, prior_logit    = self.rssm.prior(post_deter)
         dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
         burn_in_mask = data.get("burn_in_mask", None)
-        if burn_in_mask is not None:
-            mask = burn_in_mask
-            if mask.ndim == 2:
-                mask = mask[0]
-            losses["dyn"] = torch.mean(dyn_loss[:, mask])
-            losses["rep"] = torch.mean(rep_loss[:, mask])
-        else:
-            losses["dyn"] = torch.mean(dyn_loss)
-            losses["rep"] = torch.mean(rep_loss)
+        losses["dyn"] = networks.masked_mean(dyn_loss, burn_in_mask)
+        losses["rep"] = networks.masked_mean(rep_loss, burn_in_mask)
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
+        self._update_goal_feat_buffer(feat.detach().reshape(-1, self.rssm.feat_size))
+        flat_post_stoch = post_stoch.reshape(B, T, -1)
+        ctx_student = self.context_encoder(flat_post_stoch, post_deter, data["action"])
+        ctx_student_time = ctx_student.unsqueeze(1).expand(-1, T, -1)
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key]))
@@ -568,39 +617,65 @@ class Dreamer(nn.Module):
         if self.phase == 2:
             policy_input = torch.cat([feat.detach(), d_emb.detach()], dim=-1)
             actor_dist = self.actor(policy_input)
-            actor_mode = actor_dist.mode
-            losses["bc"] = torch.mean((actor_mode - data["action"]) ** 2)
+            bc_loss = -actor_dist.log_prob(data["action"])
+            losses["bc"] = networks.masked_mean(bc_loss, burn_in_mask)
+            losses["ctx_align"] = torch.mean((ctx_student_time - d_emb.detach()) ** 2)
 
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
             safety_image = data.get(self.safety_input_key, data["image"])
             safety_pred = self.safety_net(safety_image, speed, data["action"])
-            losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
+            focal_alpha = 0.8
+            focal_gamma = 2.0
+            safety_pred = torch.clamp(safety_pred, min=1e-6, max=1 - 1e-6)
+            p_t = crash_target * safety_pred + (1.0 - crash_target) * (1.0 - safety_pred)
+            alpha_t = crash_target * focal_alpha + (1.0 - crash_target) * (1.0 - focal_alpha)
+            focal_loss = -alpha_t * ((1.0 - p_t) ** focal_gamma) * torch.log(p_t)
+            losses["safety"] = torch.mean(focal_loss)
 
             if "inj_raw_image" in data:
                 inj_speed = torch.zeros_like(speed)
                 inj_action = torch.zeros_like(data["action"])
                 inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
-                inj_loss = F.binary_cross_entropy(inj_pred, data["inj_crash"])
+                inj_pred = torch.clamp(inj_pred, min=1e-6, max=1 - 1e-6)
+                inj_target = data["inj_crash"]
+                inj_pt = inj_target * inj_pred + (1.0 - inj_target) * (1.0 - inj_pred)
+                inj_alpha = inj_target * focal_alpha + (1.0 - inj_target) * (1.0 - focal_alpha)
+                inj_loss = torch.mean(-inj_alpha * ((1.0 - inj_pt) ** focal_gamma) * torch.log(inj_pt))
                 losses["safety"] = losses["safety"] + inj_loss
 
             metrics["safety/score_mean"] = safety_pred.mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
-            start = (
-                post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
-                post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
-            )
+            self._ctx_updates += 1
+            d_emb = ctx_student_time
+            valid_mask = burn_in_mask if burn_in_mask is not None else torch.ones_like(data["is_first"], dtype=torch.bool)
+            flat_mask = valid_mask.reshape(-1)
+            flat_post_stoch = post_stoch.reshape(-1, *post_stoch.shape[2:]).detach()
+            flat_post_deter = post_deter.reshape(-1, *post_deter.shape[2:]).detach()
+            if flat_mask.any():
+                flat_post_stoch = flat_post_stoch[flat_mask]
+                flat_post_deter = flat_post_deter[flat_mask]
+            start = (flat_post_stoch, flat_post_deter)
             if self.num_drones > 1:
                 assert (data["drone_id"] == data["drone_id"][:, :1]).all(), (
                     "Drone-ID wechselt innerhalb einer Sequenz — d_emb_imag wäre falsch"
                 )
-            d_emb_imag = d_emb[:, -1].repeat_interleave(T, dim=0)
+            flat_d_emb = d_emb.reshape(-1, d_emb.shape[-1])
+            if flat_mask.any():
+                flat_d_emb = flat_d_emb[flat_mask]
+            d_emb_imag = flat_d_emb
+            goal_feat = self._sample_goal_feat(post_stoch.detach(), post_deter.detach(), batch_size=d_emb_imag.shape[0])
             with torch.no_grad():
                 with autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
-                    imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1, d_emb_imag)
+                    imag_feat, imag_action, imag_goal_reward = self._imagine(
+                        start, self.imag_horizon + 1, d_emb_imag, goal_feat=goal_feat
+                    )
             imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
-            imag_reward = self._frozen_reward(imag_feat).mode
+            if imag_goal_reward is not None:
+                imag_reward = imag_goal_reward.detach()
+            else:
+                imag_reward = self._frozen_reward(imag_feat).mode
             imag_cont = self._frozen_cont(imag_feat).mean
             imag_d_emb = d_emb_imag.unsqueeze(1).expand(-1, imag_feat.shape[1], -1)
             imag_policy_input = torch.cat([imag_feat, imag_d_emb], dim=-1)
@@ -639,7 +714,7 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(imag_action, "action"))
             last, term, reward = (to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]))
             feat = self.rssm.get_feat(post_stoch, post_deter)
-            boot = ret[:, 0].reshape(B, T, 1)
+            boot = ret[:, 0].reshape(B, -1, 1)[:, :T]
             replay_policy_input = torch.cat([feat, d_emb], dim=-1)
             value = self._frozen_value(replay_policy_input).mode
             slow_value = self._frozen_slow_value(replay_policy_input).mode
@@ -655,6 +730,11 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(ret, "ret_replay"))
             metrics.update(tools.tensorstats(value, "value_replay"))
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+            half = max(1, T // 2)
+            z_a = self.context_encoder(flat_post_stoch[:, :half], post_deter[:, :half], data["action"][:, :half])
+            z_b = self.context_encoder(flat_post_stoch[:, half:], post_deter[:, half:], data["action"][:, half:])
+            warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
+            losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
@@ -662,18 +742,79 @@ class Dreamer(nn.Module):
         return (post_stoch, post_deter), total_loss, metrics
 
     @torch.no_grad()
-    def _imagine(self, start, imag_horizon, d_emb):
+    def _update_goal_feat_buffer(self, feat):
+        if feat.numel() == 0:
+            return
+        n = feat.shape[0]
+        count = int(self._goal_feat_count.item())
+        if n >= self.latent_goal_buffer_size:
+            self._goal_feat_buffer.copy_(feat[-self.latent_goal_buffer_size :])
+            self._goal_feat_count[0] = self.latent_goal_buffer_size
+            return
+        write_pos = count % self.latent_goal_buffer_size
+        first = min(self.latent_goal_buffer_size - write_pos, n)
+        self._goal_feat_buffer[write_pos : write_pos + first] = feat[:first]
+        if first < n:
+            self._goal_feat_buffer[: n - first] = feat[first:]
+        self._goal_feat_count[0] = min(count + n, self.latent_goal_buffer_size)
+
+    @torch.no_grad()
+    def _sample_goal_feat(self, post_stoch, post_deter, batch_size):
+        if not self.use_latent_goals or batch_size == 0:
+            return None
+        count = int(self._goal_feat_count.item())
+        if count > 0:
+            feat_pool = self._goal_feat_buffer[:count]
+        else:
+            feat_pool = self.rssm.get_feat(post_stoch, post_deter).reshape(-1, self.rssm.feat_size)
+
+        # Distance-Weighting: prefer goals in the reachable middle range
+        current_feat = feat_pool.mean(dim=0, keepdim=True)  # representative current state
+        dists = 1.0 - F.cosine_similarity(
+            current_feat.expand(feat_pool.shape[0], -1), feat_pool, dim=-1
+        )  # (N,) — 0=identical, 1=opposite
+        weights = torch.zeros_like(dists)
+        mask = (dists > 0.2) & (dists < 0.8)  # Goldilocks zone: not trivial, not impossible
+        weights[mask] = 1.0
+        if weights.sum() == 0:
+            weights = torch.ones_like(dists)  # fallback: uniform sampling
+
+        idx = torch.multinomial(weights, batch_size, replacement=True)
+        goals = feat_pool[idx]
+        feat_var = torch.var(feat_pool, dim=0, unbiased=False)
+        noise = torch.randn_like(goals) * torch.sqrt(feat_var + 1e-6) * self.latent_goal_noise_scale
+        return goals + noise
+
+    @torch.no_grad()
+    def _imagine(self, start, imag_horizon, d_emb, goal_feat=None):
         feats   = []
         actions = []
         stoch, deter = start
+        alpha_min, alpha_max = self.motor_inertia_range
+        alpha = torch.rand(stoch.shape[0], 1, device=stoch.device) * (alpha_max - alpha_min) + alpha_min
+        prev_filtered_action = torch.zeros(stoch.shape[0], self.act_dim, dtype=torch.float32, device=stoch.device)
         for _ in range(imag_horizon):
             feat   = self._frozen_rssm.get_feat(stoch, deter)
             policy_input = torch.cat([feat, d_emb], dim=-1)
             action = self._frozen_actor(policy_input).rsample()
             feats.append(feat)
             actions.append(action)
-            stoch, deter = self._frozen_rssm.img_step(stoch, deter, action, d_emb)
-        return torch.stack(feats, dim=1), torch.stack(actions, dim=1)
+            stoch, deter, prev_filtered_action = self._frozen_rssm.img_step(
+                stoch, deter, action, d_emb, prev_filtered_action=prev_filtered_action, alpha=alpha
+            )
+        feats = torch.stack(feats, dim=1)
+        actions = torch.stack(actions, dim=1)
+        goal_reward = None
+        if goal_feat is not None:
+            goal_feat = goal_feat.unsqueeze(1).expand(-1, feats.shape[1], -1)
+            sim = F.cosine_similarity(feats, goal_feat, dim=-1)  # (B, T)
+
+            # Progress bonus: reward getting closer to goal each step
+            progress = sim[:, 1:] - sim[:, :-1]                 # (B, T-1)
+            progress = F.pad(progress, (1, 0), value=0.0)        # (B, T) — first step = 0
+
+            goal_reward = (sim * 0.7 + progress * 0.3).unsqueeze(-1)  # (B, T, 1)
+        return feats, actions, goal_reward
 
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
