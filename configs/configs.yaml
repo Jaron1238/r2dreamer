@@ -73,6 +73,8 @@ model:
   img_width: 256
   phase: ${phase}
   use_depth: ${use_depth}
+  motor_inertia_range: [0.1, 0.8]
+  use_latent_goals: True
   safety_input_key: "raw_image" # image|raw_image
   safety_in_channels: 1
   infonce_temperature: 0.07
