@@ -278,6 +278,26 @@ class CrashDetector:
         self.brightness_drop = brightness_drop
         self.sharpness_drop = sharpness_drop
         self.near_miss_flow_threshold = near_miss_flow_threshold
+        self._raft = None
+        self._raft_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        try:
+            from torchvision.models.optical_flow import raft_small, Raft_Small_Weights
+
+            self._raft = raft_small(weights=Raft_Small_Weights.DEFAULT, progress=False).to(self._raft_device).eval()
+        except Exception:
+            self._raft = None
+
+    @torch.no_grad()
+    def _flow_mag(self, prev: np.ndarray, cur: np.ndarray) -> float:
+        if self._raft is None:
+            flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            return float(np.mean(np.linalg.norm(flow, axis=-1)))
+        p = torch.from_numpy(prev).float().to(self._raft_device) / 255.0
+        c = torch.from_numpy(cur).float().to(self._raft_device) / 255.0
+        p = p.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        c = c.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        flow = self._raft(p, c)[-1]
+        return float(flow.norm(dim=1).mean().item())
 
     def detect(self, frames_gray: np.ndarray) -> Tuple[np.ndarray, List[int], List[int]]:
         n = len(frames_gray)
@@ -293,8 +313,7 @@ class CrashDetector:
 
         for i in range(1, n):
             cur = frames_gray[i]
-            flow = cv2.calcOpticalFlowFarneback(prev, cur, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-            flow_mag = float(np.mean(np.linalg.norm(flow, axis=-1)))
+            flow_mag = self._flow_mag(prev, cur)
             b = float(np.mean(cur))
             s = float(cv2.Laplacian(cur, cv2.CV_32F).var())
 
@@ -420,6 +439,7 @@ class ParquetExporter:
         segment_id: int,
         frames_gray: np.ndarray,
         frames_depth: np.ndarray,
+        frames_cam_overlay: np.ndarray,
         actions: np.ndarray,
         speeds: np.ndarray,
         altitudes: np.ndarray,
@@ -431,6 +451,7 @@ class ParquetExporter:
         record = {
             "frames_gray": [frames_gray.astype(np.uint8)],
             "frames_depth": [frames_depth.astype(np.uint8)],
+            "frames_cam_overlay": [frames_cam_overlay.astype(np.uint8)],
             "actions": [actions.astype(np.float32)],
             "speeds": [speeds.astype(np.float32)],
             "altitudes": [altitudes.astype(np.float32)],
@@ -478,6 +499,7 @@ class FPVPreprocessor:
         actions = self.stick_tracker.extract_actions(frames_bgr_seg)
         speeds, altitudes, batteries, has_osd = self.osd_extractor.extract(frames_bgr_seg)
         masked = mask_handcam(frames_bgr_seg, self.cfg.handcam_roi)
+        cam_overlay = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames_bgr_seg], axis=0)[..., None]
 
         gray = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in masked], axis=0)
         gray = gray[..., None]
@@ -494,6 +516,7 @@ class FPVPreprocessor:
         return {
             "frames_gray": gray,
             "frames_depth": depth,
+            "frames_cam_overlay": cam_overlay,
             "actions": actions,
             "speeds": speeds,
             "altitudes": altitudes,

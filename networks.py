@@ -10,6 +10,17 @@ import distributions as dists
 from tools import weight_init_
 
 
+def masked_mean(values: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Mean over valid time positions used for context burn-in handling."""
+    if mask is None:
+        return torch.mean(values)
+    while mask.dim() < values.dim():
+        mask = mask.unsqueeze(-1)
+    mask = mask.to(dtype=values.dtype)
+    denom = torch.clamp(mask.sum(), min=1.0)
+    return torch.sum(values * mask) / denom
+
+
 class LambdaLayer(nn.Module):
     """Wrap an arbitrary callable into an ``nn.Module``."""
 
@@ -424,6 +435,27 @@ class MLPHead(nn.Module):
         """Produce a distribution head."""
         # (B, T, F)
         return self._dist(self.last(self.mlp(x)))
+
+
+class ContextEncoder(nn.Module):
+    def __init__(self, flat_stoch, deter, act_dim, ctx_len=16, bottleneck=256, out_dim=16):
+        super().__init__()
+        self.ctx_len = int(ctx_len)
+        inp_dim = int(flat_stoch + deter + act_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(inp_dim, int(bottleneck), bias=True),
+            nn.RMSNorm(int(bottleneck), eps=1e-04, dtype=torch.float32),
+            nn.SiLU(),
+        )
+        self.gru = nn.GRU(input_size=int(bottleneck), hidden_size=int(out_dim), num_layers=1, batch_first=True)
+        self.out_dim = int(out_dim)
+        self.apply(weight_init_)
+
+    def forward(self, flat_stoch, deter, action):
+        x = torch.cat([flat_stoch, deter, action], dim=-1)
+        x = self.proj(x)
+        _, h = self.gru(x)
+        return h[-1]
 
 
 class Projector(nn.Module):
