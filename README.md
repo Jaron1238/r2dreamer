@@ -11,7 +11,7 @@ In addition to the original world-model components, it includes a multi-phase wo
 - **Phase-based setup**:
   - **Phase 1**: World-model training (Actor/Value frozen).
   - **Phase 2**: Encoder/RSSM frozen, behavior cloning + safety learning.
-  - **Phase 3**: Online training via `envs/drone_sim.py` (adapter placeholder).
+  - **Phase 3**: Online training via `envs/drone_sim.py` and collosseum
   - **Phase 4**: Real deployment scaffold in `fly_real.py`.
 
 ## Project structure (key files)
