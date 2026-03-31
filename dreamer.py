@@ -338,7 +338,9 @@ class Dreamer(nn.Module):
             obs.get("drone_id"), batch_shape=embed.shape[:-1], frozen=True, device=embed.device
         )
         if self.phase >= 3:
-            d_emb = self.context_encoder(state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"])
+            ctx_ready = state["ctx_valid_steps"] >= self.ctx_len
+            ctx_d_emb = self.context_encoder(state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"])
+            d_emb = torch.where(ctx_ready.unsqueeze(-1), ctx_d_emb, teacher_d_emb)
         else:
             d_emb = teacher_d_emb
         prev_stoch, prev_deter, prev_action, prev_filtered_action = (
@@ -363,6 +365,7 @@ class Dreamer(nn.Module):
         ctx_flat_stoch = torch.cat([state["ctx_flat_stoch"][:, 1:], flat_stoch.unsqueeze(1)], dim=1)
         ctx_deter = torch.cat([state["ctx_deter"][:, 1:], deter.unsqueeze(1)], dim=1)
         ctx_action = torch.cat([state["ctx_action"][:, 1:], action.unsqueeze(1)], dim=1)
+        ctx_valid_steps = torch.clamp(state["ctx_valid_steps"] + 1, max=self.ctx_len)
         return action, TensorDict(
             {
                 "stoch": stoch,
@@ -372,6 +375,7 @@ class Dreamer(nn.Module):
                 "ctx_flat_stoch": ctx_flat_stoch,
                 "ctx_deter": ctx_deter,
                 "ctx_action": ctx_action,
+                "ctx_valid_steps": ctx_valid_steps,
             },
             batch_size=state.batch_size,
         )
@@ -383,6 +387,7 @@ class Dreamer(nn.Module):
         ctx_flat_stoch = torch.zeros(B, self.ctx_len, self.rssm.flat_stoch, dtype=torch.float32, device=self.device)
         ctx_deter = torch.zeros(B, self.ctx_len, self.rssm._deter, dtype=torch.float32, device=self.device)
         ctx_action = torch.zeros(B, self.ctx_len, self.act_dim, dtype=torch.float32, device=self.device)
+        ctx_valid_steps = torch.zeros(B, dtype=torch.long, device=self.device)
         return TensorDict(
             {
                 "stoch": stoch,
@@ -392,6 +397,7 @@ class Dreamer(nn.Module):
                 "ctx_flat_stoch": ctx_flat_stoch,
                 "ctx_deter": ctx_deter,
                 "ctx_action": ctx_action,
+                "ctx_valid_steps": ctx_valid_steps,
             }, batch_size=(B,)
         )
 
@@ -657,10 +663,6 @@ class Dreamer(nn.Module):
                 flat_post_stoch = flat_post_stoch[flat_mask]
                 flat_post_deter = flat_post_deter[flat_mask]
             start = (flat_post_stoch, flat_post_deter)
-            if self.num_drones > 1:
-                assert (data["drone_id"] == data["drone_id"][:, :1]).all(), (
-                    "Drone-ID wechselt innerhalb einer Sequenz — d_emb_imag wäre falsch"
-                )
             flat_d_emb = d_emb.reshape(-1, d_emb.shape[-1])
             if flat_mask.any():
                 flat_d_emb = flat_d_emb[flat_mask]
@@ -860,6 +862,9 @@ class Dreamer(nn.Module):
             for p in self.reward.parameters():
                 p.requires_grad = False
             for p in self.cont.parameters():
+                p.requires_grad = False
+        elif self.phase >= 3:
+            for p in self.drone_embed.parameters():
                 p.requires_grad = False
 
     @torch.no_grad()
