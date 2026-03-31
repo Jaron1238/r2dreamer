@@ -437,6 +437,27 @@ class MLPHead(nn.Module):
         return self._dist(self.last(self.mlp(x)))
 
 
+class ContextEncoder(nn.Module):
+    def __init__(self, flat_stoch, deter, act_dim, ctx_len=16, bottleneck=256, out_dim=16):
+        super().__init__()
+        self.ctx_len = int(ctx_len)
+        inp_dim = int(flat_stoch + deter + act_dim)
+        self.proj = nn.Sequential(
+            nn.Linear(inp_dim, int(bottleneck), bias=True),
+            nn.RMSNorm(int(bottleneck), eps=1e-04, dtype=torch.float32),
+            nn.SiLU(),
+        )
+        self.gru = nn.GRU(input_size=int(bottleneck), hidden_size=int(out_dim), num_layers=1, batch_first=True)
+        self.out_dim = int(out_dim)
+        self.apply(weight_init_)
+
+    def forward(self, flat_stoch, deter, action):
+        x = torch.cat([flat_stoch, deter, action], dim=-1)
+        x = self.proj(x)
+        _, h = self.gru(x)
+        return h[-1]
+
+
 class Projector(nn.Module):
     def __init__(self, in_ch1, in_ch2):
         super().__init__()

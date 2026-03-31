@@ -89,6 +89,9 @@ class FPVDataset(IterableDataset):
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
         self.burn_in_steps = int(getattr(config.trainer, "burn_in_steps", 5))
+        self.phase = int(getattr(config, "phase", 1))
+        self.telemetry_jitter_std = float(getattr(config.dataset, "telemetry_jitter_std", 0.02))
+        self.telemetry_stale_prob = float(getattr(config.dataset, "telemetry_stale_prob", 0.2))
         self.raw_source = SafetyRawImageSource(
             config.dataset.get("raw_dataset", None),
             output_size=(self.img_height, self.img_width),
@@ -184,6 +187,9 @@ class FPVDataset(IterableDataset):
             altitude = altitude_full[start : start + self.batch_length] if altitude_full is not None else torch.zeros(
                 self.batch_length, 1, dtype=torch.float32
             )
+            if self.phase == 2:
+                speed = self._apply_telemetry_noise(speed, self.telemetry_jitter_std, self.telemetry_stale_prob)
+                altitude = self._apply_telemetry_noise(altitude, self.telemetry_jitter_std, self.telemetry_stale_prob)
             battery_full = torch.from_numpy(np.array(sample["batteries"][0])).float() if "batteries" in sample else None
             battery = battery_full[start : start + self.batch_length] if battery_full is not None else torch.zeros(
                 self.batch_length, 1, dtype=torch.float32
@@ -250,6 +256,15 @@ class FPVDataset(IterableDataset):
             align_corners=False,
         )
         return resized.permute(0, 2, 3, 1)
+
+    def _apply_telemetry_noise(self, values: torch.Tensor, jitter_std: float, stale_prob: float) -> torch.Tensor:
+        out = values.clone()
+        if jitter_std > 0:
+            out = out + torch.randn_like(out) * jitter_std
+        if stale_prob > 0 and out.shape[0] > 1:
+            stale_mask = torch.rand(out.shape[0] - 1, 1) < stale_prob
+            out[1:] = torch.where(stale_mask, out[:-1], out[1:])
+        return out
 
 
 class SafetyRawImageSource:
@@ -381,13 +396,15 @@ class SafetyRawImageSource:
         return arr.clamp(0.0, 1.0)
 
 class Augmentation:
-    def __init__(self, config):
+    def __init__(self, config, phase: int = 1, use_depth: bool = False):
+        self.phase = int(phase)
+        self.use_depth_data = bool(use_depth)
         self.depth_noise_std = float(getattr(config, "depth_noise_std", config.noise_std))
         self.resolution_scale_min = float(getattr(config, "resolution_scale_min", 0.5))
         self.resolution_scale_max = float(getattr(config, "resolution_scale_max", 1.0))
         self.noise_std      = float(config.noise_std)
-        self.use_flip       = bool(config.use_flip)
-        self.use_brightness = bool(config.use_brightness)
+        self.use_flip       = bool(config.use_flip) and self.phase != 2
+        self.use_brightness = bool(config.use_brightness) and not self.use_depth_data
         self.brightness_std = float(config.brightness_std)
         self.use_cutout     = bool(config.use_cutout)
         self.cutout_size    = int(config.cutout_size)
@@ -477,7 +494,11 @@ class OfflineTrainer:
         self.checkpoint_every = int(config.checkpoint_every)
         self.log_every = int(config.log_every)
         self.num_workers = int(config.num_workers)
-        self.augmentation = Augmentation(config.augmentation)
+        self.augmentation = Augmentation(
+            config.augmentation,
+            phase=int(getattr(config, "phase", 1)),
+            use_depth=bool(getattr(config, "use_depth", False)),
+        )
         self.accumulation_steps = config.get("accumulation_steps", 8)
         self.eval_batches = int(config.get("eval_batches", 8))
         self.accelerator = Accelerator(

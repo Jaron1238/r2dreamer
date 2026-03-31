@@ -74,6 +74,13 @@ class Dreamer(nn.Module):
         self._log_grads   = bool(cfg.log_grads)
         self.num_drones = int(cfg.get("num_drone_classes", 10))
         self.drone_embed = nn.Embedding(self.num_drones, self.drone_embed_dim)
+        self.ctx_len = int(getattr(cfg, "ctx_len", 16))
+        self.ctx_consistency_weight = float(getattr(cfg, "ctx_consistency_weight", 0.1))
+        self.ctx_warmup_steps = int(getattr(cfg, "ctx_warmup_steps", 1000))
+        self._ctx_updates = 0
+        self.context_encoder = networks.ContextEncoder(
+            self.rssm.flat_stoch, self.rssm._deter, self.act_dim, ctx_len=self.ctx_len, out_dim=self.drone_embed_dim
+        )
         self.safety_net = networks.SafetyNet(
             in_channels=shapes[self.safety_input_key][-1],
             action_dim=self.act_dim,
@@ -107,6 +114,7 @@ class Dreamer(nn.Module):
             "cont":    self.cont,
             "encoder": self.encoder,
             "drone_embed": self.drone_embed, 
+            "context_encoder": self.context_encoder,
             "safety_net": self.safety_net,
         }
 
@@ -296,6 +304,9 @@ class Dreamer(nn.Module):
     def train(self, mode=True):
         super().train(mode)
         self._slow_value.train(False)
+        if mode and self.phase == 2:
+            self.encoder.eval()
+            self.rssm.eval()
         return self
 
     def clone_and_freeze(self):
@@ -323,9 +334,13 @@ class Dreamer(nn.Module):
         torch.compiler.cudagraph_mark_step_begin()
         p_obs                          = self.preprocess(obs)
         embed                          = self._frozen_encoder(p_obs)
-        d_emb                          = self._get_drone_embedding(
+        teacher_d_emb                  = self._get_drone_embedding(
             obs.get("drone_id"), batch_shape=embed.shape[:-1], frozen=True, device=embed.device
         )
+        if self.phase >= 3:
+            d_emb = self.context_encoder(state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"])
+        else:
+            d_emb = teacher_d_emb
         prev_stoch, prev_deter, prev_action, prev_filtered_action = (
             state["stoch"], state["deter"], state["prev_action"], state["prev_filtered_action"],
         )
@@ -344,8 +359,20 @@ class Dreamer(nn.Module):
         safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
         brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
         action = torch.where(safety_score > self.safety_threshold, brake, action)
+        flat_stoch = stoch.reshape(stoch.shape[0], -1)
+        ctx_flat_stoch = torch.cat([state["ctx_flat_stoch"][:, 1:], flat_stoch.unsqueeze(1)], dim=1)
+        ctx_deter = torch.cat([state["ctx_deter"][:, 1:], deter.unsqueeze(1)], dim=1)
+        ctx_action = torch.cat([state["ctx_action"][:, 1:], action.unsqueeze(1)], dim=1)
         return action, TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action, "prev_filtered_action": filtered_action},
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action,
+                "prev_filtered_action": filtered_action,
+                "ctx_flat_stoch": ctx_flat_stoch,
+                "ctx_deter": ctx_deter,
+                "ctx_action": ctx_action,
+            },
             batch_size=state.batch_size,
         )
 
@@ -353,8 +380,19 @@ class Dreamer(nn.Module):
     def get_initial_state(self, B):
         stoch, deter, prev_filtered_action = self.rssm.initial(B)
         action       = torch.zeros(B, self.act_dim, dtype=torch.float32, device=self.device)
+        ctx_flat_stoch = torch.zeros(B, self.ctx_len, self.rssm.flat_stoch, dtype=torch.float32, device=self.device)
+        ctx_deter = torch.zeros(B, self.ctx_len, self.rssm._deter, dtype=torch.float32, device=self.device)
+        ctx_action = torch.zeros(B, self.ctx_len, self.act_dim, dtype=torch.float32, device=self.device)
         return TensorDict(
-            {"stoch": stoch, "deter": deter, "prev_action": action, "prev_filtered_action": prev_filtered_action}, batch_size=(B,)
+            {
+                "stoch": stoch,
+                "deter": deter,
+                "prev_action": action,
+                "prev_filtered_action": prev_filtered_action,
+                "ctx_flat_stoch": ctx_flat_stoch,
+                "ctx_deter": ctx_deter,
+                "ctx_action": ctx_action,
+            }, batch_size=(B,)
         )
 
     @torch.no_grad()
@@ -526,6 +564,9 @@ class Dreamer(nn.Module):
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
         self._update_goal_feat_buffer(feat.detach().reshape(-1, self.rssm.feat_size))
+        flat_post_stoch = post_stoch.reshape(B, T, -1)
+        ctx_student = self.context_encoder(flat_post_stoch, post_deter, data["action"])
+        ctx_student_time = ctx_student.unsqueeze(1).expand(-1, T, -1)
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key]))
@@ -576,26 +617,38 @@ class Dreamer(nn.Module):
         if self.phase == 2:
             policy_input = torch.cat([feat.detach(), d_emb.detach()], dim=-1)
             actor_dist = self.actor(policy_input)
-            actor_mode = actor_dist.mode
-            bc_loss = torch.mean((actor_mode - data["action"]) ** 2, dim=-1)
+            bc_loss = -actor_dist.log_prob(data["action"])
             losses["bc"] = networks.masked_mean(bc_loss, burn_in_mask)
+            losses["ctx_align"] = torch.mean((ctx_student_time - d_emb.detach()) ** 2)
 
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
             safety_image = data.get(self.safety_input_key, data["image"])
             safety_pred = self.safety_net(safety_image, speed, data["action"])
-            losses["safety"] = F.binary_cross_entropy(safety_pred, crash_target)
+            focal_alpha = 0.8
+            focal_gamma = 2.0
+            safety_pred = torch.clamp(safety_pred, min=1e-6, max=1 - 1e-6)
+            p_t = crash_target * safety_pred + (1.0 - crash_target) * (1.0 - safety_pred)
+            alpha_t = crash_target * focal_alpha + (1.0 - crash_target) * (1.0 - focal_alpha)
+            focal_loss = -alpha_t * ((1.0 - p_t) ** focal_gamma) * torch.log(p_t)
+            losses["safety"] = torch.mean(focal_loss)
 
             if "inj_raw_image" in data:
                 inj_speed = torch.zeros_like(speed)
                 inj_action = torch.zeros_like(data["action"])
                 inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
-                inj_loss = F.binary_cross_entropy(inj_pred, data["inj_crash"])
+                inj_pred = torch.clamp(inj_pred, min=1e-6, max=1 - 1e-6)
+                inj_target = data["inj_crash"]
+                inj_pt = inj_target * inj_pred + (1.0 - inj_target) * (1.0 - inj_pred)
+                inj_alpha = inj_target * focal_alpha + (1.0 - inj_target) * (1.0 - focal_alpha)
+                inj_loss = torch.mean(-inj_alpha * ((1.0 - inj_pt) ** focal_gamma) * torch.log(inj_pt))
                 losses["safety"] = losses["safety"] + inj_loss
 
             metrics["safety/score_mean"] = safety_pred.mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
+            self._ctx_updates += 1
+            d_emb = ctx_student_time
             valid_mask = burn_in_mask if burn_in_mask is not None else torch.ones_like(data["is_first"], dtype=torch.bool)
             flat_mask = valid_mask.reshape(-1)
             flat_post_stoch = post_stoch.reshape(-1, *post_stoch.shape[2:]).detach()
@@ -677,6 +730,11 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(ret, "ret_replay"))
             metrics.update(tools.tensorstats(value, "value_replay"))
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+            half = max(1, T // 2)
+            z_a = self.context_encoder(flat_post_stoch[:, :half], post_deter[:, :half], data["action"][:, :half])
+            z_b = self.context_encoder(flat_post_stoch[:, half:], post_deter[:, half:], data["action"][:, half:])
+            warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
+            losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
