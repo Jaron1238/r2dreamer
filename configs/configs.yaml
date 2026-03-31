@@ -73,6 +73,7 @@ model:
   img_width: 256
   phase: ${phase}
   use_depth: ${use_depth}
+  use_cam_overlay: False
   motor_inertia_range: [0.1, 0.8]
   use_latent_goals: True
   ctx_consistency_weight: 0.1

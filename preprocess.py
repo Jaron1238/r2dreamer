@@ -439,6 +439,7 @@ class ParquetExporter:
         segment_id: int,
         frames_gray: np.ndarray,
         frames_depth: np.ndarray,
+        frames_cam_overlay: np.ndarray,
         actions: np.ndarray,
         speeds: np.ndarray,
         altitudes: np.ndarray,
@@ -450,6 +451,7 @@ class ParquetExporter:
         record = {
             "frames_gray": [frames_gray.astype(np.uint8)],
             "frames_depth": [frames_depth.astype(np.uint8)],
+            "frames_cam_overlay": [frames_cam_overlay.astype(np.uint8)],
             "actions": [actions.astype(np.float32)],
             "speeds": [speeds.astype(np.float32)],
             "altitudes": [altitudes.astype(np.float32)],
@@ -497,6 +499,7 @@ class FPVPreprocessor:
         actions = self.stick_tracker.extract_actions(frames_bgr_seg)
         speeds, altitudes, batteries, has_osd = self.osd_extractor.extract(frames_bgr_seg)
         masked = mask_handcam(frames_bgr_seg, self.cfg.handcam_roi)
+        cam_overlay = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames_bgr_seg], axis=0)[..., None]
 
         gray = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in masked], axis=0)
         gray = gray[..., None]
@@ -513,6 +516,7 @@ class FPVPreprocessor:
         return {
             "frames_gray": gray,
             "frames_depth": depth,
+            "frames_cam_overlay": cam_overlay,
             "actions": actions,
             "speeds": speeds,
             "altitudes": altitudes,

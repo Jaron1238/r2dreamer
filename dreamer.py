@@ -52,6 +52,8 @@ class Dreamer(nn.Module):
         shapes = {
             "image": (int(cfg.img_height), int(cfg.img_width), 2 if self.use_depth else 6)
         }
+        if bool(getattr(cfg, "use_cam_overlay", False)):
+            shapes["cam_overlay"] = (int(cfg.img_height), int(cfg.img_width), 1)
         if self.safety_input_key == "raw_image":
             shapes["raw_image"] = (
                 int(cfg.img_height),
@@ -844,6 +846,12 @@ class Dreamer(nn.Module):
             if not torch.is_floating_point(raw_image_in):
                 raw_image = raw_image / 255.0
             data["raw_image"] = raw_image
+        if "cam_overlay" in data:
+            cam_overlay_in = data["cam_overlay"]
+            cam_overlay = to_f32(cam_overlay_in)
+            if not torch.is_floating_point(cam_overlay_in):
+                cam_overlay = cam_overlay / 255.0
+            data["cam_overlay"] = cam_overlay
         return data
 
     def _configure_trainable_modules(self):

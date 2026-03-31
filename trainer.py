@@ -178,6 +178,8 @@ class FPVDataset(IterableDataset):
                 actions = actions_full[start : start + self.batch_length]
             else:
                 actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
+            osd, has_osd = self._extract_osd(sample, start, self.batch_length)
+            cam_overlay, has_cam_overlay = self._extract_cam_overlay(sample, start, self.batch_length, raw_image)
 
             speed_full = torch.from_numpy(np.array(sample["speeds"][0])).float() if "speeds" in sample else None
             speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
@@ -224,6 +226,10 @@ class FPVDataset(IterableDataset):
                 "crash": is_terminal.float().unsqueeze(-1),
                 "inj_raw_image": inj_raw_image,
                 "inj_crash": inj_crash,
+                "osd": osd,
+                "has_osd": has_osd,
+                "cam_overlay": cam_overlay,
+                "has_cam_overlay": has_cam_overlay,
             }
 
     def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
@@ -265,6 +271,34 @@ class FPVDataset(IterableDataset):
             stale_mask = torch.rand(out.shape[0] - 1, 1) < stale_prob
             out[1:] = torch.where(stale_mask, out[:-1], out[1:])
         return out
+
+    def _extract_osd(self, sample, start: int, length: int):
+        has_osd = bool(sample.get("has_osd", False))
+        if has_osd and "osd" in sample:
+            arr = torch.from_numpy(np.array(sample["osd"][0])).float()
+            osd = arr[start : start + length]
+        else:
+            osd = torch.zeros((length, 8), dtype=torch.float32)
+        return osd, torch.full((length, 1), float(has_osd), dtype=torch.float32)
+
+    def _extract_cam_overlay(self, sample, start: int, length: int, fallback_image: torch.Tensor):
+        keys = ("frames_cam_overlay", "cam_overlay", "overlay")
+        overlay = None
+        for key in keys:
+            if key in sample:
+                raw = torch.from_numpy(np.array(sample[key][0])).float()
+                if raw.max() > 1.5:
+                    raw = raw / 255.0
+                raw = self._ensure_channel_last(raw)
+                raw = raw[start : start + length]
+                overlay = self._resize_sequence(raw)
+                if overlay.shape[-1] > 1:
+                    overlay = overlay.mean(dim=-1, keepdim=True)
+                break
+        has_overlay = overlay is not None
+        if overlay is None:
+            overlay = torch.zeros((length, fallback_image.shape[1], fallback_image.shape[2], 1), dtype=torch.float32)
+        return overlay, torch.full((length, 1), float(has_overlay), dtype=torch.float32)
 
 
 class SafetyRawImageSource:
@@ -539,6 +573,13 @@ class OfflineTrainer:
                 "crash": batch["crash"],
                 "inj_raw_image": batch["inj_raw_image"],
                 "inj_crash": batch["inj_crash"],
+                "osd": batch.get("osd", torch.zeros(batch_size, time_steps, 8, device=image.device)),
+                "has_osd": batch.get("has_osd", torch.zeros(batch_size, time_steps, 1, device=image.device)),
+                "cam_overlay": batch.get(
+                    "cam_overlay",
+                    torch.zeros(batch_size, time_steps, image.shape[2], image.shape[3], 1, device=image.device),
+                ),
+                "has_cam_overlay": batch.get("has_cam_overlay", torch.zeros(batch_size, time_steps, 1, device=image.device)),
             },
             batch_size=[batch_size, time_steps],
         )
@@ -570,6 +611,12 @@ class OfflineTrainer:
                     "drone_id": batch["drone_id"].unsqueeze(0).to(self.accelerator.device),
                     "speed": batch["speed"].unsqueeze(0).to(self.accelerator.device),
                     "crash": batch["crash"].unsqueeze(0).to(self.accelerator.device),
+                    "osd": batch.get("osd", torch.zeros(time_steps, 8)).unsqueeze(0).to(self.accelerator.device),
+                    "has_osd": batch.get("has_osd", torch.zeros(time_steps, 1)).unsqueeze(0).to(self.accelerator.device),
+                    "cam_overlay": batch.get(
+                        "cam_overlay", torch.zeros(time_steps, image.shape[2], image.shape[3], 1)
+                    ).unsqueeze(0).to(self.accelerator.device),
+                    "has_cam_overlay": batch.get("has_cam_overlay", torch.zeros(time_steps, 1)).unsqueeze(0).to(self.accelerator.device),
                 },
                 batch_size=[batch_size, time_steps],
             )
