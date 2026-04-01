@@ -359,70 +359,76 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
-    def _cal_grad(self, data, initial):
+    def _cal_grad(self, data, initial, phase=1):
         losses  = {}
         metrics = {}
         B, T    = data.shape
+        if initial is None:
+            initial = self.rssm.initial(B)
         embed = self.encoder(data)
         d_emb = self.drone_embed(data["drone_id"])
         post_stoch, post_deter, post_logit = self.rssm.observe(
             embed, data["action"], initial, data["is_first"], d_emb
         )
-        _, prior_logit    = self.rssm.prior(post_deter)
-        dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
-        losses["dyn"]     = torch.mean(dyn_loss)
-        losses["rep"]     = torch.mean(rep_loss)
+        phase = int(phase)
+        phase2_actor_only = (phase == 2)
+        if not phase2_actor_only:
+            _, prior_logit    = self.rssm.prior(post_deter)
+            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+            losses["dyn"]     = torch.mean(dyn_loss)
+            losses["rep"]     = torch.mean(rep_loss)
 
         feat = self.rssm.get_feat(post_stoch, post_deter)
-        if self.rep_loss == "dreamer":
-            recon_losses = {
-                key: torch.mean(-dist.log_prob(data[key]))
-                for key, dist in self.decoder(post_stoch, post_deter).items()
-            }
-            losses.update(recon_losses)
-        elif self.rep_loss == "r2dreamer":
-            x1      = self.prj(feat[:, :].reshape(B * T, -1))
-            x2      = embed.reshape(B * T, -1).detach()
-            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-            c       = torch.mm(x1_norm.T, x2_norm) / (B * T)
-            invariance_loss  = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask    = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
-            redundancy_loss  = c[off_diag_mask].pow(2).sum()
-            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
-            metrics["barlow/invariance"] = invariance_loss.item()
-            metrics["barlow/redundancy"] = redundancy_loss.item()
-            metrics["barlow/std_mean"]   = x1_norm.std(0).mean().item()
-        elif self.rep_loss == "infonce":
-            x1          = self.prj(feat[:, :].reshape(B * T, -1))
-            x2          = embed.reshape(B * T, -1).detach()
-            logits      = torch.matmul(x1, x2.T)
-            norm_logits = logits - torch.max(logits, 1)[0][:, None]
-            labels      = torch.arange(norm_logits.shape[0]).long().to(self.device)
-            losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
-        elif self.rep_loss == "dreamerpro":
-            with torch.no_grad():
-                data_aug    = self.augment_data(data)
-                initial_aug = (
-                    torch.cat([initial[0], initial[0]], dim=0),
-                    torch.cat([initial[1], initial[1]], dim=0),
+        if not phase2_actor_only:
+            if self.rep_loss == "dreamer":
+                recon_losses = {
+                    key: torch.mean(-dist.log_prob(data[key]))
+                    for key, dist in self.decoder(post_stoch, post_deter).items()
+                }
+                losses.update(recon_losses)
+            elif self.rep_loss == "r2dreamer":
+                x1      = self.prj(feat[:, :].reshape(B * T, -1))
+                x2      = embed.reshape(B * T, -1).detach()
+                x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
+                x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
+                c       = torch.mm(x1_norm.T, x2_norm) / (B * T)
+                invariance_loss  = (torch.diagonal(c) - 1.0).pow(2).sum()
+                off_diag_mask    = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
+                redundancy_loss  = c[off_diag_mask].pow(2).sum()
+                losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+                metrics["barlow/invariance"] = invariance_loss.item()
+                metrics["barlow/redundancy"] = redundancy_loss.item()
+                metrics["barlow/std_mean"]   = x1_norm.std(0).mean().item()
+            elif self.rep_loss == "infonce":
+                x1          = self.prj(feat[:, :].reshape(B * T, -1))
+                x2          = embed.reshape(B * T, -1).detach()
+                logits      = torch.matmul(x1, x2.T)
+                norm_logits = logits - torch.max(logits, 1)[0][:, None]
+                labels      = torch.arange(norm_logits.shape[0]).long().to(self.device)
+                losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+            elif self.rep_loss == "dreamerpro":
+                with torch.no_grad():
+                    data_aug    = self.augment_data(data)
+                    initial_aug = (
+                        torch.cat([initial[0], initial[0]], dim=0),
+                        torch.cat([initial[1], initial[1]], dim=0),
+                    )
+                    ema_proj = self.ema_proj(data_aug)
+                embed_aug               = self.encoder(data_aug)
+                post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
+                    embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
                 )
-                ema_proj = self.ema_proj(data_aug)
-            embed_aug               = self.encoder(data_aug)
-            post_stoch_aug, post_deter_aug, _ = self.rssm.observe(
-                embed_aug, data_aug["action"], initial_aug, data_aug["is_first"]
-            )
-            proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
-            losses.update(proto_losses)
-        else:
-            raise NotImplementedError
+                proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
+                losses.update(proto_losses)
+            else:
+                raise NotImplementedError
 
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
-        cont          = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+            losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+            cont          = 1.0 - to_f32(data["is_terminal"])
+            losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
 
-        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
-        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+            metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
+            metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
 
         start = (
             post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),

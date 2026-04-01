@@ -13,6 +13,14 @@ hydra:
   run:
     dir: ${logdir}
 
+env:
+  encoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+  decoder:
+    mlp_keys: '$^'
+    cnn_keys: 'image'
+
 batch_size: 16
 batch_length: 64
 
@@ -24,6 +32,7 @@ buffer:
   storage_device: 'cuda:0'
 
 trainer:
+  phase: 1 # 1: world model + policy/value, 2: actor/value focused (skip heavy world-model losses)
   steps: 100000
   batch_per_gpu: 4
   batch_length: 64
@@ -42,4 +51,5 @@ dataset:
 
   mode: 'streaming'
   hf_repo: 'dein_benutzername/dein_fpv_dataset' # Hier den Pfad zu deinem HF-Dataset einfügen
-  shuffle_buffer: 10000 
+  shuffle_buffer: 10000
+  require_osd: true

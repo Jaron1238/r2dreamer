@@ -8,7 +8,7 @@ import torch
 
 import tools
 from dreamer import Dreamer
-from offline_trainer import FPVDataset, OfflineTrainer
+from trainer import FPVDataset, OfflineTrainer
 
 warnings.filterwarnings("ignore")
 sys.path.append(str(pathlib.Path(__file__).parent))
@@ -33,18 +33,12 @@ def main(config):
     logger.log_hydra_config(config)
 
     dataset = FPVDataset(
-        segment_dir=config.dataset.segment_dir,
+        config,
         batch_length=config.trainer.batch_length,
+        require_osd=bool(config.dataset.get("require_osd", False)),
     )
 
-    obs_space = dataset.obs_space()
-    act_space = dataset.act_space()
-
-    agent = Dreamer(
-        config.model,
-        obs_space,
-        act_space,
-    ).to(config.device)
+    agent = Dreamer(config.model).to(config.device)
 
     if config.get("checkpoint", None):
         ckpt_path = pathlib.Path(config.checkpoint).expanduser()

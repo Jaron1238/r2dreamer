@@ -1,13 +1,14 @@
 import pathlib
 import torch
-import torch.nn as nn
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from tensordict import TensorDict
+from torch.utils.data import DataLoader, IterableDataset
 from accelerate import Accelerator
 
 class FPVDataset(IterableDataset):
     def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
         super().__init__()
+        self.mode = str(getattr(config.dataset, "mode", "streaming"))
         self.batch_length = batch_length
         self.require_osd  = require_osd
         from datasets import load_dataset
@@ -35,24 +36,31 @@ class FPVDataset(IterableDataset):
             frames_6ch = torch.cat([frames, diff], dim=-1)
             is_first = torch.zeros(self.batch_length, dtype=torch.bool)
             is_first[0] = True
-
+            is_last = torch.zeros(self.batch_length, dtype=torch.bool)
+            is_last[-1] = True
+            is_terminal = torch.zeros(self.batch_length, dtype=torch.bool)
+            reward = torch.zeros(self.batch_length, 1, dtype=torch.float32)
 
             if self.require_osd and sample.get("has_osd", False):
-
                 actions = torch.tensor(sample["actions"], dtype=torch.float32)[start : start + self.batch_length]
-                
-
                 if actions.shape[0] < self.batch_length:
-                    pad_act = torch.zeros((self.batch_length - actions.shape[0], 4), dtype=torch.float32)
+                    action_dim = actions.shape[-1]
+                    pad_act = torch.zeros((self.batch_length - actions.shape[0], action_dim), dtype=torch.float32)
                     actions = torch.cat([actions, pad_act], dim=0)
             else:
                 actions = torch.zeros((self.batch_length, 4), dtype=torch.float32)
 
+            drone_id = int(sample.get("drone_id", 0))
+            drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
+
             yield {
                 "image": frames_6ch,
                 "is_first": is_first,
+                "is_last": is_last,
+                "is_terminal": is_terminal,
+                "reward": reward,
                 "action": actions,
-                "drone_id": torch.tensor(sample["drone_id"], dtype=torch.long)
+                "drone_id": drone_id,
             }
 
 class Augmentation:
@@ -93,6 +101,7 @@ class OfflineTrainer:
         self.num_workers = int(config.num_workers)
         self.augmentation = Augmentation(config.augmentation)
         self.accumulation_steps = config.get("accumulation_steps", 8)
+        self.phase = int(config.get("phase", 1))
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.accumulation_steps,
             mixed_precision="fp16"
@@ -108,18 +117,25 @@ class OfflineTrainer:
         self.accelerator.print(f"Loaded: {path}")
 
     def _compute_loss(self, agent, batch):
-        data = {
-            "image": batch["image"],
-            "is_first": batch["is_first"],
-            "action": batch["action"],
-            "drone_id": batch["drone_id"]
-        }
-        post, metrics = agent._cal_grad(data, initial=None)
+        batch_size, time_steps = batch["image"].shape[:2]
+        data = TensorDict(
+            {
+                "image": batch["image"],
+                "is_first": batch["is_first"],
+                "is_last": batch["is_last"],
+                "is_terminal": batch["is_terminal"],
+                "reward": batch["reward"],
+                "action": batch["action"],
+                "drone_id": batch["drone_id"],
+            },
+            batch_size=[batch_size, time_steps],
+        )
+        with self.accelerator.autocast():
+            post, metrics = agent._cal_grad(data, initial=None, phase=self.phase)
         loss = metrics.pop("opt/loss")
         return loss, metrics
 
     def begin(self, agent):
-        is_stream = (self.dataset.mode == "streaming")
         loader = DataLoader(
             self.dataset,
             batch_size=self.batch_per_gpu,
@@ -147,6 +163,9 @@ class OfflineTrainer:
                     self.accelerator.backward(loss)
                     
                     if self.accelerator.sync_gradients:
+                        unwrapped_agent = self.accelerator.unwrap_model(agent)
+                        if hasattr(unwrapped_agent, "_agc") and hasattr(unwrapped_agent, "_named_params"):
+                            unwrapped_agent._agc(unwrapped_agent._named_params.values())
                         self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
 
                     optimizer.step()
@@ -179,4 +198,3 @@ class OfflineTrainer:
         if self.accelerator.is_main_process:
             self._save_checkpoint(step)
         
-
