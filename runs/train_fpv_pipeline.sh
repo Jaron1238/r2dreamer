@@ -15,7 +15,7 @@ STEPS_PHASE1=20000
 STEPS_PHASE2=5000
 STEPS_PHASE3=50000
 
-NUM_GPUS=1
+NUM_GPUS=2
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
