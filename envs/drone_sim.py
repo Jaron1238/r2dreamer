@@ -122,6 +122,8 @@ class DroneSimEnv(gym.Env):
             "obstacle_dx": float(max(0.0, nearest["x"] - self._x)),
             "position": np.array([self._x, self._y], dtype=np.float32),
             "yaw": float(self._yaw),
+            "clearance": float(np.median(depth[..., 0])),
+            "clearance_ema": float(np.median(depth[..., 0])),
         }
         return obs, info
 
@@ -171,6 +173,7 @@ class DroneSimEnv(gym.Env):
         terminated = bool(collision)
         truncated = self._step >= self._max_steps
 
+        obs, info = self._obs(is_first=False)
         reward_parts = self.reward_fn(
             position_xy=np.array([self._x, self._y], dtype=np.float32),
             velocity_xy=self._velocity,
@@ -178,16 +181,17 @@ class DroneSimEnv(gym.Env):
             action=action,
             prev_action=self._prev_action,
             collision=collision,
+            clearance=info.get("clearance"),
+            clearance_ema=info.get("clearance_ema"),
         )
         self._prev_action = action.copy()
-
-        obs, info = self._obs(is_first=False)
         info.update(
             {
                 "r_explore": float(reward_parts.r_explore),
                 "r_vel": float(reward_parts.r_vel),
                 "r_survival": float(reward_parts.r_survival),
                 "r_smooth": float(reward_parts.r_smooth),
+                "r_height": float(reward_parts.r_height),
                 "collision": bool(reward_parts.collision),
             }
         )
@@ -208,6 +212,10 @@ class ColosseumBridge:
         self.obs_w = int(getattr(model_cfg, "img_width", 256))
         self._prev_depth = None
         self._prev_action = np.zeros(int(getattr(model_cfg, "act_dim", 4)), dtype=np.float32)
+        self.down_camera_name = str(getattr(colosseum_cfg, "down_camera_name", "downward"))
+        self.clearance_ema_alpha = float(getattr(colosseum_cfg, "clearance_ema_alpha", 0.2))
+        self.max_clearance = float(getattr(colosseum_cfg, "max_clearance", 20.0))
+        self._clearance_ema = None
 
     def connect(self):
         if not self.enabled:
@@ -232,6 +240,7 @@ class ColosseumBridge:
         self._step = 0
         self._prev_depth = None
         self._prev_action = np.zeros_like(self._prev_action)
+        self._clearance_ema = None
 
     def _yaw_from_quat(self, q) -> float:
         x, y, z, w = float(q.x_val), float(q.y_val), float(q.z_val), float(q.w_val)
@@ -263,8 +272,34 @@ class ColosseumBridge:
         vel = np.array([kin.linear_velocity.x_val, -kin.linear_velocity.z_val], dtype=np.float32)
         speed = np.array([[float(np.linalg.norm(vel))]], dtype=np.float32)
         yaw = self._yaw_from_quat(kin.orientation)
-        info = {"position": np.array([kin.position.x_val, -kin.position.z_val], dtype=np.float32), "yaw": yaw, "speed": speed}
+        clearance = self._read_downward_clearance()
+        if self._clearance_ema is None:
+            self._clearance_ema = clearance
+        else:
+            self._clearance_ema = (1.0 - self.clearance_ema_alpha) * self._clearance_ema + self.clearance_ema_alpha * clearance
+        info = {
+            "position": np.array([kin.position.x_val, -kin.position.z_val], dtype=np.float32),
+            "yaw": yaw,
+            "speed": speed,
+            "clearance": float(clearance),
+            "clearance_ema": float(self._clearance_ema),
+            "terrain_rel_height": float(self._clearance_ema),
+        }
         return image, speed, info
+
+    def _read_downward_clearance(self) -> float:
+        import airsim
+
+        req = airsim.ImageRequest(self.down_camera_name, airsim.ImageType.DepthPlanar, pixels_as_float=True)
+        img = self._client.simGetImages([req], vehicle_name=self.vehicle_name)[0]
+        if img.height <= 0 or img.width <= 0 or len(img.image_data_float) == 0:
+            return self.max_clearance
+        depth = np.array(img.image_data_float, dtype=np.float32)
+        depth = np.nan_to_num(depth, nan=self.max_clearance, posinf=self.max_clearance, neginf=0.0)
+        valid = depth[(depth > 0.05) & np.isfinite(depth)]
+        if valid.size == 0:
+            return self.max_clearance
+        return float(np.clip(np.median(valid), 0.0, self.max_clearance))
 
     def step(self, action, reward_fn, max_steps):
         import airsim
@@ -282,6 +317,7 @@ class ColosseumBridge:
         vel = np.array([kin.linear_velocity.x_val, -kin.linear_velocity.z_val], dtype=np.float32)
         collision = bool(self._client.simGetCollisionInfo(vehicle_name=self.vehicle_name).has_collided)
         yaw = self._yaw_from_quat(kin.orientation)
+        obs, speed, info = self.read_observation(self.obs_h, self.obs_w, is_first=False)
         reward_parts = reward_fn(
             position_xy=np.array([kin.position.x_val, -kin.position.z_val], dtype=np.float32),
             velocity_xy=vel,
@@ -289,9 +325,10 @@ class ColosseumBridge:
             action=action,
             prev_action=self._prev_action,
             collision=collision,
+            clearance=info.get("clearance"),
+            clearance_ema=info.get("clearance_ema"),
         )
         self._prev_action = action.copy()
-        obs, speed, info = self.read_observation(self.obs_h, self.obs_w, is_first=False)
         self._step += 1
         terminated = collision
         truncated = self._step >= max_steps
@@ -301,6 +338,7 @@ class ColosseumBridge:
                 "r_vel": float(reward_parts.r_vel),
                 "r_survival": float(reward_parts.r_survival),
                 "r_smooth": float(reward_parts.r_smooth),
+                "r_height": float(reward_parts.r_height),
                 "collision": bool(reward_parts.collision),
             }
         )
