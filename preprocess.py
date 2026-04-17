@@ -437,6 +437,7 @@ class ParquetExporter:
         self,
         stem: str,
         segment_id: int,
+        frames_rgb: np.ndarray,
         frames_gray: np.ndarray,
         frames_depth: np.ndarray,
         frames_cam_overlay: np.ndarray,
@@ -449,6 +450,7 @@ class ParquetExporter:
         has_osd: bool,
     ) -> Path:
         record = {
+            "frames_rgb": [frames_rgb.astype(np.uint8)],
             "frames_gray": [frames_gray.astype(np.uint8)],
             "frames_depth": [frames_depth.astype(np.uint8)],
             "frames_cam_overlay": [frames_cam_overlay.astype(np.uint8)],
@@ -500,6 +502,7 @@ class FPVPreprocessor:
         speeds, altitudes, batteries, has_osd = self.osd_extractor.extract(frames_bgr_seg)
         masked = mask_handcam(frames_bgr_seg, self.cfg.handcam_roi)
         cam_overlay = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames_bgr_seg], axis=0)[..., None]
+        rgb = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2RGB) for f in masked], axis=0)
 
         gray = np.stack([cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in masked], axis=0)
         gray = gray[..., None]
@@ -514,6 +517,7 @@ class FPVPreprocessor:
         self.event_exporter.export_events(stem, fps, crash_idx, near_idx, gray[..., 0], depth)
 
         return {
+            "frames_rgb": rgb,
             "frames_gray": gray,
             "frames_depth": depth,
             "frames_cam_overlay": cam_overlay,

@@ -123,6 +123,10 @@ class FPVDataset(IterableDataset):
         for sample in ds_iter:
             gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
             gray_full = self._ensure_channel_last(gray_full)
+            rgb_full = None
+            if "frames_rgb" in sample:
+                rgb_full = torch.from_numpy(np.array(sample["frames_rgb"][0])).float() / 255.0
+                rgb_full = self._ensure_channel_last(rgb_full)
             depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
             depth_full = self._ensure_channel_last(depth_full)
             is_terminal_full = torch.from_numpy(np.array(sample["is_terminal"][0])).bool()
@@ -140,25 +144,25 @@ class FPVDataset(IterableDataset):
             raw_image = self._resize_sequence(raw_image)
             raw_image = self._build_raw_image(raw_image)
 
-            depth = depth_full[start : start + self.batch_length]
-            is_terminal = is_terminal_full[start : start + self.batch_length]
-            if self.use_depth:
-                depth_map = self.depth_preprocessor(depth)
-                if depth_map.ndim == 3:
-                    depth_map = depth_map.unsqueeze(-1)
-                depth_map = self._resize_sequence(depth_map)
-                diff = torch.zeros_like(depth_map)
-                diff[1:] = depth_map[1:] - depth_map[:-1]
-                image = torch.cat([depth_map, diff], dim=-1)
+            if rgb_full is not None:
+                rgb = rgb_full[start : start + self.batch_length]
+                rgb = self._resize_sequence(rgb)
+                rgb = rgb[..., :3]
             else:
-                image = self._resize_sequence(raw_image)
-                if image.shape[-1] == 1:
-                    image = image.repeat(1, 1, 1, 3)
-                elif image.shape[-1] > 3:
-                    image = image[..., :3]
-                diff = torch.zeros_like(image)
-                diff[1:] = image[1:] - image[:-1]
-                image = torch.cat([image, diff], dim=-1)
+                rgb = self._resize_sequence(raw_image)
+                if rgb.shape[-1] == 1:
+                    rgb = rgb.repeat(1, 1, 1, 3)
+                elif rgb.shape[-1] > 3:
+                    rgb = rgb[..., :3]
+
+            depth = depth_full[start : start + self.batch_length]
+            depth = self._resize_sequence(depth)
+            if depth.ndim == 3:
+                depth = depth.unsqueeze(-1)
+            is_terminal = is_terminal_full[start : start + self.batch_length]
+            diff = torch.zeros_like(rgb)
+            diff[1:] = rgb[1:] - rgb[:-1]
+            image = torch.cat([rgb, diff], dim=-1)
 
             reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
             if is_terminal.any():
@@ -230,6 +234,7 @@ class FPVDataset(IterableDataset):
                 "has_osd": has_osd,
                 "cam_overlay": cam_overlay,
                 "has_cam_overlay": has_cam_overlay,
+                "depth_target": depth,
             }
 
     def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
