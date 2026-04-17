@@ -6,7 +6,7 @@ lamb: 0.95
 compile: True
 log_grads: False
 device: ${device}
-rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro/nedreamer
 safety_input_key: "image"
 safety_in_channels: 1
 drone_embed_dim: 16
@@ -39,8 +39,19 @@ loss_scales:
   swav: 1.0
   temp: 1.0
   norm: 1.0
+  nedreamer: 1.0
+  depth_aux: 1.0
 
 r2dreamer:
+  lambd: 5e-4
+
+nedreamer:
+  hidden_dim: 256
+  transformer_layers: 2
+  transformer_heads: 4
+  transformer_dropout: 0.1
+  use_ema_target: false
+  ema_rate: 0.99
   lambd: 5e-4
 
 dreamer_pro:

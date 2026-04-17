@@ -50,7 +50,7 @@ class Dreamer(nn.Module):
         self.latent_goal_noise_scale = float(getattr(cfg, "latent_goal_noise_scale", 0.2))
 
         shapes = {
-            "image": (int(cfg.img_height), int(cfg.img_width), 2 if self.use_depth else 6)
+            "image": (int(cfg.img_height), int(cfg.img_width), 6)
         }
         if bool(getattr(cfg, "use_cam_overlay", False)):
             shapes["cam_overlay"] = (int(cfg.img_height), int(cfg.img_width), 1)
@@ -88,6 +88,13 @@ class Dreamer(nn.Module):
             action_dim=self.act_dim,
             speed_dim=1,
         )
+        self.use_depth_aux = bool(getattr(cfg, "use_depth_aux", False))
+        if self.phase >= 3 and self.use_depth_aux:
+            self.depth_aux_head = networks.DepthAuxHead(
+                in_dim=self.rssm.flat_stoch + self.rssm._deter,
+                out_h=int(cfg.img_height),
+                out_w=int(cfg.img_width),
+            )
         actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
         self.actor = networks.MLPHead(cfg.actor, actor_input_dim)
         self.value = networks.MLPHead(cfg.critic, actor_input_dim)
@@ -119,6 +126,8 @@ class Dreamer(nn.Module):
             "context_encoder": self.context_encoder,
             "safety_net": self.safety_net,
         }
+        if self.phase >= 3 and self.use_depth_aux:
+            modules.update({"depth_aux_head": self.depth_aux_head})
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -132,6 +141,36 @@ class Dreamer(nn.Module):
             self.prj_target   = Projector(self.embed_size, self.embed_size)
             self.barlow_lambd = float(cfg.r2dreamer.lambd)
             modules.update({"projector": self.prj, "projector_target": self.prj_target})
+        elif self.rep_loss == "nedreamer":
+            ne_cfg = cfg.nedreamer
+            self.barlow_lambd = float(ne_cfg.lambd)
+            self.use_ema_target = bool(ne_cfg.use_ema_target)
+            self.nedreamer_transformer = networks.CausalTemporalTransformer(
+                state_dim=self.rssm.feat_size,
+                action_dim=self.act_dim,
+                model_dim=int(getattr(ne_cfg, "hidden_dim", 256)),
+                num_layers=int(ne_cfg.transformer_layers),
+                num_heads=int(ne_cfg.transformer_heads),
+                dropout=float(ne_cfg.transformer_dropout),
+                max_len=int(getattr(config, "batch_length", 64)),
+                action_proj_dim=32,
+            )
+            self.nedreamer_predictor = networks.NEPredictorHead(
+                int(getattr(ne_cfg, "hidden_dim", 256)),
+                self.embed_size,
+            )
+            modules.update(
+                {
+                    "nedreamer_transformer": self.nedreamer_transformer,
+                    "nedreamer_predictor": self.nedreamer_predictor,
+                }
+            )
+            self.target_encoder = None
+            if self.use_ema_target:
+                self.target_encoder = copy.deepcopy(self.encoder)
+                for param in self.target_encoder.parameters():
+                    param.requires_grad = False
+                modules.update({"target_encoder": self.target_encoder})
         elif self.rep_loss == "dreamerpro":
             dpc                         = cfg.dreamer_pro
             self.warm_up                = int(dpc.warm_up)
@@ -542,6 +581,8 @@ class Dreamer(nn.Module):
             zero_grad_kwargs={"set_to_none": True},
             post_backward_hook=post_backward_hook,
         )
+        if self.rep_loss == "nedreamer" and getattr(self, "use_ema_target", False):
+            self._update_nedreamer_ema_target()
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
@@ -595,6 +636,33 @@ class Dreamer(nn.Module):
             norm_logits = logits - torch.max(logits, 1)[0][:, None]
             labels      = torch.arange(norm_logits.shape[0]).long().to(self.device)
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
+        elif self.rep_loss == "nedreamer":
+            state_seq = self.rssm.get_feat(post_stoch, post_deter)
+            prev_actions = torch.cat(
+                [torch.zeros(B, 1, self.act_dim, device=data["action"].device, dtype=data["action"].dtype), data["action"][:, :-1]],
+                dim=1,
+            )
+            tr_out = self.nedreamer_transformer(state_seq, prev_actions)
+            pred = self.nedreamer_predictor(tr_out[:, :-1])
+            with torch.no_grad():
+                if getattr(self, "use_ema_target", False):
+                    target_embed = self.target_encoder(data)
+                else:
+                    target_embed = self.encoder(data)
+            target = target_embed[:, 1:]
+            valid = (~data["is_terminal"][:, :-1].bool()).reshape(-1)
+            if burn_in_mask is not None:
+                valid = valid & burn_in_mask[:, :-1].reshape(-1).bool()
+            flat_pred = pred.reshape(B * (T - 1), -1)
+            flat_target = target.reshape(B * (T - 1), -1)
+            if valid.any():
+                flat_pred = flat_pred[valid]
+                flat_target = flat_target[valid]
+                losses["nedreamer"], barlow_metrics = self.barlow_loss(flat_pred, flat_target)
+            else:
+                losses["nedreamer"] = torch.zeros((), device=pred.device, dtype=pred.dtype)
+                barlow_metrics = {"barlow/invariance": 0.0, "barlow/redundancy": 0.0, "barlow/std_mean": 0.0}
+            metrics.update({f"nedreamer/{k.split('/')[-1]}": v for k, v in barlow_metrics.items()})
         elif self.rep_loss == "dreamerpro":
             with torch.no_grad():
                 data_aug    = self.augment_data(data)
@@ -739,11 +807,30 @@ class Dreamer(nn.Module):
             z_b = self.context_encoder(flat_post_stoch[:, half:], post_deter[:, half:], data["action"][:, half:])
             warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
             losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
+            if bool(getattr(self.config.model, "use_depth_aux", False)) and "depth_target" in data:
+                post_feat = torch.cat([post_stoch.reshape(B, T, -1), post_deter], dim=-1)
+                depth_pred = self.depth_aux_head(post_feat)
+                depth_target = data["depth_target"]
+                losses["depth_aux"] = self._scale_invariant_depth_loss(depth_pred, depth_target)
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
         metrics.update({"opt/loss": total_loss})
         return (post_stoch, post_deter), total_loss, metrics
+
+    def _scale_invariant_depth_loss(self, pred, target):
+        pred_log = torch.log(pred + 1e-6)
+        target_log = torch.log(target + 1e-6)
+        diff = pred_log - target_log
+        mse = torch.mean(diff**2)
+        mean_term = torch.mean(diff) ** 2
+        return mse - 0.5 * mean_term
+
+    @torch.no_grad()
+    def _update_nedreamer_ema_target(self):
+        ema_rate = float(self.config.model.nedreamer.ema_rate)
+        for ema_param, online_param in zip(self.target_encoder.parameters(), self.encoder.parameters()):
+            ema_param.data.lerp_(online_param.data, 1.0 - ema_rate)
 
     @torch.no_grad()
     def _update_goal_feat_buffer(self, feat):
@@ -852,6 +939,12 @@ class Dreamer(nn.Module):
             if not torch.is_floating_point(cam_overlay_in):
                 cam_overlay = cam_overlay / 255.0
             data["cam_overlay"] = cam_overlay
+        if "depth_target" in data:
+            depth_target_in = data["depth_target"]
+            depth_target = to_f32(depth_target_in)
+            if not torch.is_floating_point(depth_target_in):
+                depth_target = depth_target / 255.0
+            data["depth_target"] = depth_target
         return data
 
     def _configure_trainable_modules(self):

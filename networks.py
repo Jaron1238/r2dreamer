@@ -210,7 +210,7 @@ class ConvEncoder(nn.Module):
         # EfficientNet-B0 Backbone laden
         backbone = tv_models.efficientnet_b0(weights=tv_models.EfficientNet_B0_Weights.DEFAULT)
 
-        # Layer 1 auf variable Channels erweitern (z. B. Depth + Diff = 2)
+        # Layer 1 auf variable Channels erweitern (z. B. RGB+Diff = 6)
         old_conv = backbone.features[0][0]
         backbone.features[0][0] = nn.Conv2d(
             in_channels=self.input_ch,
@@ -220,14 +220,20 @@ class ConvEncoder(nn.Module):
             padding=1,
             bias=False
         )
-        # Pretrained Gewichte kopieren / wiederholen.
+        # Pretrained-Gewichtsmigration:
+        # - RGB-Kanäle direkt übernehmen.
+        # - Zusätzliche Kanäle mit dem Mittelwert der RGB-Filter initialisieren,
+        #   statt die RGB-Filter zyklisch zu wiederholen.
+        # Dadurch wird die Aktivierungsskala beim Wechsel 3 -> 6 Kanäle stabil gehalten.
         with torch.no_grad():
             if self.input_ch <= 3:
                 backbone.features[0][0].weight[:, :self.input_ch] = old_conv.weight[:, :self.input_ch]
             else:
-                repeat = math.ceil(self.input_ch / 3)
-                repeated = old_conv.weight.repeat(1, repeat, 1, 1)[:, :self.input_ch]
-                backbone.features[0][0].weight.copy_(repeated)
+                new_weight = backbone.features[0][0].weight
+                new_weight[:, :3].copy_(old_conv.weight[:, :3])
+                mean_filter = old_conv.weight[:, :3].mean(dim=1, keepdim=True)
+                for channel_idx in range(3, self.input_ch):
+                    new_weight[:, channel_idx:channel_idx + 1].copy_(mean_filter)
 
         # Modality-shift (RGB -> Depth/Flow): kompletten Backbone feinjustieren.
         for param in backbone.features.parameters():
@@ -263,6 +269,75 @@ class ConvEncoder(nn.Module):
         x = self.adapter(x)
         # (B, T, embed_dim)
         return x.reshape(*obs.shape[:-3], x.shape[-1])
+
+
+class CausalTemporalTransformer(nn.Module):
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        dropout: float,
+        max_len: int,
+        action_proj_dim: int = 32,
+    ):
+        super().__init__()
+        self.action_proj = nn.Linear(action_dim, action_proj_dim)
+        self.in_proj = nn.Linear(state_dim + action_proj_dim, model_dim)
+        self.pos_embed = nn.Parameter(torch.zeros(1, max_len, model_dim))
+        layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=num_heads,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(layer, num_layers=num_layers)
+
+    def forward(self, state_seq: torch.Tensor, prev_action_seq: torch.Tensor) -> torch.Tensor:
+        # state_seq: (B, T, state_dim), prev_action_seq: (B, T, action_dim)
+        x = torch.cat([state_seq, self.action_proj(prev_action_seq)], dim=-1)
+        x = self.in_proj(x)
+        x = x + self.pos_embed[:, : x.shape[1]]
+        t = x.shape[1]
+        causal_mask = torch.triu(torch.ones(t, t, device=x.device, dtype=torch.bool), diagonal=1)
+        return self.encoder(x, mask=causal_mask)
+
+
+class NEPredictorHead(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        hidden = max(in_dim, out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class DepthAuxHead(nn.Module):
+    def __init__(self, in_dim: int, out_h: int, out_w: int):
+        super().__init__()
+        self.out_h = int(out_h)
+        self.out_w = int(out_w)
+        hidden = max(128, in_dim // 2)
+        self.head = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, self.out_h * self.out_w),
+        )
+
+    def forward(self, post_feat: torch.Tensor) -> torch.Tensor:
+        # (B, T, F) -> (B, T, H, W, 1)
+        b, t, _ = post_feat.shape
+        pred = self.head(post_feat).view(b, t, self.out_h, self.out_w, 1)
+        return F.softplus(pred)
 
 
 class SafetyNet(nn.Module):

@@ -11,6 +11,7 @@ model:
   img_width: 256
   act_dim: 4
   use_depth: false
+  use_depth_aux: false
   safety_input_key: 'image'
   safety_in_channels: 3
   hover_throttle: 0.52
