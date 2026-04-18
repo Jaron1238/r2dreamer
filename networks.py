@@ -239,16 +239,16 @@ class ConvEncoder(nn.Module):
         for param in backbone.features.parameters():
             param.requires_grad = True
 
-        # Classifier-Head entfernen
-        self.backbone = nn.Sequential(
-            backbone.features,
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten()
-        )
+        # Classifier-Head entfernen, räumliche Struktur erhalten.
+        self.backbone = backbone.features
 
-        # Adapter: 1280 (EfficientNet Output) → was RSSM erwartet
+        # Adapter: EfficientNet feature grid (1280 * H' * W') → RSSM Embed-Dim
+        with torch.no_grad():
+            dummy = torch.zeros(1, self.input_ch, int(h), int(w))
+            backbone_out = self.backbone(dummy)
+            backbone_flat_dim = int(backbone_out.flatten(1).shape[-1])
         embed_dim = int(config.depth) * int(config.mults[-1])
-        self.adapter = nn.Linear(1280, embed_dim)
+        self.adapter = nn.Linear(backbone_flat_dim, embed_dim)
         self.out_dim = embed_dim
 
     def forward(self, obs):
@@ -263,8 +263,9 @@ class ConvEncoder(nn.Module):
             obs = torch.cat([rgb, diff], dim=-1)
         x = obs.reshape(-1, *obs.shape[-3:])
         x = x.permute(0, 3, 1, 2)
-        # (B*T, 1280)
+        # (B*T, 1280, H', W')
         x = self.backbone(x)
+        x = x.flatten(1)
         # (B*T, embed_dim)
         x = self.adapter(x)
         # (B, T, embed_dim)
@@ -327,16 +328,33 @@ class DepthAuxHead(nn.Module):
         self.out_h = int(out_h)
         self.out_w = int(out_w)
         hidden = max(128, in_dim // 2)
-        self.head = nn.Sequential(
+        base_h = max(4, self.out_h // 16)
+        base_w = max(4, self.out_w // 16)
+        self.base_h = base_h
+        self.base_w = base_w
+        self.proj = nn.Sequential(
             nn.Linear(in_dim, hidden),
             nn.SiLU(),
-            nn.Linear(hidden, self.out_h * self.out_w),
+            nn.Linear(hidden, 64 * base_h * base_w),
+            nn.SiLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),
+            nn.SiLU(),
+            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.SiLU(),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+            nn.SiLU(),
+            nn.ConvTranspose2d(16, 1, kernel_size=4, stride=2, padding=1),
         )
 
     def forward(self, post_feat: torch.Tensor) -> torch.Tensor:
         # (B, T, F) -> (B, T, H, W, 1)
         b, t, _ = post_feat.shape
-        pred = self.head(post_feat).view(b, t, self.out_h, self.out_w, 1)
+        x = self.proj(post_feat).reshape(b * t, 64, self.base_h, self.base_w)
+        pred = self.decoder(x)
+        pred = F.interpolate(pred, size=(self.out_h, self.out_w), mode="bilinear", align_corners=False)
+        pred = pred.reshape(b, t, self.out_h, self.out_w, 1)
         return F.softplus(pred)
 
 

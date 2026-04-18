@@ -58,7 +58,9 @@ class PiVideoStream:
         with self._lock:
             if self._frame is None:
                 return None
-            return torch.from_numpy(self._frame.copy()).float() / 255.0
+            frame = self._frame.copy()
+            self._frame = None
+            return torch.from_numpy(frame).float() / 255.0
 
     def close(self):
         self._running = False

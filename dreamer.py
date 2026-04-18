@@ -39,9 +39,10 @@ class Dreamer(nn.Module):
         self.safety_threshold = float(getattr(cfg, "safety_threshold", 0.4))
         self.safety_input_key = str(getattr(cfg, "safety_input_key", "image"))
         hover_throttle = float(getattr(cfg, "hover_throttle", 0.5))
+        throttle_index = int(getattr(cfg, "throttle_index", 0))
         self.brake_vector  = torch.zeros(self.act_dim, device=self.device)
-        if self.act_dim > 0:
-            self.brake_vector[0] = hover_throttle
+        if 0 <= throttle_index < self.act_dim:
+            self.brake_vector[throttle_index] = hover_throttle
         self.drone_embed_dim = int(getattr(cfg, "drone_embed_dim", 16))
         self.infonce_temperature = float(getattr(cfg, "infonce_temperature", 0.1))
         self.video_pred_batch = int(getattr(cfg, "video_pred_batch", 6))
@@ -237,6 +238,10 @@ class Dreamer(nn.Module):
             print("Compiling loss computation with torch.compile...")
             self.compute_losses = torch.compile(self.compute_losses, mode="reduce-overhead")
 
+    def _maybe_mark_cudagraph_step(self):
+        if self.device.type == "cuda":
+            torch.compiler.cudagraph_mark_step_begin()
+
     def encode(self, images):
         obs = {"image": images}
         return self.encoder(obs)
@@ -372,7 +377,7 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
-        torch.compiler.cudagraph_mark_step_begin()
+        self._maybe_mark_cudagraph_step()
         p_obs                          = self.preprocess(obs)
         embed                          = self._frozen_encoder(p_obs)
         teacher_d_emb                  = self._get_drone_embedding(
@@ -444,7 +449,7 @@ class Dreamer(nn.Module):
 
     @torch.no_grad()
     def video_pred(self, data, initial):
-        torch.compiler.cudagraph_mark_step_begin()
+        self._maybe_mark_cudagraph_step()
         p_data = self.preprocess(data)
         return self._video_pred(p_data, initial)
 
@@ -546,7 +551,9 @@ class Dreamer(nn.Module):
             scheduler.step()
             mets["opt/lr"] = scheduler.get_last_lr()[0]
 
-        self.zero_grad(**zero_grad_kwargs)
+        optimizer.zero_grad(**zero_grad_kwargs)
+
+        self._update_slow_target()
 
         if self._log_grads and old_params is not None:
             updates = [new.detach() - old for new, old in zip(grad_params, old_params)]
@@ -558,9 +565,8 @@ class Dreamer(nn.Module):
 
     def update(self, replay_buffer):
         data, index, initial = replay_buffer.sample()
-        torch.compiler.cudagraph_mark_step_begin()
+        self._maybe_mark_cudagraph_step()
         p_data = self.preprocess(data)
-        self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
 
@@ -703,24 +709,29 @@ class Dreamer(nn.Module):
             safety_pred = self.safety_net(safety_image, speed, data["action"])
             focal_alpha = 0.8
             focal_gamma = 2.0
-            safety_pred = torch.clamp(safety_pred, min=1e-6, max=1 - 1e-6)
-            p_t = crash_target * safety_pred + (1.0 - crash_target) * (1.0 - safety_pred)
+            eps = 1e-4
+            safety_prob = torch.clamp(safety_pred, min=eps, max=1.0 - eps)
+            safety_logits = torch.logit(safety_prob)
+            bce = F.binary_cross_entropy_with_logits(safety_logits, crash_target, reduction="none")
+            p_t = torch.exp(-bce)
             alpha_t = crash_target * focal_alpha + (1.0 - crash_target) * (1.0 - focal_alpha)
-            focal_loss = -alpha_t * ((1.0 - p_t) ** focal_gamma) * torch.log(p_t)
+            focal_loss = alpha_t * ((1.0 - p_t) ** focal_gamma) * bce
             losses["safety"] = torch.mean(focal_loss)
 
             if "inj_raw_image" in data:
                 inj_speed = torch.zeros_like(speed)
                 inj_action = torch.zeros_like(data["action"])
                 inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
-                inj_pred = torch.clamp(inj_pred, min=1e-6, max=1 - 1e-6)
+                inj_prob = torch.clamp(inj_pred, min=eps, max=1.0 - eps)
+                inj_logits = torch.logit(inj_prob)
                 inj_target = data["inj_crash"]
-                inj_pt = inj_target * inj_pred + (1.0 - inj_target) * (1.0 - inj_pred)
+                inj_bce = F.binary_cross_entropy_with_logits(inj_logits, inj_target, reduction="none")
+                inj_pt = torch.exp(-inj_bce)
                 inj_alpha = inj_target * focal_alpha + (1.0 - inj_target) * (1.0 - focal_alpha)
-                inj_loss = torch.mean(-inj_alpha * ((1.0 - inj_pt) ** focal_gamma) * torch.log(inj_pt))
+                inj_loss = torch.mean(inj_alpha * ((1.0 - inj_pt) ** focal_gamma) * inj_bce)
                 losses["safety"] = losses["safety"] + inj_loss
 
-            metrics["safety/score_mean"] = safety_pred.mean()
+            metrics["safety/score_mean"] = safety_prob.mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
             self._ctx_updates += 1

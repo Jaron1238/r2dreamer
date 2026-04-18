@@ -39,6 +39,16 @@ class DepthPreprocessor:
         )[0, 0]
         return depth.clamp(0.0, 1.0)
 
+    def _resize_depth_batch(self, depth: torch.Tensor) -> torch.Tensor:
+        # depth: (T, H, W)
+        depth = F.interpolate(
+            depth.unsqueeze(1),
+            size=(self.output_size, self.output_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1)
+        return depth.clamp(0.0, 1.0)
+
     @torch.no_grad()
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
         # frames can be:
@@ -51,16 +61,16 @@ class DepthPreprocessor:
             # Already depth maps without channel dimension.
             if frames.max() > 1.5:
                 frames = frames / 255.0
-            return torch.stack([self._resize_depth(frames[t]) for t in range(frames.shape[0])], dim=0)
+            return self._resize_depth_batch(frames)
         if frames.ndim == 4 and frames.shape[-1] in (1, 2):
             # Already depth-like input (depth or depth+diff). Keep only depth channel.
             depth = frames[..., 0]
             if depth.max() > 1.5:
                 depth = depth / 255.0
-            return torch.stack([self._resize_depth(depth[t]) for t in range(depth.shape[0])], dim=0)
+            return self._resize_depth_batch(depth)
         if self._depth_model is None:
             gray = frames.mean(dim=-1)
-            return torch.stack([self._resize_depth(gray[t]) for t in range(gray.shape[0])], dim=0)
+            return self._resize_depth_batch(gray)
 
         # Depth Anything path (best effort in offline preprocessing).
         # In constrained environments we gracefully fallback to grayscale.
@@ -75,7 +85,7 @@ class DepthPreprocessor:
             return torch.stack(outs, dim=0)
         except Exception:
             gray = frames.mean(dim=-1)
-            return torch.stack([self._resize_depth(gray[t]) for t in range(gray.shape[0])], dim=0)
+            return self._resize_depth_batch(gray)
 
 class FPVDataset(IterableDataset):
     def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
@@ -545,6 +555,7 @@ class OfflineTrainer:
             mixed_precision="fp16"
         )
         self._augmentation_logged = False
+        self._eval_loader = None
 
     def _save_checkpoint(self, step):
         ckpt_path = self.logdir / f"checkpoint-{step:07d}"
@@ -597,31 +608,31 @@ class OfflineTrainer:
         agent.eval()
         total_reward = 0.0
         count = 0
-        eval_iter = iter(self.dataset)
+        eval_iter = iter(self._eval_loader)
         for _ in range(self.eval_batches):
             batch = next(eval_iter)
-            image = batch["image"].unsqueeze(0).to(self.accelerator.device)
-            raw_image = batch["raw_image"].unsqueeze(0).to(self.accelerator.device)
+            image = batch["image"].to(self.accelerator.device)
+            raw_image = batch["raw_image"].to(self.accelerator.device)
             batch_size, time_steps = image.shape[:2]
             data = TensorDict(
                 {
                     "image": image,
                     "raw_image": raw_image,
-                    "is_first": batch["is_first"].unsqueeze(0).to(self.accelerator.device),
-                    "burn_in_mask": batch["burn_in_mask"].unsqueeze(0).to(self.accelerator.device),
-                    "is_last": batch["is_last"].unsqueeze(0).to(self.accelerator.device),
-                    "is_terminal": batch["is_terminal"].unsqueeze(0).to(self.accelerator.device),
-                    "reward": batch["reward"].unsqueeze(0).to(self.accelerator.device),
-                    "action": batch["action"].unsqueeze(0).to(self.accelerator.device),
-                    "drone_id": batch["drone_id"].unsqueeze(0).to(self.accelerator.device),
-                    "speed": batch["speed"].unsqueeze(0).to(self.accelerator.device),
-                    "crash": batch["crash"].unsqueeze(0).to(self.accelerator.device),
-                    "osd": batch.get("osd", torch.zeros(time_steps, 8)).unsqueeze(0).to(self.accelerator.device),
-                    "has_osd": batch.get("has_osd", torch.zeros(time_steps, 1)).unsqueeze(0).to(self.accelerator.device),
+                    "is_first": batch["is_first"].to(self.accelerator.device),
+                    "burn_in_mask": batch["burn_in_mask"].to(self.accelerator.device),
+                    "is_last": batch["is_last"].to(self.accelerator.device),
+                    "is_terminal": batch["is_terminal"].to(self.accelerator.device),
+                    "reward": batch["reward"].to(self.accelerator.device),
+                    "action": batch["action"].to(self.accelerator.device),
+                    "drone_id": batch["drone_id"].to(self.accelerator.device),
+                    "speed": batch["speed"].to(self.accelerator.device),
+                    "crash": batch["crash"].to(self.accelerator.device),
+                    "osd": batch.get("osd", torch.zeros(batch_size, time_steps, 8)).to(self.accelerator.device),
+                    "has_osd": batch.get("has_osd", torch.zeros(batch_size, time_steps, 1)).to(self.accelerator.device),
                     "cam_overlay": batch.get(
-                        "cam_overlay", torch.zeros(time_steps, image.shape[2], image.shape[3], 1)
-                    ).unsqueeze(0).to(self.accelerator.device),
-                    "has_cam_overlay": batch.get("has_cam_overlay", torch.zeros(time_steps, 1)).unsqueeze(0).to(self.accelerator.device),
+                        "cam_overlay", torch.zeros(batch_size, time_steps, image.shape[2], image.shape[3], 1)
+                    ).to(self.accelerator.device),
+                    "has_cam_overlay": batch.get("has_cam_overlay", torch.zeros(batch_size, time_steps, 1)).to(self.accelerator.device),
                 },
                 batch_size=[batch_size, time_steps],
             )
@@ -643,9 +654,18 @@ class OfflineTrainer:
             pin_memory=True,
             drop_last=True
         )
+        self._eval_loader = DataLoader(
+            self.dataset,
+            batch_size=self.batch_per_gpu,
+            shuffle=False,
+            num_workers=max(1, self.num_workers // 2),
+            pin_memory=True,
+            drop_last=True,
+        )
         optimizer = agent._optimizer
         scheduler = agent._scheduler
         agent, optimizer, loader, scheduler = self.accelerator.prepare(agent, optimizer, loader, scheduler)
+        train_agent = self.accelerator.unwrap_model(agent)
         agent.train()
         
         self.accelerator.print(f"Start Training | Processes: {self.accelerator.num_processes}")
@@ -674,6 +694,8 @@ class OfflineTrainer:
                     optimizer.step()
                     scheduler.step()
                     optimizer.zero_grad()
+                    if self.accelerator.sync_gradients and hasattr(train_agent, "_update_slow_target"):
+                        train_agent._update_slow_target()
 
                     running_loss += loss.detach().item()
                     step += 1

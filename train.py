@@ -40,9 +40,9 @@ def main(config):
             ckpt = torch.load(ckpt_path, map_location=config.device)
             ckpt_phase = ckpt.get("phase", None)
             if ckpt_phase is not None and int(ckpt_phase) != int(config.phase):
-                raise ValueError(
-                    f"Checkpoint Phase {ckpt_phase} != Config Phase {config.phase}. "
-                    f"Entweder phase: {ckpt_phase} in der Config setzen oder Checkpoint prüfen."
+                print(
+                    f"[WARNUNG] Checkpoint Phase {ckpt_phase} != Config Phase {config.phase}. "
+                    "Fortsetzen im Curriculum-Modus mit geladenen Gewichten."
                 )
             agent.load_state_dict(ckpt["model"])
             print(f"Checkpoint geladen: {ckpt_path} (Phase {ckpt_phase})")
