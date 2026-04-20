@@ -64,12 +64,20 @@ class DepthPreprocessor:
             if frames.max() > 1.5:
                 frames = frames / 255.0
             return self._resize_depth_batch(frames)
-        if frames.ndim == 4 and frames.shape[-1] in (1, 2):
-            # Already depth-like input (depth or depth+diff). Keep only depth channel.
+        if frames.ndim == 4 and frames.shape[-1] == 1:
             depth = frames[..., 0]
             if depth.max() > 1.5:
                 depth = depth / 255.0
             return self._resize_depth_batch(depth)
+        if frames.ndim == 4 and frames.shape[-1] == 2:
+            # depth + diff input: preserve both channels
+            depth = frames[..., 0]
+            diff = frames[..., 1]
+            if depth.max() > 1.5:
+                depth = depth / 255.0
+            depth = self._resize_depth_batch(depth)
+            diff = self._resize_depth_batch(diff)
+            return torch.stack([depth, diff], dim=-1)
         self._ensure_depth_model()
         if self._depth_model is None:
             gray = frames.mean(dim=-1)
@@ -762,14 +770,31 @@ class OnlineTrainer:
                 {
                     "image": obs["image"],
                     "raw_image": obs.get("raw_image", obs["image"]),
+                    "osd": obs.get("osd", torch.zeros(1, 8, device=self.accelerator.device)),
+                    "has_osd": obs.get("has_osd", torch.zeros(1, 1, device=self.accelerator.device)),
+                    "cam_overlay": obs.get(
+                        "cam_overlay",
+                        torch.zeros(
+                            obs["image"].shape[0],
+                            obs["image"].shape[1],
+                            obs["image"].shape[2],
+                            1,
+                            device=self.accelerator.device,
+                        ),
+                    ),
+                    "has_cam_overlay": obs.get("has_cam_overlay", torch.zeros(1, 1, device=self.accelerator.device)),
                     "is_first": obs["is_first"],
                     "is_last": torch.tensor([done], dtype=torch.bool, device=self.accelerator.device),
                     "is_terminal": torch.tensor([bool(terminated)], dtype=torch.bool, device=self.accelerator.device),
                     "reward": torch.tensor([[reward]], dtype=torch.float32, device=self.accelerator.device),
                     "action": action.detach(),
                     "speed": obs.get("speed", torch.zeros(1, 1, device=self.accelerator.device)),
+                    "altitude": obs.get("altitude", torch.zeros(1, 1, device=self.accelerator.device)),
+                    "battery": obs.get("battery", torch.zeros(1, 1, device=self.accelerator.device)),
                     "drone_id": obs.get("drone_id", torch.zeros(1, dtype=torch.long, device=self.accelerator.device)),
                     "crash": torch.tensor([[float(terminated)]], dtype=torch.float32, device=self.accelerator.device),
+                    "inj_raw_image": obs.get("inj_raw_image", obs.get("raw_image", obs["image"])),
+                    "inj_crash": obs.get("inj_crash", torch.tensor([[float(terminated)]], device=self.accelerator.device)),
                     "episode": torch.tensor([self.num_eps], dtype=torch.long, device=self.accelerator.device),
                     "stoch": state["stoch"].detach(),
                     "deter": state["deter"].detach(),
