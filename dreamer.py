@@ -364,6 +364,29 @@ class Dreamer(nn.Module):
         self._frozen_value = self._freeze_copy(self.value)
         self._frozen_slow_value = self._freeze_copy(self._slow_value)
         self._frozen_drone_embed = self._freeze_copy(self.drone_embed)
+        self._set_frozen_eval()
+
+    def _set_frozen_eval(self):
+        self._frozen_encoder.eval()
+        self._frozen_rssm.eval()
+        self._frozen_reward.eval()
+        self._frozen_cont.eval()
+        self._frozen_actor.eval()
+        self._frozen_value.eval()
+        self._frozen_slow_value.eval()
+        self._frozen_drone_embed.eval()
+
+    @torch.no_grad()
+    def _sync_frozen_modules(self):
+        self._frozen_encoder.load_state_dict(self.encoder.state_dict())
+        self._frozen_rssm.load_state_dict(self.rssm.state_dict())
+        self._frozen_reward.load_state_dict(self.reward.state_dict())
+        self._frozen_cont.load_state_dict(self.cont.state_dict())
+        self._frozen_actor.load_state_dict(self.actor.state_dict())
+        self._frozen_value.load_state_dict(self.value.state_dict())
+        self._frozen_slow_value.load_state_dict(self._slow_value.state_dict())
+        self._frozen_drone_embed.load_state_dict(self.drone_embed.state_dict())
+        self._set_frozen_eval()
 
     def _get_drone_embedding(self, drone_id=None, *, batch_shape=None, frozen=False, device=None):
         module = self._frozen_drone_embed if frozen else self.drone_embed
@@ -554,6 +577,7 @@ class Dreamer(nn.Module):
         optimizer.zero_grad(**zero_grad_kwargs)
 
         self._update_slow_target()
+        self._sync_frozen_modules()
 
         if self._log_grads and old_params is not None:
             updates = [new.detach() - old for new, old in zip(grad_params, old_params)]
@@ -563,7 +587,17 @@ class Dreamer(nn.Module):
         metrics.update(mets)
         return (stoch, deter), metrics
 
-    def update(self, replay_buffer):
+    def update(
+        self,
+        replay_buffer,
+        *,
+        optimizer=_DEFAULT,
+        scheduler=_DEFAULT,
+        scaler=_DEFAULT,
+        backward_fn=None,
+        clip_grad_fn=None,
+        autocast_enabled=True,
+    ):
         data, index, initial = replay_buffer.sample()
         self._maybe_mark_cudagraph_step()
         p_data = self.preprocess(data)
@@ -581,9 +615,12 @@ class Dreamer(nn.Module):
         (stoch, deter), metrics = self.train_step(
             p_data,
             initial,
-            optimizer=self._optimizer,
-            scheduler=self._scheduler,
-            scaler=self._scaler,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            backward_fn=backward_fn,
+            clip_grad_fn=clip_grad_fn,
+            autocast_enabled=autocast_enabled,
             zero_grad_kwargs={"set_to_none": True},
             post_backward_hook=post_backward_hook,
         )

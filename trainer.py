@@ -14,8 +14,14 @@ class DepthPreprocessor:
         self.use_depth = bool(use_depth)
         self.output_size = int(output_size)
         self._depth_model = None
-        self._backend = "disabled"
-        if not self.use_depth:
+        self._backend = "disabled" if not self.use_depth else "lazy"
+
+    @property
+    def backend(self):
+        return self._backend
+
+    def _ensure_depth_model(self):
+        if self._depth_model is not None or not self.use_depth:
             return
         try:
             from depth_anything_v2.dpt import DepthAnythingV2  # type: ignore
@@ -25,10 +31,6 @@ class DepthPreprocessor:
         except Exception:
             self._depth_model = None
             self._backend = "grayscale-fallback"
-
-    @property
-    def backend(self):
-        return self._backend
 
     def _resize_depth(self, depth: torch.Tensor) -> torch.Tensor:
         depth = F.interpolate(
@@ -68,6 +70,7 @@ class DepthPreprocessor:
             if depth.max() > 1.5:
                 depth = depth / 255.0
             return self._resize_depth_batch(depth)
+        self._ensure_depth_model()
         if self._depth_model is None:
             gray = frames.mean(dim=-1)
             return self._resize_depth_batch(gray)
@@ -100,16 +103,13 @@ class FPVDataset(IterableDataset):
         self.img_width = int(getattr(config.model, "img_width", 256))
         self.burn_in_steps = int(getattr(config.trainer, "burn_in_steps", 5))
         self.phase = int(getattr(config, "phase", 1))
+        self.chunk_stride = int(getattr(config.dataset, "chunk_stride", self.batch_length))
         self.telemetry_jitter_std = float(getattr(config.dataset, "telemetry_jitter_std", 0.02))
         self.telemetry_stale_prob = float(getattr(config.dataset, "telemetry_stale_prob", 0.2))
         self.raw_source = SafetyRawImageSource(
             config.dataset.get("raw_dataset", None),
             output_size=(self.img_height, self.img_width),
             raw_image_mode=self.raw_image_mode,
-        )
-        self.depth_preprocessor = DepthPreprocessor(
-            use_depth=self.use_depth,
-            output_size=min(self.img_height, self.img_width),
         )
         from datasets import load_dataset
         self.ds = load_dataset(config.dataset.hf_repo, streaming=True, split="train")
@@ -121,8 +121,7 @@ class FPVDataset(IterableDataset):
             
         print(
             f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | "
-            f"OSD-Pflicht: {self.require_osd} | use_depth={self.use_depth} "
-            f"(backend={self.depth_preprocessor.backend})"
+            f"OSD-Pflicht: {self.require_osd} | use_depth={self.use_depth}"
         )
 
     def __iter__(self):
@@ -145,107 +144,109 @@ class FPVDataset(IterableDataset):
             if T < self.batch_length:
                 continue
 
-            if T == self.batch_length:
-                start = 0
-            else:
-                start = torch.randint(0, T - self.batch_length + 1, (1,)).item()
+            max_start = T - self.batch_length
+            stride = max(1, self.chunk_stride)
+            starts = list(range(0, max_start + 1, stride))
+            if starts[-1] != max_start:
+                starts.append(max_start)
 
-            raw_image = gray_full[start : start + self.batch_length]
-            raw_image = self._resize_sequence(raw_image)
-            raw_image = self._build_raw_image(raw_image)
+            for start in starts:
+                raw_image = gray_full[start : start + self.batch_length]
+                raw_image = self._resize_sequence(raw_image)
+                raw_image = self._build_raw_image(raw_image)
 
-            if rgb_full is not None:
-                rgb = rgb_full[start : start + self.batch_length]
-                rgb = self._resize_sequence(rgb)
-                rgb = rgb[..., :3]
-            else:
-                rgb = self._resize_sequence(raw_image)
-                if rgb.shape[-1] == 1:
-                    rgb = rgb.repeat(1, 1, 1, 3)
-                elif rgb.shape[-1] > 3:
+                if rgb_full is not None:
+                    rgb = rgb_full[start : start + self.batch_length]
+                    rgb = self._resize_sequence(rgb)
                     rgb = rgb[..., :3]
+                else:
+                    rgb = self._resize_sequence(raw_image)
+                    if rgb.shape[-1] == 1:
+                        rgb = rgb.repeat(1, 1, 1, 3)
+                    elif rgb.shape[-1] > 3:
+                        rgb = rgb[..., :3]
 
-            depth = depth_full[start : start + self.batch_length]
-            depth = self._resize_sequence(depth)
-            if depth.ndim == 3:
-                depth = depth.unsqueeze(-1)
-            is_terminal = is_terminal_full[start : start + self.batch_length]
-            diff = torch.zeros_like(rgb)
-            diff[1:] = rgb[1:] - rgb[:-1]
-            image = torch.cat([rgb, diff], dim=-1)
+                depth = depth_full[start : start + self.batch_length]
+                depth = self._resize_sequence(depth)
+                if depth.ndim == 3:
+                    depth = depth.unsqueeze(-1)
+                is_terminal = is_terminal_full[start : start + self.batch_length]
+                diff = torch.zeros_like(rgb)
+                diff[1:] = rgb[1:] - rgb[:-1]
+                image = torch.cat([rgb, diff], dim=-1)
 
-            reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
-            if is_terminal.any():
-                crash_idx = torch.where(is_terminal)[0]
-                reward[crash_idx] = -1.0
+                reward = torch.ones((self.batch_length, 1), dtype=torch.float32)
+                if is_terminal.any():
+                    crash_idx = torch.where(is_terminal)[0]
+                    reward[crash_idx] = -1.0
 
-            safety = self.raw_source.sample_sequence(self.batch_length)
-            is_first = torch.zeros(self.batch_length, dtype=torch.bool)
-            is_first[0] = True
-            burn_in_mask = torch.ones(self.batch_length, dtype=torch.bool)
-            burn_in_mask[: min(self.burn_in_steps, self.batch_length)] = False
-            is_last = torch.zeros(self.batch_length, dtype=torch.bool)
-            is_last[-1] = True
+                safety = self.raw_source.sample_sequence(self.batch_length)
+                is_first = torch.zeros(self.batch_length, dtype=torch.bool)
+                is_first[0] = True
+                burn_in_mask = torch.ones(self.batch_length, dtype=torch.bool)
+                burn_in_mask[: min(self.burn_in_steps, self.batch_length)] = False
+                is_last = torch.zeros(self.batch_length, dtype=torch.bool)
+                is_last[-1] = True
 
-            if self.require_osd and sample.get("has_osd", False):
-                actions_full = torch.from_numpy(np.array(sample["actions"][0])).float()
-                actions = actions_full[start : start + self.batch_length]
-            else:
-                actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
-            osd, has_osd = self._extract_osd(sample, start, self.batch_length)
-            cam_overlay, has_cam_overlay = self._extract_cam_overlay(sample, start, self.batch_length, raw_image)
+                if self.require_osd and sample.get("has_osd", False):
+                    actions_full = torch.from_numpy(np.array(sample["actions"][0])).float()
+                    actions = actions_full[start : start + self.batch_length]
+                else:
+                    actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
+                osd, has_osd = self._extract_osd(sample, start, self.batch_length)
+                cam_overlay, has_cam_overlay = self._extract_cam_overlay(sample, start, self.batch_length, raw_image)
 
-            speed_full = torch.from_numpy(np.array(sample["speeds"][0])).float() if "speeds" in sample else None
-            speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
-                self.batch_length, 1, dtype=torch.float32
-            )
-            altitude_full = torch.from_numpy(np.array(sample["altitudes"][0])).float() if "altitudes" in sample else None
-            altitude = altitude_full[start : start + self.batch_length] if altitude_full is not None else torch.zeros(
-                self.batch_length, 1, dtype=torch.float32
-            )
-            if self.phase == 2:
-                speed = self._apply_telemetry_noise(speed, self.telemetry_jitter_std, self.telemetry_stale_prob)
-                altitude = self._apply_telemetry_noise(altitude, self.telemetry_jitter_std, self.telemetry_stale_prob)
-            battery_full = torch.from_numpy(np.array(sample["batteries"][0])).float() if "batteries" in sample else None
-            battery = battery_full[start : start + self.batch_length] if battery_full is not None else torch.zeros(
-                self.batch_length, 1, dtype=torch.float32
-            )
+                speed_full = torch.from_numpy(np.array(sample["speeds"][0])).float() if "speeds" in sample else None
+                speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
+                    self.batch_length, 1, dtype=torch.float32
+                )
+                altitude_full = torch.from_numpy(np.array(sample["altitudes"][0])).float() if "altitudes" in sample else None
+                altitude = altitude_full[start : start + self.batch_length] if altitude_full is not None else torch.zeros(
+                    self.batch_length, 1, dtype=torch.float32
+                )
+                if self.phase == 2:
+                    speed = self._apply_telemetry_noise(speed, self.telemetry_jitter_std, self.telemetry_stale_prob)
+                    altitude = self._apply_telemetry_noise(altitude, self.telemetry_jitter_std, self.telemetry_stale_prob)
+                battery_full = torch.from_numpy(np.array(sample["batteries"][0])).float() if "batteries" in sample else None
+                battery = battery_full[start : start + self.batch_length] if battery_full is not None else torch.zeros(
+                    self.batch_length, 1, dtype=torch.float32
+                )
 
-            drone_value = sample.get("drone_id", 0)
-            if isinstance(drone_value, (list, tuple, np.ndarray)):
-                drone_value = drone_value[0]
-            drone_id = int(drone_value)
-            drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
+                drone_value = sample.get("drone_id", 0)
+                if isinstance(drone_value, (list, tuple, np.ndarray)):
+                    drone_value = drone_value[0]
+                drone_id = int(drone_value)
+                drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
 
-            if safety is not None:
-                inj_raw_image = safety["raw_image"]
-                inj_crash = safety["crash"]
-            else:
-                inj_raw_image = torch.zeros_like(raw_image)
-                inj_crash = torch.zeros_like(is_terminal.float().unsqueeze(-1))
+                if safety is not None:
+                    inj_raw_image = safety["raw_image"]
+                    inj_crash = safety["crash"]
+                else:
+                    inj_raw_image = torch.zeros_like(raw_image)
+                    inj_crash = torch.zeros_like(is_terminal.float().unsqueeze(-1))
 
-            yield {
-                "image": image,
-                "raw_image": raw_image,
-                "is_first": is_first,
-                "burn_in_mask": burn_in_mask,
-                "is_last": is_last,
-                "is_terminal": is_terminal,
-                "reward": reward,
-                "action": actions,
-                "drone_id": drone_id,
-                "speed": speed,
-                "altitude": altitude,
-                "battery": battery,
-                "crash": is_terminal.float().unsqueeze(-1),
-                "inj_raw_image": inj_raw_image,
-                "inj_crash": inj_crash,
-                "osd": osd,
-                "has_osd": has_osd,
-                "cam_overlay": cam_overlay,
-                "has_cam_overlay": has_cam_overlay,
-                "depth_target": depth,
-            }
+                yield {
+                    "image": image,
+                    "raw_image": raw_image,
+                    "is_first": is_first,
+                    "burn_in_mask": burn_in_mask,
+                    "is_last": is_last,
+                    "is_terminal": is_terminal,
+                    "reward": reward,
+                    "action": actions,
+                    "drone_id": drone_id,
+                    "speed": speed,
+                    "altitude": altitude,
+                    "battery": battery,
+                    "crash": is_terminal.float().unsqueeze(-1),
+                    "inj_raw_image": inj_raw_image,
+                    "inj_crash": inj_crash,
+                    "osd": osd,
+                    "has_osd": has_osd,
+                    "cam_overlay": cam_overlay,
+                    "has_cam_overlay": has_cam_overlay,
+                    "depth_target": depth,
+                }
 
     def _build_raw_image(self, frames: torch.Tensor) -> torch.Tensor:
         if frames.ndim == 3:
@@ -744,6 +745,7 @@ class OnlineTrainer:
         replay_buffer = Buffer(agent.config.buffer)
         optimizer = agent._optimizer
         agent, optimizer = self.accelerator.prepare(agent, optimizer)
+        train_agent = self.accelerator.unwrap_model(agent)
         state = agent.get_initial_state(B=1).to(self.accelerator.device)
         obs, _ = env.reset()
         obs = self._to_device_obs(obs, is_first=True)
@@ -778,7 +780,15 @@ class OnlineTrainer:
             obs = next_obs
 
             if replay_buffer.count() >= learning_starts and (step + 1) % train_every == 0:
-                metrics = agent.update(replay_buffer)
+                metrics = train_agent.update(
+                    replay_buffer,
+                    optimizer=optimizer,
+                    scheduler=train_agent._scheduler,
+                    scaler=None,
+                    backward_fn=self.accelerator.backward,
+                    clip_grad_fn=lambda params: self.accelerator.clip_grad_norm_(params, max_norm=100.0),
+                    autocast_enabled=False,
+                )
                 if step % self.log_every == 0 and self.accelerator.is_main_process:
                     for k, v in metrics.items():
                         val = v.item() if hasattr(v, "item") else v
