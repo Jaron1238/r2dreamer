@@ -90,6 +90,7 @@ class Dreamer(nn.Module):
             speed_dim=1,
         )
         self.use_depth_aux = bool(getattr(cfg, "use_depth_aux", False))
+        self.use_depth_aux_prob = float(getattr(cfg, "use_depth_aux_prob", 1.0))
         if self.phase >= 3 and self.use_depth_aux:
             self.depth_aux_head = networks.DepthAuxHead(
                 in_dim=self.rssm.flat_stoch + self.rssm._deter,
@@ -856,10 +857,13 @@ class Dreamer(nn.Module):
             warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
             losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
             if bool(getattr(self.config.model, "use_depth_aux", False)) and "depth_target" in data:
-                post_feat = torch.cat([post_stoch.reshape(B, T, -1), post_deter], dim=-1)
-                depth_pred = self.depth_aux_head(post_feat)
-                depth_target = data["depth_target"]
-                losses["depth_aux"] = self._scale_invariant_depth_loss(depth_pred, depth_target)
+                use_depth_aux_now = self.use_depth_aux_prob >= 1.0 or torch.rand((), device=feat.device) < self.use_depth_aux_prob
+                metrics["depth_aux/active"] = float(use_depth_aux_now)
+                if use_depth_aux_now:
+                    post_feat = torch.cat([post_stoch.reshape(B, T, -1), post_deter], dim=-1)
+                    depth_pred = self.depth_aux_head(post_feat)
+                    depth_target = data["depth_target"]
+                    losses["depth_aux"] = self._scale_invariant_depth_loss(depth_pred, depth_target)
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})

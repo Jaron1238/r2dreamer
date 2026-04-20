@@ -119,6 +119,13 @@ class FPVDataset(IterableDataset):
             output_size=(self.img_height, self.img_width),
             raw_image_mode=self.raw_image_mode,
         )
+        self.depth_fallback_mode = str(getattr(config.dataset, "depth_fallback_mode", "zeros"))
+        self.depth_preprocessor = None
+        if self.use_depth and self.depth_fallback_mode == "preprocess":
+            self.depth_preprocessor = DepthPreprocessor(
+                use_depth=self.use_depth,
+                output_size=min(self.img_height, self.img_width),
+            )
         from datasets import load_dataset
         self.ds = load_dataset(config.dataset.hf_repo, streaming=True, split="train")
         if self.require_osd:
@@ -129,7 +136,9 @@ class FPVDataset(IterableDataset):
             
         print(
             f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | "
-            f"OSD-Pflicht: {self.require_osd} | use_depth={self.use_depth}"
+            f"OSD-Pflicht: {self.require_osd} | use_depth={self.use_depth} "
+            f"(depth_fallback_mode={self.depth_fallback_mode}, "
+            f"depth_backend={self.depth_preprocessor.backend if self.depth_preprocessor is not None else 'none'})"
         )
 
     def __iter__(self):
@@ -144,8 +153,12 @@ class FPVDataset(IterableDataset):
             if "frames_rgb" in sample:
                 rgb_full = torch.from_numpy(np.array(sample["frames_rgb"][0])).float() / 255.0
                 rgb_full = self._ensure_channel_last(rgb_full)
-            depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
-            depth_full = self._ensure_channel_last(depth_full)
+            has_precomputed_depth = "frames_depth" in sample
+            if has_precomputed_depth:
+                depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
+                depth_full = self._ensure_channel_last(depth_full)
+            else:
+                depth_full = None
             is_terminal_full = torch.from_numpy(np.array(sample["is_terminal"][0])).bool()
 
             T = gray_full.shape[0]
@@ -174,10 +187,22 @@ class FPVDataset(IterableDataset):
                     elif rgb.shape[-1] > 3:
                         rgb = rgb[..., :3]
 
-                depth = depth_full[start : start + self.batch_length]
-                depth = self._resize_sequence(depth)
-                if depth.ndim == 3:
-                    depth = depth.unsqueeze(-1)
+                if has_precomputed_depth and depth_full is not None:
+                    depth = depth_full[start : start + self.batch_length]
+                    depth = self._resize_sequence(depth)
+                    if depth.ndim == 3:
+                        depth = depth.unsqueeze(-1)
+                else:
+                    if self.use_depth and self.depth_preprocessor is not None:
+                        input_for_depth = rgb if rgb_full is not None else raw_image
+                        depth = self.depth_preprocessor(input_for_depth)
+                        if depth.ndim == 3:
+                            depth = depth.unsqueeze(-1)
+                    else:
+                        depth = torch.zeros(
+                            (self.batch_length, self.img_height, self.img_width, 1),
+                            dtype=torch.float32,
+                        )
                 is_terminal = is_terminal_full[start : start + self.batch_length]
                 diff = torch.zeros_like(rgb)
                 diff[1:] = rgb[1:] - rgb[:-1]
