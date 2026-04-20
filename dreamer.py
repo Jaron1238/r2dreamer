@@ -90,6 +90,7 @@ class Dreamer(nn.Module):
             speed_dim=1,
         )
         self.use_depth_aux = bool(getattr(cfg, "use_depth_aux", False))
+        self.use_depth_aux_prob = float(getattr(cfg, "use_depth_aux_prob", 1.0))
         if self.phase >= 3 and self.use_depth_aux:
             self.depth_aux_head = networks.DepthAuxHead(
                 in_dim=self.rssm.flat_stoch + self.rssm._deter,
@@ -364,6 +365,29 @@ class Dreamer(nn.Module):
         self._frozen_value = self._freeze_copy(self.value)
         self._frozen_slow_value = self._freeze_copy(self._slow_value)
         self._frozen_drone_embed = self._freeze_copy(self.drone_embed)
+        self._set_frozen_eval()
+
+    def _set_frozen_eval(self):
+        self._frozen_encoder.eval()
+        self._frozen_rssm.eval()
+        self._frozen_reward.eval()
+        self._frozen_cont.eval()
+        self._frozen_actor.eval()
+        self._frozen_value.eval()
+        self._frozen_slow_value.eval()
+        self._frozen_drone_embed.eval()
+
+    @torch.no_grad()
+    def _sync_frozen_modules(self):
+        self._frozen_encoder.load_state_dict(self.encoder.state_dict())
+        self._frozen_rssm.load_state_dict(self.rssm.state_dict())
+        self._frozen_reward.load_state_dict(self.reward.state_dict())
+        self._frozen_cont.load_state_dict(self.cont.state_dict())
+        self._frozen_actor.load_state_dict(self.actor.state_dict())
+        self._frozen_value.load_state_dict(self.value.state_dict())
+        self._frozen_slow_value.load_state_dict(self._slow_value.state_dict())
+        self._frozen_drone_embed.load_state_dict(self.drone_embed.state_dict())
+        self._set_frozen_eval()
 
     def _get_drone_embedding(self, drone_id=None, *, batch_shape=None, frozen=False, device=None):
         module = self._frozen_drone_embed if frozen else self.drone_embed
@@ -554,6 +578,7 @@ class Dreamer(nn.Module):
         optimizer.zero_grad(**zero_grad_kwargs)
 
         self._update_slow_target()
+        self._sync_frozen_modules()
 
         if self._log_grads and old_params is not None:
             updates = [new.detach() - old for new, old in zip(grad_params, old_params)]
@@ -563,7 +588,17 @@ class Dreamer(nn.Module):
         metrics.update(mets)
         return (stoch, deter), metrics
 
-    def update(self, replay_buffer):
+    def update(
+        self,
+        replay_buffer,
+        *,
+        optimizer=_DEFAULT,
+        scheduler=_DEFAULT,
+        scaler=_DEFAULT,
+        backward_fn=None,
+        clip_grad_fn=None,
+        autocast_enabled=True,
+    ):
         data, index, initial = replay_buffer.sample()
         self._maybe_mark_cudagraph_step()
         p_data = self.preprocess(data)
@@ -581,9 +616,12 @@ class Dreamer(nn.Module):
         (stoch, deter), metrics = self.train_step(
             p_data,
             initial,
-            optimizer=self._optimizer,
-            scheduler=self._scheduler,
-            scaler=self._scaler,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            scaler=scaler,
+            backward_fn=backward_fn,
+            clip_grad_fn=clip_grad_fn,
+            autocast_enabled=autocast_enabled,
             zero_grad_kwargs={"set_to_none": True},
             post_backward_hook=post_backward_hook,
         )
@@ -819,10 +857,13 @@ class Dreamer(nn.Module):
             warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
             losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
             if bool(getattr(self.config.model, "use_depth_aux", False)) and "depth_target" in data:
-                post_feat = torch.cat([post_stoch.reshape(B, T, -1), post_deter], dim=-1)
-                depth_pred = self.depth_aux_head(post_feat)
-                depth_target = data["depth_target"]
-                losses["depth_aux"] = self._scale_invariant_depth_loss(depth_pred, depth_target)
+                use_depth_aux_now = self.use_depth_aux_prob >= 1.0 or torch.rand((), device=feat.device) < self.use_depth_aux_prob
+                metrics["depth_aux/active"] = float(use_depth_aux_now)
+                if use_depth_aux_now:
+                    post_feat = torch.cat([post_stoch.reshape(B, T, -1), post_deter], dim=-1)
+                    depth_pred = self.depth_aux_head(post_feat)
+                    depth_target = data["depth_target"]
+                    losses["depth_aux"] = self._scale_invariant_depth_loss(depth_pred, depth_target)
 
         total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})

@@ -12,6 +12,7 @@ safety_in_channels: 1
 drone_embed_dim: 16
 infonce_temperature: 0.1
 video_pred_batch: 6
+use_depth_aux_prob: 1.0
 
 lr: 4e-5
 agc: 0.3
