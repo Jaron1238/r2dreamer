@@ -851,20 +851,20 @@ class Dreamer(nn.Module):
         count = int(self._goal_feat_count.item())
         if n >= self.latent_goal_buffer_size:
             self._goal_feat_buffer.copy_(feat[-self.latent_goal_buffer_size :])
-            self._goal_feat_count[0] = self.latent_goal_buffer_size
+            self._goal_feat_count[0] = count + n
             return
         write_pos = count % self.latent_goal_buffer_size
         first = min(self.latent_goal_buffer_size - write_pos, n)
         self._goal_feat_buffer[write_pos : write_pos + first] = feat[:first]
         if first < n:
             self._goal_feat_buffer[: n - first] = feat[first:]
-        self._goal_feat_count[0] = min(count + n, self.latent_goal_buffer_size)
+        self._goal_feat_count[0] = count + n
 
     @torch.no_grad()
     def _sample_goal_feat(self, post_stoch, post_deter, batch_size):
         if not self.use_latent_goals or batch_size == 0:
             return None
-        count = int(self._goal_feat_count.item())
+        count = min(int(self._goal_feat_count.item()), self.latent_goal_buffer_size)
         if count > 0:
             feat_pool = self._goal_feat_buffer[:count]
         else:
