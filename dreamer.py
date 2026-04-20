@@ -918,16 +918,27 @@ class Dreamer(nn.Module):
             goal_reward = (sim * 0.7 + progress * 0.3).unsqueeze(-1)  # (B, T, 1)
         return feats, actions, goal_reward
 
+    # Lambda-return recurrence over time (B, T):
+    #   a_t = interm[:, t], b_t = (live * cont)[:, t], R_t = a_t + b_t * R_{t+1}, R_T = boot[:, -1].
+    # Inputs are (B, T) and output keeps the existing caller contract: returns.shape == (B, T-1).
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
         assert last.shape == term.shape == reward.shape == value.shape == boot.shape
         live   = (1 - to_f32(term))[:, 1:] * disc
         cont   = (1 - to_f32(last))[:, 1:] * lamb
         interm = reward[:, 1:] + (1 - cont) * live * boot[:, 1:]
-        out    = [boot[:, -1]]
-        for i in reversed(range(live.shape[1])):
-            out.append(interm[:, i] + live[:, i] * cont[:, i] * out[-1])
-        return torch.stack(list(reversed(out))[:-1], 1)
+        a = interm
+        b = live * cont
+
+        # Forward scan over reversed time for compile-friendly carry update.
+        a_rev = torch.flip(a, dims=(1,))
+        b_rev = torch.flip(b, dims=(1,))
+        ret_rev = torch.empty_like(a_rev)
+        carry = boot[:, -1]
+        for t in range(a_rev.shape[1]):
+            carry = a_rev[:, t] + b_rev[:, t] * carry
+            ret_rev[:, t] = carry
+        return torch.flip(ret_rev, dims=(1,))
 
     @torch.no_grad()
     def preprocess(self, data):
