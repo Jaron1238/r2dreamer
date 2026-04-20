@@ -56,7 +56,7 @@ class DepthPreprocessor:
         # frames can be:
         # - RGB:            (T, H, W, 3)
         # - depth only:     (T, H, W) or (T, H, W, 1)
-        # - depth + diff:   (T, H, W, 2) -> we intentionally keep only depth channel.
+        # - depth + diff:   (T, H, W, 2)
         if not self.use_depth:
             return frames
         if frames.ndim == 3:
@@ -64,12 +64,20 @@ class DepthPreprocessor:
             if frames.max() > 1.5:
                 frames = frames / 255.0
             return self._resize_depth_batch(frames)
-        if frames.ndim == 4 and frames.shape[-1] in (1, 2):
-            # Already depth-like input (depth or depth+diff). Keep only depth channel.
+        if frames.ndim == 4 and frames.shape[-1] == 1:
             depth = frames[..., 0]
             if depth.max() > 1.5:
                 depth = depth / 255.0
             return self._resize_depth_batch(depth)
+        if frames.ndim == 4 and frames.shape[-1] == 2:
+            # depth + diff input: preserve both channels
+            depth = frames[..., 0]
+            diff = frames[..., 1]
+            if depth.max() > 1.5:
+                depth = depth / 255.0
+            depth = self._resize_depth_batch(depth)
+            diff = self._resize_depth_batch(diff)
+            return torch.stack([depth, diff], dim=-1)
         self._ensure_depth_model()
         if self._depth_model is None:
             gray = frames.mean(dim=-1)
