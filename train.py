@@ -61,8 +61,9 @@ def main(config):
         trainer = OfflineTrainer(config.trainer, dataset, logger, logdir)
         trainer.begin(agent)
 
+    raw_agent = trainer.accelerator.unwrap_model(agent) if hasattr(trainer, "accelerator") else agent
     torch.save(
-        {"model": agent.state_dict(), "phase": config.phase},
+        {"model": raw_agent.state_dict(), "phase": config.phase},
         logdir / "latest.pt",
     )
 

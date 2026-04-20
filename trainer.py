@@ -636,9 +636,9 @@ class OfflineTrainer:
                 },
                 batch_size=[batch_size, time_steps],
             )
-            (_, _), _, metrics = agent.compute_losses(agent.preprocess(data), initial=None)
-            rew = metrics.get("rew", 0.0)
-            total_reward += float(rew.item() if hasattr(rew, "item") else rew)
+            (_, _), _, _ = agent.compute_losses(agent.preprocess(data), initial=None)
+            rew = data["reward"].mean()
+            total_reward += float(rew.item())
             count += 1
         agent.train()
         if self.accelerator.is_main_process:
