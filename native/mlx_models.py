@@ -1,5 +1,3 @@
-
-
 import math
 from dataclasses import dataclass
 from typing import Callable
@@ -32,16 +30,22 @@ class RMSNorm(nn.Module):
         self.weight = mx.ones((dim,))
 
     def __call__(self, x: mx.array) -> mx.array:
-        rms = mx.rsqrt(mx.mean(mx.square(x), axis=-1, keepdims=True) + self.eps)
-        return x * rms * self.weight
+        # Match PyTorch's RMSNorm behavior exactly
+        # PyTorch: x * weight * rsqrt(mean(x^2, dim=-1, keepdim=True) + eps)
+        # We need to compute over the last dimension
+        squared = mx.square(x)
+        mean_squared = mx.mean(squared, axis=-1, keepdims=True)
+        inv_std = mx.rsqrt(mean_squared + self.eps)
+        return x * self.weight * inv_std
 
 class BlockLinear(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, blocks: int):
+    def __init__(self, in_ch: int, out_ch: int, blocks: int, outscale: float = 1.0):
         super().__init__()
         self.in_ch = int(in_ch)
         self.out_ch = int(out_ch)
         self.blocks = int(blocks)
-        scale = (2.0 / max(1, self.in_ch // self.blocks)) ** 0.5
+        self.outscale = float(outscale)
+        scale = (2.0 / max(1, self.in_ch // self.blocks)) ** 0.5 * self.outscale
         self.weight = mx.random.normal((self.out_ch // self.blocks, self.in_ch // self.blocks, self.blocks)) * scale
         self.bias = mx.zeros((self.out_ch,))
 
@@ -65,12 +69,12 @@ class DeterNet(nn.Module):
         in_ch = (4 * cfg.hidden + cfg.deter // cfg.blocks) * cfg.blocks
         layers: list[nn.Module] = []
         for _ in range(cfg.dyn_layers):
-            layers.append(BlockLinear(in_ch, cfg.deter, cfg.blocks))
+            layers.append(BlockLinear(in_ch, cfg.deter, cfg.blocks, outscale=1.0))
             layers.append(RMSNorm(cfg.deter))
             layers.append(nn.SiLU())
             in_ch = cfg.deter
         self.hid = nn.Sequential(*layers)
-        self.gru = BlockLinear(in_ch, 3 * cfg.deter, cfg.blocks)
+        self.gru = BlockLinear(in_ch, 3 * cfg.deter, cfg.blocks, outscale=1.0)
         self.deter = cfg.deter
 
     def __call__(self, stoch: mx.array, deter: mx.array, action: mx.array, d_emb: mx.array) -> mx.array:
@@ -765,7 +769,7 @@ class MLXDreamer(nn.Module):
         self.barlow_lambd        = float(getattr(cfg, "barlow_lambd", 5e-3))
         self.inv_dyn_loss_weight = float(getattr(cfg, "inv_dyn_loss_weight", 1.0))
         self.ctx_len             = int(getattr(cfg, "ctx_len", 16))
-        self.ctx_warmup_steps    = int(getattr(cfg, "ctx_warmup_steps", 1000))
+        self.ctx_warmup_steps    = int(getattr(ctx, "ctx_warmup_steps", 1000))
         self.ctx_consistency_w   = float(getattr(cfg, "ctx_consistency_weight", 1.0))
         self._ctx_updates        = 0
         self._loss_scales        = dict(cfg.loss_scales)
