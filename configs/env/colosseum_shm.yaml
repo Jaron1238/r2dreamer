@@ -1,0 +1,26 @@
+# configs/env/colosseum_shm.yaml
+# Aktiviert die Shared Memory IPC Bridge zu Colosseum (statt airsim RPC).
+# Einbinden mit:  defaults: - env: colosseum_shm
+
+colosseum:
+  enabled: true
+
+  # Namen der POSIX IPC Objekte — müssen identisch mit ShmIPCLayout.h sein
+  shm_name: "/colosseum_ipc"
+  sem_ue:   "/colosseum_ue_wrote"    # UE postet nach jedem Frame
+  sem_py:   "/colosseum_py_wrote"    # Python postet nach jedem Kommando
+
+  vehicle_name: ""                   # Leer = erstes Fahrzeug
+
+  # Downward-Clearance Einstellungen
+  max_clearance: 20.0                # Maximale Höhe [m] für Depth-Normalisierung
+  clearance_ema_alpha: 0.2           # EMA-Glättungsfaktor (0=träge, 1=direkt)
+
+# macOS System V Shared Memory Limits:
+# Das POSIX-Interface (shm_open) hat KEINE 4MB-Beschränkung —
+# diese gilt nur für das ältere System V Interface (shmget).
+# Keine sysctl-Änderungen erforderlich.
+#
+# Falls System V trotzdem gebraucht wird:
+#   sudo sysctl kern.sysv.shmmax=2147483648
+#   sudo sysctl kern.sysv.shmall=524288

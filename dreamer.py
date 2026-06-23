@@ -16,9 +16,7 @@ from networks import Projector
 from optim import LaProp, clip_grad_agc_
 from tools import to_f32
 
-
 _DEFAULT = object()
-
 
 class Dreamer(nn.Module):
     def __init__(self, config):
@@ -26,6 +24,10 @@ class Dreamer(nn.Module):
         self.config = config
         cfg = config.model if hasattr(config, "model") else config
         self.device        = torch.device(getattr(config, "device", getattr(cfg, "device", "cpu")))
+        
+        
+        self._amp_dtype    = torch.bfloat16 if self.device.type == "mps" else torch.float16
+        self._amp_enabled  = self.device.type in ("cuda", "mps")
         self.act_entropy   = float(cfg.act_entropy)
         self.kl_free       = float(cfg.kl_free)
         self.imag_horizon  = int(cfg.imag_horizon)
@@ -35,7 +37,7 @@ class Dreamer(nn.Module):
         self.act_dim       = int(cfg.act_dim)
         self.rep_loss      = str(cfg.rep_loss)
         self.phase         = int(getattr(config, "phase", getattr(cfg, "phase", 1)))
-        self.use_depth     = bool(getattr(config, "use_depth", getattr(cfg, "use_depth", False)))
+        self.use_depth     = bool(getattr(config, "use_depth_aux", getattr(cfg, "use_depth_aux", False)))  # Bug #6 fix: was use_depth
         self.safety_threshold = float(getattr(cfg, "safety_threshold", 0.4))
         self.safety_input_key = str(getattr(cfg, "safety_input_key", "image"))
         hover_throttle = float(getattr(cfg, "hover_throttle", 0.5))
@@ -50,16 +52,34 @@ class Dreamer(nn.Module):
         self.use_latent_goals = bool(getattr(cfg, "use_latent_goals", True))
         self.latent_goal_noise_scale = float(getattr(cfg, "latent_goal_noise_scale", 0.2))
 
+        # RSSM encoder resolution (img_height/width) and SafetyNet resolution (safety_img_height/width)
+        _rssm_h = int(cfg.img_height)
+        _rssm_w = int(cfg.img_width)
+        _safe_h = int(getattr(cfg, "safety_img_height", _rssm_h))
+        _safe_w = int(getattr(cfg, "safety_img_width",  _rssm_w))
+
         shapes = {
-            "image": (int(cfg.img_height), int(cfg.img_width), 6)
+            "image": (_rssm_h, _rssm_w, 6)
         }
         if bool(getattr(cfg, "use_cam_overlay", False)):
-            shapes["cam_overlay"] = (int(cfg.img_height), int(cfg.img_width), 1)
+            shapes["cam_overlay"] = (_rssm_h, _rssm_w, 1)
+
+        # Auto-detect per-frame channel count from dataset.raw_image_mode:
+        #   "grayscale" → 1,  "rgb" → 3,  anything else → fallback to cfg.safety_in_channels or 1.
+        # This avoids manually keeping safety_in_channels in sync with raw_image_mode.
+        _RAW_MODE_CHANNELS = {"grayscale": 1, "rgb": 3}
+        _dataset_cfg = getattr(cfg, "dataset", None)
+        _raw_image_mode = str(getattr(_dataset_cfg, "raw_image_mode", "grayscale")).lower()
+        _safety_channels_per_frame: int = _RAW_MODE_CHANNELS.get(
+            _raw_image_mode,
+            int(getattr(cfg, "safety_in_channels", 1)),  # legacy fallback only
+        )
+
         if self.safety_input_key == "raw_image":
             shapes["raw_image"] = (
-                int(cfg.img_height),
-                int(cfg.img_width),
-                int(getattr(cfg, "safety_in_channels", 1)),
+                _safe_h,
+                _safe_w,
+                _safety_channels_per_frame,
             )
 
         self.encoder    = networks.MultiEncoder(cfg.encoder, shapes)
@@ -75,31 +95,60 @@ class Dreamer(nn.Module):
 
         self._loss_scales = dict(cfg.loss_scales)
         self._log_grads   = bool(cfg.log_grads)
-        self.num_drones = int(cfg.get("num_drone_classes", 10))
+        self.num_drones = int(cfg.get("num_drones", 100))
         self.drone_embed = nn.Embedding(self.num_drones, self.drone_embed_dim)
         self.ctx_len = int(getattr(cfg, "ctx_len", 16))
         self.ctx_consistency_weight = float(getattr(cfg, "ctx_consistency_weight", 0.1))
         self.ctx_warmup_steps = int(getattr(cfg, "ctx_warmup_steps", 1000))
         self._ctx_updates = 0
+        ctx_encoder_type = str(getattr(cfg, "ctx_encoder_type", "gru"))
         self.context_encoder = networks.ContextEncoder(
-            self.rssm.flat_stoch, self.rssm._deter, self.act_dim, ctx_len=self.ctx_len, out_dim=self.drone_embed_dim
+            self.rssm.flat_stoch, self.rssm._deter, self.act_dim,
+            ctx_len=self.ctx_len, out_dim=self.drone_embed_dim,
+            encoder_type=ctx_encoder_type,
+        )
+        self.inv_dyn_loss_weight = float(getattr(cfg, "inv_dyn_loss_weight", 1.0))
+        self.inv_dyn_head = networks.InverseDynamicsHead(
+            feat_dim=self.rssm.feat_size,
+            d_emb_dim=self.drone_embed_dim,
+            act_dim=self.act_dim,
         )
         self.safety_net = networks.SafetyNet(
             in_channels=shapes[self.safety_input_key][-1],
             action_dim=self.act_dim,
             speed_dim=1,
+            frame_stack=int(getattr(cfg, "safety_frame_stack", 3)),
         )
+        
+        self._safety_C = shapes[self.safety_input_key][-1]
+        self._safety_H = _safe_h
+        self._safety_W = _safe_w
         self.use_depth_aux = bool(getattr(cfg, "use_depth_aux", False))
         self.use_depth_aux_prob = float(getattr(cfg, "use_depth_aux_prob", 1.0))
         if self.phase >= 3 and self.use_depth_aux:
             self.depth_aux_head = networks.DepthAuxHead(
                 in_dim=self.rssm.flat_stoch + self.rssm._deter,
-                out_h=int(cfg.img_height),
-                out_w=int(cfg.img_width),
+                out_h=_rssm_h,
+                out_w=_rssm_w,
             )
         actor_input_dim = self.rssm.feat_size + self.drone_embed_dim
         self.actor = networks.MLPHead(cfg.actor, actor_input_dim)
         self.value = networks.MLPHead(cfg.critic, actor_input_dim)
+        # Bug #13 fix: wire nightly VLA-Heads when vla_enabled=True in config
+        self.vla_enabled = bool(getattr(cfg, "vla_enabled", False))
+        if self.vla_enabled:
+            from nightly.vla_heads import build_vla_heads, TextEncoder
+            _text_model = str(getattr(cfg, "vla_text_model", "all-MiniLM-L6-v2"))
+            self.text_encoder = TextEncoder(model_name=_text_model)
+            _text_dim = self.text_encoder.embed_dim
+            self.actor, self.reward, self.value = build_vla_heads(
+                cfg,
+                actor_input_dim=actor_input_dim,
+                reward_input_dim=self.rssm.feat_size,
+                value_input_dim=actor_input_dim,
+                text_dim=_text_dim,
+            )
+            print(f"[Dreamer] VLA-Heads aktiv | text_model={_text_model} | text_dim={_text_dim}")
         self.latent_goal_buffer_size = int(getattr(cfg, "latent_goal_buffer_size", 65536))
         self.register_buffer(
             "_goal_feat_buffer",
@@ -126,6 +175,7 @@ class Dreamer(nn.Module):
             "encoder": self.encoder,
             "drone_embed": self.drone_embed, 
             "context_encoder": self.context_encoder,
+            "inv_dyn_head": self.inv_dyn_head,
             "safety_net": self.safety_net,
         }
         if self.phase >= 3 and self.use_depth_aux:
@@ -222,7 +272,9 @@ class Dreamer(nn.Module):
         self._opt_betas = (float(cfg.beta1), float(cfg.beta2))
         self._opt_eps   = float(cfg.eps)
         self._optimizer = self._build_optimizer()
-        self._scaler = GradScaler()
+        
+        
+        self._scaler = GradScaler(enabled=self.device.type == "cuda")
 
         def lr_lambda(step):
             if cfg.warmup:
@@ -289,13 +341,15 @@ class Dreamer(nn.Module):
         if not encoder_named_params:
             return []
 
+        # Bug #8 fix: actual param paths are .backbone_early. / .backbone_late.
+        # not .backbone. — so the original substring never matched.
         backbone_params = [
             param for name, param in encoder_named_params
-            if ".backbone." in name
+            if ".backbone_early." in name or ".backbone_late." in name
         ]
         adapter_params = [
             param for name, param in encoder_named_params
-            if ".backbone." not in name
+            if ".backbone_early." not in name and ".backbone_late." not in name
         ]
 
         param_groups = []
@@ -397,6 +451,7 @@ class Dreamer(nn.Module):
             drone_id = torch.zeros(*batch_shape, dtype=torch.long, device=device or self.device)
         else:
             drone_id = drone_id.to(device=device or self.device, dtype=torch.long)
+            drone_id = drone_id % self.num_drones  # guard against out-of-range ids
         return module(drone_id)
 
     @torch.no_grad()
@@ -409,7 +464,10 @@ class Dreamer(nn.Module):
         )
         if self.phase >= 3:
             ctx_ready = state["ctx_valid_steps"] >= self.ctx_len
-            ctx_d_emb = self.context_encoder(state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"])
+            ctx_d_emb = self.context_encoder(
+                state["ctx_flat_stoch"], state["ctx_deter"], state["ctx_action"],
+                valid_len=state["ctx_valid_steps"],   
+            )
             d_emb = torch.where(ctx_ready.unsqueeze(-1), ctx_d_emb, teacher_d_emb)
         else:
             d_emb = teacher_d_emb
@@ -424,13 +482,45 @@ class Dreamer(nn.Module):
         action_dist  = self._frozen_actor(policy_input)
         action       = action_dist.mode if eval else action_dist.rsample()
         speed = obs.get("speed", torch.zeros(*action.shape[:-1], 1, device=action.device))
-        safety_image = p_obs.get(self.safety_input_key, p_obs["image"])
-        img_t = safety_image.unsqueeze(1)
-        speed_t = speed.unsqueeze(1)
-        action_t = action.unsqueeze(1)
-        safety_score = self.safety_net(img_t, speed_t, action_t).squeeze(1)
-        brake = self.brake_vector.view(*([1] * (action.ndim - 1)), -1).expand_as(action)
-        action = torch.where(safety_score > self.safety_threshold, brake, action)
+        safety_image = p_obs.get(self.safety_input_key, p_obs["image"])   
+
+        
+        fs = self.safety_net.frame_stack
+        
+        
+        prev_frames = state.get("safety_frame_buf", None)
+        if prev_frames is None:
+            prev_frames = torch.zeros(
+                safety_image.shape[0], fs - 1,
+                *safety_image.shape[1:],
+                dtype=safety_image.dtype, device=safety_image.device,
+            )
+        
+        stacked_frames = torch.cat([prev_frames, safety_image.unsqueeze(1)], dim=1)
+        
+        B_s = stacked_frames.shape[0]
+        stacked_img = (
+            stacked_frames
+            .permute(0, 2, 3, 1, 4)          
+            .contiguous()
+            .reshape(B_s, self._safety_H, self._safety_W, -1)  
+        )
+        
+        safety_prob, safe_action_raw = self.safety_net(
+            stacked_img.unsqueeze(1),          
+            speed.unsqueeze(1),                
+            action.unsqueeze(1),               
+        )
+        
+        safety_score   = torch.sigmoid(safety_prob.squeeze(1))  
+        safe_action_ev = safe_action_raw.squeeze(1)              
+
+        
+        danger_mask = (safety_score > self.safety_threshold)   
+        action = torch.where(danger_mask, safe_action_ev, action)
+
+        
+        new_frame_buf = stacked_frames[:, 1:, ...].contiguous()  
         flat_stoch = stoch.reshape(stoch.shape[0], -1)
         ctx_flat_stoch = torch.cat([state["ctx_flat_stoch"][:, 1:], flat_stoch.unsqueeze(1)], dim=1)
         ctx_deter = torch.cat([state["ctx_deter"][:, 1:], deter.unsqueeze(1)], dim=1)
@@ -446,9 +536,25 @@ class Dreamer(nn.Module):
                 "ctx_deter": ctx_deter,
                 "ctx_action": ctx_action,
                 "ctx_valid_steps": ctx_valid_steps,
+                "safety_frame_buf": new_frame_buf,
             },
             batch_size=state.batch_size,
         )
+
+    @staticmethod
+    def _stack_frames(x: torch.Tensor, n: int = 3) -> torch.Tensor:
+        
+
+        frames = []
+        for i in range(n):
+            shift = n - 1 - i           
+            if shift > 0:
+                pad     = torch.zeros_like(x[:, :shift])
+                shifted = torch.cat([pad, x[:, :-shift]], dim=1)
+            else:
+                shifted = x
+            frames.append(shifted)
+        return torch.cat(frames, dim=-1)  
 
     @torch.no_grad()
     def get_initial_state(self, B):
@@ -458,6 +564,11 @@ class Dreamer(nn.Module):
         ctx_deter = torch.zeros(B, self.ctx_len, self.rssm._deter, dtype=torch.float32, device=self.device)
         ctx_action = torch.zeros(B, self.ctx_len, self.act_dim, dtype=torch.float32, device=self.device)
         ctx_valid_steps = torch.zeros(B, dtype=torch.long, device=self.device)
+        fs = self.safety_net.frame_stack
+        safety_frame_buf = torch.zeros(
+            B, fs - 1, self._safety_H, self._safety_W, self._safety_C,
+            dtype=torch.float32, device=self.device,
+        )
         return TensorDict(
             {
                 "stoch": stoch,
@@ -468,6 +579,7 @@ class Dreamer(nn.Module):
                 "ctx_deter": ctx_deter,
                 "ctx_action": ctx_action,
                 "ctx_valid_steps": ctx_valid_steps,
+                "safety_frame_buf": safety_frame_buf,
             }, batch_size=(B,)
         )
 
@@ -535,8 +647,8 @@ class Dreamer(nn.Module):
 
         autocast_context = autocast(
             device_type=self.device.type,
-            dtype=torch.float16,
-            enabled=autocast_enabled,
+            dtype=self._amp_dtype,
+            enabled=autocast_enabled and self._amp_enabled,
         )
         with autocast_context:
             (stoch, deter), loss, mets = self.compute_losses(data, initial)
@@ -639,13 +751,57 @@ class Dreamer(nn.Module):
         if self.phase == 2:
             with torch.no_grad():
                 embed = self.encoder(data)
-                d_emb = self.drone_embed(data["drone_id"])
+                # Phase 2 is unsupervised: ignore drone_id, let Barlow Twins
+                # disentangle physics via the context encoder instead.
+                d_emb = self._get_drone_embedding(
+                    None, batch_shape=data["action"].shape[:2], device=embed.device
+                )
                 post_stoch, post_deter, post_logit = self.rssm.observe(
                     embed, data["action"], initial, data["is_first"], d_emb
                 )
         else:
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+
             embed = self.encoder(data)
-            d_emb = self.drone_embed(data["drone_id"])
+
+            with torch.no_grad():
+                d_emb_static = self.drone_embed(data["drone_id"])     
+                post_stoch_w, post_deter_w, _ = self.rssm.observe(
+                    embed.detach(), data["action"], initial, data["is_first"], d_emb_static
+                )
+
+            
+            
+            
+            
+            
+            ctx_end = min(T, self.ctx_len)                             
+            flat_warm_stoch = post_stoch_w.reshape(B, T, -1)
+            d_emb_ctx = self.context_encoder(                          
+                flat_warm_stoch[:, :ctx_end],
+                post_deter_w[:, :ctx_end],
+                data["action"][:, :ctx_end],
+            )
+            d_emb = d_emb_ctx.unsqueeze(1).expand(-1, T, -1)          
+
+            
             post_stoch, post_deter, post_logit = self.rssm.observe(
                 embed, data["action"], initial, data["is_first"], d_emb
             )
@@ -658,8 +814,43 @@ class Dreamer(nn.Module):
         feat = self.rssm.get_feat(post_stoch, post_deter)
         self._update_goal_feat_buffer(feat.detach().reshape(-1, self.rssm.feat_size))
         flat_post_stoch = post_stoch.reshape(B, T, -1)
-        ctx_student = self.context_encoder(flat_post_stoch, post_deter, data["action"])
+        if self.phase == 2:
+            
+            ctx_end = min(T, self.ctx_len)
+            ctx_student = self.context_encoder(
+                flat_post_stoch[:, :ctx_end], post_deter[:, :ctx_end], data["action"][:, :ctx_end]
+            )
+        else:
+            
+            ctx_student = d_emb_ctx  
         ctx_student_time = ctx_student.unsqueeze(1).expand(-1, T, -1)
+
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        if self.phase != 2 and T > 1:
+            inv_end = min(T - 1, self.ctx_len - 1)                    
+            feat_t  = feat[:, :inv_end].detach()                      
+            feat_t1 = feat[:, 1:inv_end + 1].detach()                 
+            d_emb_inv = d_emb[:, :inv_end]                            
+
+            pred_action = self.inv_dyn_head(feat_t, feat_t1, d_emb_inv)    
+            actions_target = data["action"][:, :inv_end]                    
+
+            inv_dyn_mse = F.mse_loss(pred_action, actions_target, reduction="none").mean(dim=-1)  
+
+            valid_mask_inv = (
+                burn_in_mask[:, :inv_end] if burn_in_mask is not None
+                else torch.ones(B, inv_end, dtype=torch.bool, device=feat.device)
+            )
+            losses["inv_dyn"] = self.inv_dyn_loss_weight * networks.masked_mean(inv_dyn_mse, valid_mask_inv)
+
         if self.rep_loss == "dreamer":
             recon_losses = {
                 key: torch.mean(-dist.log_prob(data[key]))
@@ -682,17 +873,16 @@ class Dreamer(nn.Module):
             losses["infonce"] = torch.nn.functional.cross_entropy(norm_logits, labels)
         elif self.rep_loss == "nedreamer":
             state_seq = self.rssm.get_feat(post_stoch, post_deter)
-            prev_actions = torch.cat(
-                [torch.zeros(B, 1, self.act_dim, device=data["action"].device, dtype=data["action"].dtype), data["action"][:, :-1]],
-                dim=1,
-            )
-            tr_out = self.nedreamer_transformer(state_seq, prev_actions)
-            pred = self.nedreamer_predictor(tr_out[:, :-1])
+            actions = data["action"]
+            tr_out = self.nedreamer_transformer(state_seq, actions)
+
             with torch.no_grad():
                 if getattr(self, "use_ema_target", False):
                     target_embed = self.target_encoder(data)
                 else:
-                    target_embed = self.encoder(data)
+                    target_embed = self.encoder(data).detach()  
+
+            pred = self.nedreamer_predictor(tr_out[:, :-1])
             target = target_embed[:, 1:]
             valid = (~data["is_terminal"][:, :-1].bool()).reshape(-1)
             if burn_in_mask is not None:
@@ -700,9 +890,7 @@ class Dreamer(nn.Module):
             flat_pred = pred.reshape(B * (T - 1), -1)
             flat_target = target.reshape(B * (T - 1), -1)
             if valid.any():
-                flat_pred = flat_pred[valid]
-                flat_target = flat_target[valid]
-                losses["nedreamer"], barlow_metrics = self.barlow_loss(flat_pred, flat_target)
+                losses["nedreamer"], barlow_metrics = self.barlow_loss(flat_pred[valid], flat_target[valid])
             else:
                 losses["nedreamer"] = torch.zeros((), device=pred.device, dtype=pred.dtype)
                 barlow_metrics = {"barlow/invariance": 0.0, "barlow/redundancy": 0.0, "barlow/std_mean": 0.0}
@@ -739,18 +927,34 @@ class Dreamer(nn.Module):
             actor_dist = self.actor(policy_input)
             bc_loss = -actor_dist.log_prob(data["action"])
             losses["bc"] = networks.masked_mean(bc_loss, burn_in_mask)
-            losses["ctx_align"] = torch.mean((ctx_student_time - d_emb.detach()) ** 2)
+            # Unsupervised: self-supervise the context encoder via Barlow Twins on
+            # two non-overlapping time windows instead of pulling toward a zero embedding.
+            mid = ctx_end // 2
+            if mid > 0 and ctx_end - mid > 0:
+                z_a = self.context_encoder(
+                    flat_post_stoch[:, :mid], post_deter[:, :mid], data["action"][:, :mid]
+                )
+                z_b = self.context_encoder(
+                    flat_post_stoch[:, mid:ctx_end], post_deter[:, mid:ctx_end],
+                    data["action"][:, mid:ctx_end],
+                )
+                losses["ctx_barlow"], ctx_barlow_metrics = self.barlow_loss(z_a, z_b.detach())
+                metrics.update({f"ctx/{k.split('/')[-1]}": v for k, v in ctx_barlow_metrics.items()})
+            else:
+                losses["ctx_barlow"] = torch.zeros((), device=feat.device)
 
             speed = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
             crash_target = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
             safety_image = data.get(self.safety_input_key, data["image"])
-            safety_pred = self.safety_net(safety_image, speed, data["action"])
+
+            
+            safety_image_stacked = self._stack_frames(safety_image, n=self.safety_net.frame_stack)
+            
+            safety_logit, _ = self.safety_net(safety_image_stacked, speed, data["action"])
+
             focal_alpha = 0.8
             focal_gamma = 2.0
-            eps = 1e-4
-            safety_prob = torch.clamp(safety_pred, min=eps, max=1.0 - eps)
-            safety_logits = torch.logit(safety_prob)
-            bce = F.binary_cross_entropy_with_logits(safety_logits, crash_target, reduction="none")
+            bce = F.binary_cross_entropy_with_logits(safety_logit, crash_target, reduction="none")
             p_t = torch.exp(-bce)
             alpha_t = crash_target * focal_alpha + (1.0 - crash_target) * (1.0 - focal_alpha)
             focal_loss = alpha_t * ((1.0 - p_t) ** focal_gamma) * bce
@@ -759,17 +963,16 @@ class Dreamer(nn.Module):
             if "inj_raw_image" in data:
                 inj_speed = torch.zeros_like(speed)
                 inj_action = torch.zeros_like(data["action"])
-                inj_pred = self.safety_net(data["inj_raw_image"], inj_speed, inj_action)
-                inj_prob = torch.clamp(inj_pred, min=eps, max=1.0 - eps)
-                inj_logits = torch.logit(inj_prob)
+                inj_img_stacked = self._stack_frames(data["inj_raw_image"], n=self.safety_net.frame_stack)
+                inj_logit, _ = self.safety_net(inj_img_stacked, inj_speed, inj_action)
                 inj_target = data["inj_crash"]
-                inj_bce = F.binary_cross_entropy_with_logits(inj_logits, inj_target, reduction="none")
+                inj_bce = F.binary_cross_entropy_with_logits(inj_logit, inj_target, reduction="none")
                 inj_pt = torch.exp(-inj_bce)
                 inj_alpha = inj_target * focal_alpha + (1.0 - inj_target) * (1.0 - focal_alpha)
                 inj_loss = torch.mean(inj_alpha * ((1.0 - inj_pt) ** focal_gamma) * inj_bce)
                 losses["safety"] = losses["safety"] + inj_loss
 
-            metrics["safety/score_mean"] = safety_prob.mean()
+            metrics["safety/score_mean"] = torch.sigmoid(safety_logit).mean()
             metrics["bc/mse"] = losses["bc"].detach()
         elif self.phase >= 3:
             self._ctx_updates += 1
@@ -788,7 +991,7 @@ class Dreamer(nn.Module):
             d_emb_imag = flat_d_emb
             goal_feat = self._sample_goal_feat(post_stoch.detach(), post_deter.detach(), batch_size=d_emb_imag.shape[0])
             with torch.no_grad():
-                with autocast(device_type=self.device.type, dtype=torch.float16, enabled=True):
+                with autocast(device_type=self.device.type, dtype=self._amp_dtype, enabled=self._amp_enabled):
                     imag_feat, imag_action, imag_goal_reward = self._imagine(
                         start, self.imag_horizon + 1, d_emb_imag, goal_feat=goal_feat
                     )
@@ -835,7 +1038,13 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(imag_action, "action"))
             last, term, reward = (to_f32(data["is_last"]), to_f32(data["is_terminal"]), to_f32(data["reward"]))
             feat = self.rssm.get_feat(post_stoch, post_deter)
-            boot = ret[:, 0].reshape(B, -1, 1)[:, :T]
+            # Fix Bug #3: reshape(B, -1, 1)[:, :T] silently yields (B, T_valid, 1)
+            # when burn_in_mask is active (T_valid < T), causing the assert in
+            # _lambda_return() to fire. Scatter via flat_mask to restore (B, T, 1).
+            boot_flat_vals = ret[:, 0]                        # (N, 1) where N = B*T_valid
+            boot = torch.zeros(B * T, 1, device=boot_flat_vals.device, dtype=boot_flat_vals.dtype)
+            boot[flat_mask] = boot_flat_vals
+            boot = boot.reshape(B, T, 1)                      # always (B, T, 1)
             replay_policy_input = torch.cat([feat, d_emb], dim=-1)
             value = self._frozen_value(replay_policy_input).mode
             slow_value = self._frozen_slow_value(replay_policy_input).mode
@@ -851,11 +1060,61 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(ret, "ret_replay"))
             metrics.update(tools.tensorstats(value, "value_replay"))
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
-            half = max(1, T // 2)
+            
+            
+            
+            half = min(max(1, T // 2), self.ctx_len)
             z_a = self.context_encoder(flat_post_stoch[:, :half], post_deter[:, :half], data["action"][:, :half])
-            z_b = self.context_encoder(flat_post_stoch[:, half:], post_deter[:, half:], data["action"][:, half:])
+            z_b = self.context_encoder(flat_post_stoch[:, T - half:], post_deter[:, T - half:], data["action"][:, T - half:])
             warm = min(1.0, self._ctx_updates / max(1, self.ctx_warmup_steps))
             losses["ctx_consistency"] = self.ctx_consistency_weight * warm * torch.mean((z_a - z_b.detach()) ** 2)
+
+            
+            
+            _safety_image   = data.get(self.safety_input_key, data["image"])
+            _safety_stacked = self._stack_frames(_safety_image, n=self.safety_net.frame_stack)
+            _speed          = data.get("speed", torch.zeros(B, T, 1, device=feat.device))
+            _crash_target   = data.get("crash", to_f32(data["is_terminal"]).unsqueeze(-1))
+            safety_logit_p3, safe_action_pred = self.safety_net(
+                _safety_stacked, _speed, data["action"]
+            )
+            _fa, _fg = 0.8, 2.0
+            _bce = F.binary_cross_entropy_with_logits(
+                safety_logit_p3, _crash_target, reduction="none"
+            )
+            _pt = torch.exp(-_bce)
+            _at = _crash_target * _fa + (1.0 - _crash_target) * (1.0 - _fa)
+            losses["safety"] = torch.mean(_at * ((1.0 - _pt) ** _fg) * _bce)
+            metrics["safety/score_mean"] = torch.sigmoid(safety_logit_p3).mean()
+
+            
+            
+            
+            
+            
+            if "expert_evasion" in data:
+                expert_ev     = data["expert_evasion"].to(feat.device)   
+                expert_active = data.get(
+                    "expert_active",
+                    
+                    (torch.sigmoid(safety_logit_p3.detach()).squeeze(-1) > 0.3).float(),
+                )                                                          
+                if expert_active.dim() == 3:
+                    expert_active = expert_active.squeeze(-1)              
+
+                
+                expert_active_exp = expert_active.unsqueeze(-1)           
+                distill_target = expert_active_exp * expert_ev.detach()   
+
+                
+                distill_loss = (safe_action_pred - distill_target) ** 2   
+                
+                sample_weight = expert_active_exp + (1.0 - expert_active_exp) * 0.1
+                losses["safety_distill"] = (distill_loss * sample_weight).mean()
+
+                metrics["safety/distill_danger_frac"] = expert_active.mean()
+                metrics["safety/distill_loss"]        = losses["safety_distill"].detach()
+
             if bool(getattr(self.config.model, "use_depth_aux", False)) and "depth_target" in data:
                 use_depth_aux_now = self.use_depth_aux_prob >= 1.0 or torch.rand((), device=feat.device) < self.use_depth_aux_prob
                 metrics["depth_aux/active"] = float(use_depth_aux_now)
@@ -911,16 +1170,16 @@ class Dreamer(nn.Module):
         else:
             feat_pool = self.rssm.get_feat(post_stoch, post_deter).reshape(-1, self.rssm.feat_size)
 
-        # Distance-Weighting: prefer goals in the reachable middle range
-        current_feat = feat_pool.mean(dim=0, keepdim=True)  # representative current state
+        
+        current_feat = feat_pool.mean(dim=0, keepdim=True)  
         dists = 1.0 - F.cosine_similarity(
             current_feat.expand(feat_pool.shape[0], -1), feat_pool, dim=-1
-        )  # (N,) — 0=identical, 1=opposite
+        )  
         weights = torch.zeros_like(dists)
-        mask = (dists > 0.2) & (dists < 0.8)  # Goldilocks zone: not trivial, not impossible
+        mask = (dists > 0.2) & (dists < 0.8)  
         weights[mask] = 1.0
         if weights.sum() == 0:
-            weights = torch.ones_like(dists)  # fallback: uniform sampling
+            weights = torch.ones_like(dists)  
 
         idx = torch.multinomial(weights, batch_size, replacement=True)
         goals = feat_pool[idx]
@@ -950,18 +1209,18 @@ class Dreamer(nn.Module):
         goal_reward = None
         if goal_feat is not None:
             goal_feat = goal_feat.unsqueeze(1).expand(-1, feats.shape[1], -1)
-            sim = F.cosine_similarity(feats, goal_feat, dim=-1)  # (B, T)
+            sim = F.cosine_similarity(feats, goal_feat, dim=-1)  
 
-            # Progress bonus: reward getting closer to goal each step
-            progress = sim[:, 1:] - sim[:, :-1]                 # (B, T-1)
-            progress = F.pad(progress, (1, 0), value=0.0)        # (B, T) — first step = 0
+            
+            progress = sim[:, 1:] - sim[:, :-1]                 
+            progress = F.pad(progress, (1, 0), value=0.0)        
 
-            goal_reward = (sim * 0.7 + progress * 0.3).unsqueeze(-1)  # (B, T, 1)
+            goal_reward = (sim * 0.7 + progress * 0.3).unsqueeze(-1)  
         return feats, actions, goal_reward
 
-    # Lambda-return recurrence over time (B, T):
-    #   a_t = interm[:, t], b_t = (live * cont)[:, t], R_t = a_t + b_t * R_{t+1}, R_T = boot[:, -1].
-    # Inputs are (B, T) and output keeps the existing caller contract: returns.shape == (B, T-1).
+    
+    
+    
     @torch.no_grad()
     def _lambda_return(self, last, term, reward, value, boot, disc, lamb):
         assert last.shape == term.shape == reward.shape == value.shape == boot.shape
@@ -971,7 +1230,7 @@ class Dreamer(nn.Module):
         a = interm
         b = live * cont
 
-        # Forward scan over reversed time for compile-friendly carry update.
+        
         a_rev = torch.flip(a, dims=(1,))
         b_rev = torch.flip(b, dims=(1,))
         ret_rev = torch.empty_like(a_rev)
@@ -1011,13 +1270,13 @@ class Dreamer(nn.Module):
         return data
 
     def _configure_trainable_modules(self):
-        # Phase 1: world model only; no policy/value updates.
+        
         if self.phase == 1:
             for p in self.actor.parameters():
                 p.requires_grad = False
             for p in self.value.parameters():
                 p.requires_grad = False
-        # Phase 2: freeze encoder/rssm, train actor via BC and safety net.
+        
         elif self.phase == 2:
             for p in self.encoder.parameters():
                 p.requires_grad = False

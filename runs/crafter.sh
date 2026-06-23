@@ -1,14 +1,12 @@
 #!/bin/bash
 
-# ==== Common settings ====
 GPU_ID=0
-DATE=$(date +%m%d) # auto complete
+DATE=$(date +%m%d)
 SEED_START=0
 SEED_END=400
 SEED_STEP=100
 METHOD=r2dreamer
 
-# ==== Run loop ====
 for seed in $(seq $SEED_START $SEED_STEP $SEED_END)
 do
     CUDA_VISIBLE_DEVICES=$GPU_ID python train.py \

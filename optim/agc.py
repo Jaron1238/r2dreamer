@@ -11,12 +11,11 @@ from torch.utils._foreach_utils import (
 
 _tensor_or_tensors = Union[torch.Tensor, Iterable[torch.Tensor]]
 
-
 def clip_grad_agc_(parameters: _tensor_or_tensors, clip: float, pmin: float, foreach: bool | None = None):
     if isinstance(parameters, torch.Tensor):
         parameters = [parameters]
     else:
-        # prevent generators from being exhausted
+        
         parameters = list(parameters)
     params = []
     grads = []
@@ -31,7 +30,7 @@ def clip_grad_agc_(parameters: _tensor_or_tensors, clip: float, pmin: float, for
         tuple[torch.device, torch.dtype], tuple[list[list[Tensor]], list[int]]
     ] = _group_tensors_by_device_and_dtype(
         [params, grads]
-    )  # type: ignore[assignment]
+    )  
 
     for (device, _), ([device_params, device_grads], _) in grouped.items():
         if (foreach is None and _has_foreach_support(device_grads, device)) or (

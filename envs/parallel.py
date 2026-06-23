@@ -13,7 +13,6 @@ from tensordict import TensorDict
 
 import tools
 
-
 class ParallelEnv:
     def __init__(self, constructor, env_num, device):
         self.envs = [Parallel(constructor(i), "process") for i in range(env_num)]
@@ -38,14 +37,8 @@ class ParallelEnv:
         return td
 
     def step(self, action, done):
-        """Step all environments.
+        
 
-        Notes
-        -----
-        This implementation intentionally steps the environment processes on CPU.
-        The returned TensorDict is pinned in CPU memory so that the caller can
-        transfer it to GPU asynchronously (H2D with non_blocking=True).
-        """
         promise = [e.reset() if d else e.step(a) for e, a, d in zip(self.envs, tools.to_np(action), done)]
         new_o, new_r, new_d = [], [], []
         for p, d in zip(promise, done):
@@ -60,16 +53,15 @@ class ParallelEnv:
                 new_d.append(d)
         obs_stacked = {k: np.stack([o[k] for o in new_o]) for k in new_o[0].keys()}
 
-        # Build CPU tensors first to avoid implicit GPU syncs and enable async H2D in caller.
+        
         obs_tensors = {k: torch.as_tensor(v, device="cpu") for k, v in obs_stacked.items()}
         rew_stacked = torch.as_tensor(new_r, dtype=torch.float32, device="cpu")
 
-        # Keep data on CPU; caller will .to(device, non_blocking=True) after pinning.
-        # TensorDict batch size is (B,).
+        
+        
         td = TensorDict({**obs_tensors, "reward": rew_stacked}, batch_size=(self.env_num,), device="cpu").pin_memory()
         done = torch.as_tensor(new_d, device="cpu")
         return self.lift_dim(td), done
-
 
 class Parallel:
     def __init__(self, constructor, strategy):
@@ -96,7 +88,7 @@ class Parallel:
 
     @staticmethod
     def _respond(constructor, state, message, name, *args, **kwargs):
-        state = state or constructor()  # Instantiate at first time
+        state = state or constructor()  
         if message == PMessage.CALLABLE:
             assert not args and not kwargs, (args, kwargs)
             result = callable(getattr(state, name))
@@ -107,12 +99,10 @@ class Parallel:
             result = getattr(state, name)
         return state, result
 
-
 class PMessage(enum.Enum):
     CALLABLE = 2
     CALL = 3
     READ = 4
-
 
 class Worker:
     initializers = []
@@ -132,7 +122,7 @@ class Worker:
         self.promise = None
 
     def __call__(self, *args, **kwargs):
-        self.promise and self.promise()  # Raise previous exception if any.
+        self.promise and self.promise()  
         self.promise = self.impl(*args, **kwargs)
         return self.promise
 
@@ -141,7 +131,6 @@ class Worker:
 
     def close(self):
         self.impl.close()
-
 
 class ProcessPipeWorker:
     def __init__(self, fn, initializers=(), daemon=False):
@@ -171,7 +160,7 @@ class ProcessPipeWorker:
             self._pipe.send((Message.STOP, self._nextid, None))
             self._pipe.close()
         except (AttributeError, OSError):
-            pass  # The connection was already closed.
+            pass  
         try:
             self._process.join(0.1)
             if self._process.exitcode is None:
@@ -215,7 +204,7 @@ class ProcessPipeWorker:
             [fn() for fn in initializers]
             while True:
                 if not pipe.poll(0.1):
-                    continue  # Wake up for keyboard interrupts.
+                    continue  
                 message, callid, payload = pipe.recv()
                 if message == Message.STOP:
                     return
@@ -237,14 +226,12 @@ class ProcessPipeWorker:
             with contextlib.suppress(Exception):
                 pipe.close()
 
-
 class Message(enum.Enum):
     OK = 1
     RUN = 2
     RESULT = 3
     STOP = 4
     ERROR = 5
-
 
 class Future:
     def __init__(self, receive, callid):

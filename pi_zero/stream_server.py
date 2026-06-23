@@ -1,12 +1,7 @@
-#!/usr/bin/env python3
-"""
-Läuft auf dem Raspberry Pi Zero 2W.
-Streamt H.264 via GStreamer UDP an MacBook.
-"""
+
 
 import argparse
 import subprocess
-
 
 def start_stream(host: str, port: int, width: int, height: int, fps: int):
     pipeline = (
@@ -23,7 +18,6 @@ def start_stream(host: str, port: int, width: int, height: int, fps: int):
         proc.wait()
     except KeyboardInterrupt:
         proc.terminate()
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

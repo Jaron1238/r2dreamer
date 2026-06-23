@@ -9,13 +9,16 @@ seed: 0
 deterministic_run: False
 device: 'cuda'
 phase: 1
-use_depth: True
+# Depth is now an optional auxiliary supervision signal for the depth_aux_head.
+# The main RSSM image is always 6-channel RGB+diff regardless of this flag.
+use_depth_aux: False
 
 hydra:
   run:
     dir: ${logdir}
 
 env:
+  reward_curriculum_phase: 0  # 0=conservative, 1=balanced, 2=aggressive (independent of training phase)
   encoder:
     mlp_keys: '$^'
     cnn_keys: 'image'
@@ -24,7 +27,7 @@ env:
     cnn_keys: 'image'
 
 batch_size: 1
-batch_length: 64
+batch_length: 256
 
 buffer:
   batch_size: ${batch_size}
@@ -35,13 +38,13 @@ buffer:
 
 trainer:
   steps: 100000
-  batch_per_gpu: 1
-  batch_length: 64
+  batch_per_gpu: 4
+  batch_length: 256
   checkpoint_every: 500
   log_every: 50
   num_workers: 4
-  accumulation_steps: 16
-  burn_in_steps: 5
+  accumulation_steps: 6
+  burn_in_steps: 16
   augmentation:
     noise_std: 0.05
     depth_noise_std: 0.02
@@ -60,24 +63,28 @@ dataset:
   shuffle_buffer: 10000
   raw_image_mode: 'grayscale' # grayscale|rgb
   raw_dataset:
-    enabled: true
-    source: "folders" # folders|streaming
-    root: "./dataset_temp/event_clips/crashes"
+    enabled: false  # set true only when local crash folders exist; cloud runs use streaming instead
     hf_repo: ""
     split: "train"
     streaming: true
-  require_osd: true
+  require_osd: false  # OSD-Werte werden in der Loss-Funktion nicht genutzt; true würde ~90% der Daten filtern
 
 model:
-  img_height: 256
-  img_width: 256
+  img_height: 288          # RSSM encoder/decoder resolution (Landscape: H=288, W=512)
+  img_width: 512
+  safety_img_height: 720   # SafetyNet resolution (Landscape: H=720, W=1280) (höher für obstacle detection)
+  safety_img_width: 1280
+  act_dim: 4               # Anzahl Steuerkanäle (roll, pitch, yaw, throttle)
   phase: ${phase}
-  use_depth: ${use_depth}
+  use_depth_aux: ${use_depth_aux}
   use_cam_overlay: False
   motor_inertia_range: [0.1, 0.8]
   use_latent_goals: True
   ctx_consistency_weight: 0.1
   ctx_warmup_steps: 1000
   safety_input_key: "raw_image" # image|raw_image
-  safety_in_channels: 1
+  # safety_in_channels is now auto-derived from dataset.raw_image_mode
+  # (grayscale→1, rgb→3). Remove or ignore this value — it is no longer read.
   infonce_temperature: 0.07
+  throttle_index: 3              # unified throttle axis: action[3]
+  num_drones: 100                # generous buffer; model guards with % num_drones

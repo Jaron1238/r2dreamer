@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 import numpy as np
 
-
 @dataclass
 class RewardBreakdown:
     r_explore: float
@@ -20,17 +19,8 @@ class RewardBreakdown:
             return -1.0
         return self.r_explore + self.r_vel + self.r_survival + self.r_smooth + self.r_height
 
-
 class DroneRewardFunction:
-    """Curriculum reward for drone corridor navigation.
-
-    Terms:
-    - r_explore: grid-cell novelty bonus
-    - r_vel: alignment of velocity and heading, normalized by max_speed
-    - r_survival: +0.01 per timestep
-    - r_smooth: penalty for abrupt action changes
-    - collision: hard -1.0 terminal penalty
-    """
+    
 
     def __init__(
         self,

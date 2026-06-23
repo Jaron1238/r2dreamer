@@ -2,10 +2,9 @@ import gym as old_gym
 import gymnasium as gym
 import numpy as np
 
-
 class MemoryMaze(gym.Env):
     def __init__(self, task, size=(64, 64), seed=0):
-        # 9x9, 11x11, 13x13 and 15x15 are available
+        
         self._env = old_gym.make(f"memory_maze:MemoryMaze-{task}-v0", seed=seed)
         self._obs_is_dict = hasattr(self._env.observation_space, "spaces")
         self._size = size

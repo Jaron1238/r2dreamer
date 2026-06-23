@@ -6,7 +6,6 @@ import distributions as dists
 from networks import BlockLinear, LambdaLayer
 from tools import rpad, weight_init_
 
-
 class Deter(nn.Module):
     def __init__(self, deter, stoch, act_dim, hidden, blocks, dynlayers, d_emb_dim=16, act="SiLU"):
         super().__init__()
@@ -38,7 +37,6 @@ class Deter(nn.Module):
         self.flat2group = lambda x: x.reshape(*x.shape[:-1], self.blocks, -1)
         self.group2flat = lambda x: x.reshape(*x.shape[:-2], -1)
 
-
     def forward(self, stoch, deter, action, d_emb):
         B = action.shape[0]
         stoch = stoch.reshape(B, -1)
@@ -48,7 +46,6 @@ class Deter(nn.Module):
         x1 = self._dyn_in1(stoch)
         x2 = self._dyn_in2(action)
         x3 = self._dyn_in3(d_emb) 
-
 
         x = torch.cat([x0, x1, x2, x3], -1)
         x = x.unsqueeze(-2).expand(-1, self.blocks, -1)
@@ -64,7 +61,6 @@ class Deter(nn.Module):
         update = torch.sigmoid(update - 1)
         
         return update * cand + (1 - update) * deter
-
 
 class RSSM(nn.Module):
     def __init__(self, config, embed_size, act_dim):
@@ -125,8 +121,8 @@ class RSSM(nn.Module):
         self.apply(weight_init_)
 
     def initial(self, batch_size):
-        """Return an initial latent state."""
-        # (B, D), (B, S, K)
+        
+        
         deter = torch.zeros(batch_size, self._deter, dtype=torch.float32, device=self._device)
         stoch = torch.zeros(batch_size, self._stoch, self._discrete, dtype=torch.float32, device=self._device)
         prev_filtered_action = torch.zeros(batch_size, self._act_dim, dtype=torch.float32, device=self._device)
@@ -201,16 +197,16 @@ class RSSM(nn.Module):
         
 
     def prior(self, deter):
-        """Compute prior distribution parameters and sample stoch."""
+        
 
-        # (B, S, K)
+        
         logit = self._img_net(deter)
         stoch = self.get_dist(logit).rsample()
         return stoch, logit
 
     def imagine_with_action(self, stoch, deter, actions, d_emb=None, prev_filtered_action=None, alpha=None):
-        """Roll out prior dynamics given a sequence of actions."""
-        # (B, S, K), (B, D), (B, T, A)
+        
+        
         L = actions.shape[1]
         if d_emb is None:
             d_emb = self._default_d_emb(actions)
@@ -224,17 +220,17 @@ class RSSM(nn.Module):
             )
             stochs.append(stoch)
             deters.append(deter)
-        # (B, T, S, K), (B, T, D)
+        
         stochs = torch.stack(stochs, dim=1)
         deters = torch.stack(deters, dim=1)
         return stochs, deters
 
     def get_feat(self, stoch, deter):
-        """Flatten stoch and concatenate with deter."""
-        # (B, S, K), (B, D)
-        # (B, S*K)
+        
+        
+        
         stoch = stoch.reshape(*stoch.shape[:-2], self._stoch * self._discrete)
-        # (B, S*K + D)
+        
         return torch.cat([stoch, deter], -1)
 
     def get_dist(self, logit):
@@ -244,7 +240,7 @@ class RSSM(nn.Module):
         kld = dists.kl
         rep_loss = kld(post_logit, prior_logit.detach()).sum(-1)
         dyn_loss = kld(post_logit.detach(), prior_logit).sum(-1)
-        # Clipped gradients are not backpropagated using torch.clip.
+        
         rep_loss = torch.clip(rep_loss, min=free)
         dyn_loss = torch.clip(dyn_loss, min=free)
 

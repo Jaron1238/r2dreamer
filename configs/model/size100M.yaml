@@ -9,8 +9,3 @@ depth: 48
 units: 768
 act: 'SiLU'
 norm: True
-
-
-img_height: 1024
-img_width: 720  
-act_dim: 4      

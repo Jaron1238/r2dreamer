@@ -5,34 +5,30 @@ from typing import Any, TypedDict
 
 import mlx.core as mx
 
-
 @dataclass
 class RSSMState:
-    """Explicit stateless RSSM state container for MLX modules."""
+    
 
-    stoch: mx.array  # (B, stoch, discrete)
-    deter: mx.array  # (B, deter)
-    prev_action: mx.array  # (B, action_dim)
-    prev_filtered_action: mx.array  # (B, action_dim)
-
+    stoch: mx.array  
+    deter: mx.array  
+    prev_action: mx.array  
+    prev_filtered_action: mx.array  
 
 @dataclass
 class ContextState:
-    """Context buffer state for temporal drone embedding in MLX runtime."""
+    
 
-    flat_stoch: mx.array  # (B, ctx_len, flat_stoch)
-    deter: mx.array  # (B, ctx_len, deter)
-    action: mx.array  # (B, ctx_len, action_dim)
-    valid_steps: mx.array  # (B,)
-
+    flat_stoch: mx.array  
+    deter: mx.array  
+    action: mx.array  
+    valid_steps: mx.array  
 
 @dataclass
 class DreamerMLXState:
-    """Top-level state for online inference/training in native MLX."""
+    
 
     rssm: RSSMState
     context: ContextState
-
 
 class TransitionBatch(TypedDict):
     image: mx.array
@@ -42,13 +38,11 @@ class TransitionBatch(TypedDict):
     is_terminal: mx.array
     speed: mx.array
 
-
 class LoaderReport(TypedDict):
     loaded: int
     skipped: int
     missing: int
     details: dict[str, str]
-
 
 def zeros_rssm_state(
     batch_size: int,

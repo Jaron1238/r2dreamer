@@ -1,6 +1,6 @@
 act_entropy: 3e-4
 kl_free: 1.0
-imag_horizon: 15
+imag_horizon: 25
 horizon: 333
 lamb: 0.95
 compile: True
@@ -10,6 +10,9 @@ rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro/nedreamer
 safety_input_key: "image"
 safety_in_channels: 1
 drone_embed_dim: 16
+ctx_len: 128                   # Kontext-Fensterlänge: passt zu batch_length=256 (erste Hälfte = Kontext, zweite = Prediction)
+ctx_encoder_type: "gru"       # "gru" oder "transformer"
+inv_dyn_loss_weight: 1.0      # Gewichtung des Inverse-Dynamics-Loss
 infonce_temperature: 0.1
 video_pred_batch: 6
 use_depth_aux_prob: 1.0
@@ -42,6 +45,7 @@ loss_scales:
   norm: 1.0
   nedreamer: 1.0
   depth_aux: 1.0
+  inv_dyn: 1.0
 
 r2dreamer:
   lambd: 5e-4

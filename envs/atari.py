@@ -7,7 +7,6 @@ import gymnasium as gym
 import numpy as np
 from PIL import Image
 
-
 class Atari(gym.Env):
     LOCK = None
     metadata = {}
@@ -175,7 +174,7 @@ class Atari(gym.Env):
 
         self._last_lives = self.ale.lives()
         self._render()
-        # Fill the buffer with the first frame
+        
         for _ in range(self._pooling - 1):
             self._buffers.appendleft(self._buffers[0].copy())
 
@@ -213,7 +212,7 @@ class Atari(gym.Env):
         return obs, reward, is_last, {}
 
     def _render(self):
-        # Efficiently render by reusing buffer memory
+        
         self._buffers.appendleft(self._buffers.pop())
         self.ale.getScreenRGB(self._buffers[0])
 

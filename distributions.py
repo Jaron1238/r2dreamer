@@ -4,18 +4,15 @@ from torch.nn import functional as F
 
 from tools import to_f32, to_i32
 
-
 def symlog(x):
     return torch.sign(x) * torch.log1p(torch.abs(x))
-
 
 def symexp(x):
     return torch.sign(x) * torch.expm1(torch.abs(x))
 
-
 class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
     def __init__(self, logits, unimix_ratio=0.0):
-        # (..., K)
+        
         probs = F.softmax(to_f32(logits), dim=-1)
         uniform = unimix_ratio / probs.shape[-1]
         probs = probs * (1.0 - unimix_ratio) + torch.ones_like(probs, dtype=torch.float32) * uniform
@@ -24,17 +21,16 @@ class OneHotDist(torchd.one_hot_categorical.OneHotCategorical):
 
     @property
     def mode(self):
-        # (..., K)
+        
         _mode = F.one_hot(torch.argmax(self.logits, axis=-1), self.logits.shape[-1])
         return _mode.detach() + self.logits - self.logits.detach()
 
     def rsample(self, sample_shape=(), temperature=1.0):
-        # (..., K)
+        
         return F.gumbel_softmax(self.logits, tau=temperature, hard=True, dim=-1)
 
     def sample(self, **kwargs):
         raise NotImplementedError
-
 
 class MultiOneHotDist:
     def __init__(self, logits, shape, unimix_ratio=0.0):
@@ -63,20 +59,19 @@ class MultiOneHotDist:
         _entropies = [dist.entropy() for dist in self.onehots]
         return sum(_entropies)
 
-
 class TwoHot:
     def __init__(self, logits, bins, squash=None, unsquash=None):
-        # (..., N_bins), (N_bins,)
+        
         self.logits = to_f32(logits)
         assert self.logits.shape[-1] == len(bins), (self.logits.shape, len(bins))
 
         self.bins = bins
-        self.probs = F.softmax(self.logits, dim=-1)  # (..., N_bins)
+        self.probs = F.softmax(self.logits, dim=-1)  
         self.squash = squash if squash is not None else (lambda x: x)
         self.unsquash = unsquash if unsquash is not None else (lambda x: x)
 
     def mode(self):
-        # (..., N_bins), (N_bins,) -> (..., 1)
+        
         n = self.logits.shape[-1]
         if n % 2 == 1:
             m = (n - 1) // 2
@@ -98,11 +93,11 @@ class TwoHot:
         return self.unsquash(wavg)
 
     def log_prob(self, target):
-        # (..., 1)
+        
         assert target.dtype == self.probs.dtype
-        target = target.squeeze(-1)  # (...,)
-        target_squashed = self.squash(target).detach()  # (...,)
-        # below/above: (...,)
+        target = target.squeeze(-1)  
+        target_squashed = self.squash(target).detach()  
+        
         below = to_i32(self.bins <= target_squashed.unsqueeze(-1)).sum(dim=-1) - 1
         above = len(self.bins) - to_i32(self.bins > target_squashed.unsqueeze(-1)).sum(dim=-1)
         below = torch.clamp(below, 0, len(self.bins) - 1)
@@ -123,15 +118,14 @@ class TwoHot:
         weight_above = dist_to_below / total
         oh_below = to_f32(F.one_hot(below, num_classes=len(self.bins)))
         oh_above = to_f32(F.one_hot(above, num_classes=len(self.bins)))
-        # (..., N_bins)
+        
         mixed_target = oh_below * weight_below.unsqueeze(-1) + oh_above * weight_above.unsqueeze(-1)
-        log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)  # (..., N_bins)
-        return (mixed_target * log_pred).sum(dim=-1)  # (...)
-
+        log_pred = self.logits - torch.logsumexp(self.logits, dim=-1, keepdim=True)  
+        return (mixed_target * log_pred).sum(dim=-1)  
 
 class MSEDist:
     def __init__(self, mode, agg="sum"):
-        # (..., D)
+        
         self._mode = to_f32(mode)
         self._agg = agg
 
@@ -142,7 +136,7 @@ class MSEDist:
         return self._mode
 
     def log_prob(self, value):
-        # (..., D)
+        
         assert self._mode.shape == value.shape, (self._mode.shape, value.shape)
         assert self._mode.dtype == value.dtype, (self._mode.dtype, value.dtype)
         distance = (self._mode - value) ** 2
@@ -152,12 +146,11 @@ class MSEDist:
             loss = distance.sum(list(range(len(distance.shape)))[2:])
         else:
             raise NotImplementedError(self._agg)
-        return -loss  # (...)
-
+        return -loss  
 
 class SymlogDist:
     def __init__(self, mode, dist="mse", agg="sum", tol=1e-8):
-        # (..., D)
+        
         self._mode = to_f32(mode)
         self._dist = dist
         self._agg = agg
@@ -170,7 +163,7 @@ class SymlogDist:
         return symexp(self._mode)
 
     def log_prob(self, value):
-        # (..., D)
+        
         assert self._mode.shape == value.shape
         assert self._mode.dtype == value.dtype
         if self._dist == "mse":
@@ -187,8 +180,7 @@ class SymlogDist:
             loss = distance.sum(list(range(len(distance.shape)))[2:])
         else:
             raise NotImplementedError(self._agg)
-        return -loss  # (...)
-
+        return -loss  
 
 class Bound:
     def __init__(self, dist):
@@ -213,31 +205,25 @@ class Bound:
     def log_prob(self, x):
         return self._dist.log_prob(x)
 
-
 def bounded_normal(x, min_std, max_std, **kwargs):
     mean, std = torch.chunk(x, 2, dim=-1)
     std = (max_std - min_std) * torch.sigmoid(std + 2.0) + min_std
-    # NOTE: Bound can be added
+    
     dist = torchd.normal.Normal(torch.tanh(to_f32(mean)), to_f32(std))
     return torchd.independent.Independent(dist, 1)
-
 
 def normal_std_fixed(mean, std, **kwargs):
     dist = torchd.normal.Normal(to_f32(mean), to_f32(std))
     return Bound(torchd.independent.Independent(dist, 1))
 
-
 def onehot(mean, unimix_ratio, **kwargs):
     return OneHotDist(to_f32(mean), unimix_ratio=unimix_ratio)
-
 
 def multi_onehot(mean, unimix_ratio, shape, **kwargs):
     return MultiOneHotDist(to_f32(mean), shape, unimix_ratio=unimix_ratio)
 
-
 def binary(logits, **kwargs):
     return torchd.independent.Independent(torchd.bernoulli.Bernoulli(logits=to_f32(logits)), 1)
-
 
 def symexp_twohot(logits, bin_num, **kwargs):
     if bin_num % 2 == 1:
@@ -250,22 +236,18 @@ def symexp_twohot(logits, bin_num, **kwargs):
         bins = torch.concatenate([half, -half.flip(dims=(0,))], 0)
     return TwoHot(to_f32(logits), bins)
 
-
 def symlog_mse(logits, **kwargs):
     return SymlogDist(to_f32(logits))
-
 
 def mse(logits, **kwargs):
     return MSEDist(to_f32(logits))
 
-
 def identity(logits, **kwargs):
     return logits
 
-
 def kl(logits_left, logits_right):
-    # (..., K), (..., K)
+    
     logprob_left = torch.log_softmax(logits_left, -1)
     logprob_right = torch.log_softmax(logits_right, -1)
     prob = torch.softmax(logits_left, -1)
-    return (prob * (logprob_left - logprob_right)).sum(-1)  # (...)
+    return (prob * (logprob_left - logprob_right)).sum(-1)  

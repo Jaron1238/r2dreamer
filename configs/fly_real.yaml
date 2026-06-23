@@ -5,17 +5,28 @@ defaults:
 device: 'mps'
 checkpoint: 'logdir/latest.pt'
 phase: 3
+drone_id: 0  # which drone embedding to bake into the CoreML export
 
 model:
-  img_height: 256
-  img_width: 256
+  img_height: 288          # RSSM encoder resolution (Landscape: H=288, W=512)
+  img_width: 512
+  safety_img_height: 720   # SafetyNet input resolution (Landscape: H=720, W=1280)
+  safety_img_width: 1280
   act_dim: 4
-  use_depth: false
+  # Image is always 6-channel RGB+diff — use_depth no longer controls main image.
   use_depth_aux: false
-  safety_input_key: 'image'
-  safety_in_channels: 3
+  safety_input_key: 'raw_image'
+  safety_frame_stack: 3        # SafetyNet stacks this many frames → 6*3=18 ch CNN input
   hover_throttle: 0.52
+  throttle_index: 3              # unified: throttle = action[3]
   safety_threshold: 0.4
+  safety_release_threshold: 0.15
+  # RSSM state dims — must match the size config used during training.
+  # size100M: stoch=32, discrete=48, deter=6144
+  # size25M:  stoch=32, discrete=24, deter=3072
+  stoch: 32
+  discrete: 48
+  deter: 6144
 
 stream:
   port: 5600

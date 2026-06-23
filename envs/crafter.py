@@ -1,9 +1,7 @@
 import gymnasium as gym
 import numpy as np
 
-# hacky way to avoid error in crafter
 np.bool = np.bool_
-
 
 class Crafter(gym.Env):
     metadata = {}

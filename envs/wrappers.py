@@ -4,7 +4,6 @@ import torch
 
 import tools
 
-
 class TimeLimit(gym.Wrapper):
     def __init__(self, env, duration):
         super().__init__(env)
@@ -20,14 +19,13 @@ class TimeLimit(gym.Wrapper):
             if "discount" not in info:
                 info["discount"] = np.array(1.0).astype(np.float32)
             self._step = None
-            # keep is_terminal as it is
+            
             obs["is_last"] = True
         return obs, reward, done, info
 
     def reset(self):
         self._step = 0
         return self.env.reset()
-
 
 class NormalizeActions(gym.Wrapper):
     def __init__(self, env):
@@ -43,7 +41,6 @@ class NormalizeActions(gym.Wrapper):
         original = (action + 1) / 2 * (self._high - self._low) + self._low
         original = np.where(self._mask, original, action)
         return self.env.step(original)
-
 
 class OneHotAction(gym.Wrapper):
     def __init__(self, env):
@@ -73,7 +70,6 @@ class OneHotAction(gym.Wrapper):
         reference[index] = 1.0
         return reference
 
-
 class MultiOneHotAction(gym.Wrapper):
     def __init__(self, env, device):
         assert isinstance(env.action_space, gym.spaces.MultiDiscrete)
@@ -97,7 +93,6 @@ class MultiOneHotAction(gym.Wrapper):
             now += dim
         return torch.cat(indexes, dim=-1) + self.index_low
 
-
 class RewardObs(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -117,7 +112,6 @@ class RewardObs(gym.Wrapper):
         if "obs_reward" not in obs:
             obs["obs_reward"] = np.array([0.0], dtype=np.float32)
         return obs
-
 
 class Dtype(gym.Wrapper):
     def step(self, action):

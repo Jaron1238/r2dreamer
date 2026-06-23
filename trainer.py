@@ -8,7 +8,6 @@ from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from accelerate import Accelerator
 from buffer import Buffer
 
-
 class DepthPreprocessor:
     def __init__(self, use_depth: bool = True, output_size: int = 256):
         self.use_depth = bool(use_depth)
@@ -24,7 +23,7 @@ class DepthPreprocessor:
         if self._depth_model is not None or not self.use_depth:
             return
         try:
-            from depth_anything_v2.dpt import DepthAnythingV2  # type: ignore
+            from depth_anything_v2.dpt import DepthAnythingV2  
             self._depth_model = DepthAnythingV2(encoder="vits")
             self._depth_model.eval()
             self._backend = "depth-anything-v2"
@@ -42,7 +41,7 @@ class DepthPreprocessor:
         return depth.clamp(0.0, 1.0)
 
     def _resize_depth_batch(self, depth: torch.Tensor) -> torch.Tensor:
-        # depth: (T, H, W)
+        
         depth = F.interpolate(
             depth.unsqueeze(1),
             size=(self.output_size, self.output_size),
@@ -53,14 +52,14 @@ class DepthPreprocessor:
 
     @torch.no_grad()
     def __call__(self, frames: torch.Tensor) -> torch.Tensor:
-        # frames can be:
-        # - RGB:            (T, H, W, 3)
-        # - depth only:     (T, H, W) or (T, H, W, 1)
-        # - depth + diff:   (T, H, W, 2)
+        
+        
+        
+        
         if not self.use_depth:
             return frames
         if frames.ndim == 3:
-            # Already depth maps without channel dimension.
+            
             if frames.max() > 1.5:
                 frames = frames / 255.0
             return self._resize_depth_batch(frames)
@@ -70,7 +69,7 @@ class DepthPreprocessor:
                 depth = depth / 255.0
             return self._resize_depth_batch(depth)
         if frames.ndim == 4 and frames.shape[-1] == 2:
-            # depth + diff input: preserve both channels
+            
             depth = frames[..., 0]
             diff = frames[..., 1]
             if depth.max() > 1.5:
@@ -83,13 +82,13 @@ class DepthPreprocessor:
             gray = frames.mean(dim=-1)
             return self._resize_depth_batch(gray)
 
-        # Depth Anything path (best effort in offline preprocessing).
-        # In constrained environments we gracefully fallback to grayscale.
+        
+        
         try:
             outs = []
             for t in range(frames.shape[0]):
                 rgb = (frames[t].cpu().numpy() * 255.0).astype(np.uint8)
-                depth = self._depth_model.infer_image(rgb)  # np.ndarray(H, W)
+                depth = self._depth_model.infer_image(rgb)  
                 depth = torch.from_numpy(depth).float()
                 depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
                 outs.append(self._resize_depth(depth))
@@ -99,16 +98,22 @@ class DepthPreprocessor:
             return self._resize_depth_batch(gray)
 
 class FPVDataset(IterableDataset):
-    def __init__(self, config, batch_length: int = 64, require_osd: bool = False):
+    def __init__(self, config, batch_length: int = 64, require_osd: bool = False, shuffle_seed: int = 42):
         super().__init__()
+        self._config = config  # Bug #12: stored for eval clone
         self.mode = str(getattr(config.dataset, "mode", "streaming"))
         self.batch_length = batch_length
         self.require_osd  = require_osd
-        self.use_depth = bool(getattr(config, "use_depth", False))
+        self.use_depth = bool(getattr(config, "use_depth_aux", False))  # Bug #6 fix: was use_depth
         self.action_dim = int(getattr(config.model, "act_dim", 4))
+        self.model_num_drones = int(getattr(config.model, "num_drones", 100))  # Bug #5 fix
         self.raw_image_mode = str(getattr(config.dataset, "raw_image_mode", "grayscale"))
         self.img_height = int(getattr(config.model, "img_height", 256))
         self.img_width = int(getattr(config.model, "img_width", 256))
+        # SafetyNet uses a separate (larger) resolution — read it from config,
+        # fall back to the RSSM resolution only if not set.
+        self.safety_img_height = int(getattr(config.model, "safety_img_height", self.img_height))
+        self.safety_img_width  = int(getattr(config.model, "safety_img_width",  self.img_width))
         self.burn_in_steps = int(getattr(config.trainer, "burn_in_steps", 5))
         self.phase = int(getattr(config, "phase", 1))
         self.chunk_stride = int(getattr(config.dataset, "chunk_stride", self.batch_length))
@@ -116,7 +121,8 @@ class FPVDataset(IterableDataset):
         self.telemetry_stale_prob = float(getattr(config.dataset, "telemetry_stale_prob", 0.2))
         self.raw_source = SafetyRawImageSource(
             config.dataset.get("raw_dataset", None),
-            output_size=(self.img_height, self.img_width),
+            # Bug fix: use safety resolution (e.g. 1280x720), not RSSM resolution (512x288)
+            output_size=(self.safety_img_height, self.safety_img_width),
             raw_image_mode=self.raw_image_mode,
         )
         self.depth_fallback_mode = str(getattr(config.dataset, "depth_fallback_mode", "zeros"))
@@ -132,7 +138,7 @@ class FPVDataset(IterableDataset):
             self.ds = self.ds.filter(lambda x: x.get("has_osd", False))
         shuffle_buffer = int(getattr(config.dataset, "shuffle_buffer", 1000))
         if shuffle_buffer > 0:
-            self.ds = self.ds.shuffle(seed=42, buffer_size=shuffle_buffer)
+            self.ds = self.ds.shuffle(seed=shuffle_seed, buffer_size=shuffle_buffer)  # Bug #12 fix: seed param
             
         print(
             f"FPVDataset (Streaming): Repo '{config.dataset.hf_repo}' | "
@@ -141,14 +147,36 @@ class FPVDataset(IterableDataset):
             f"depth_backend={self.depth_preprocessor.backend if self.depth_preprocessor is not None else 'none'})"
         )
 
+    def clone_for_eval(self, seed: int = 137) -> "FPVDataset":
+        """Bug #12: Return a fresh FPVDataset with a different shuffle seed for eval.
+        This ensures eval data is drawn from a different stream position than training."""
+        return FPVDataset(
+            self._config,
+            batch_length=self.batch_length,
+            require_osd=self.require_osd,
+            shuffle_seed=seed,
+        )
+
     def __iter__(self):
         worker_info = get_worker_info()
         ds_iter = self.ds
         if worker_info is not None and worker_info.num_workers > 1:
             ds_iter = ds_iter.shard(num_shards=worker_info.num_workers, index=worker_info.id)
         for sample in ds_iter:
-            gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
-            gray_full = self._ensure_channel_last(gray_full)
+            if "frames_gray" in sample:
+                gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
+                gray_full = self._ensure_channel_last(gray_full)
+            elif "frames_rgb" in sample or "frames" in sample:
+                # frames_gray not present → derive from RGB on the fly
+                rgb_key = "frames_rgb" if "frames_rgb" in sample else "frames"
+                _rgb = torch.from_numpy(np.array(sample[rgb_key][0])).float() / 255.0
+                _rgb = self._ensure_channel_last(_rgb)
+                if _rgb.shape[-1] == 3:
+                    gray_full = _rgb.mean(dim=-1, keepdim=True)
+                else:
+                    gray_full = _rgb[..., :1]   # already 1-ch or unknown, take first
+            else:
+                continue  # no usable image key in this sample
             rgb_full = None
             if "frames_rgb" in sample:
                 rgb_full = torch.from_numpy(np.array(sample["frames_rgb"][0])).float() / 255.0
@@ -173,7 +201,8 @@ class FPVDataset(IterableDataset):
 
             for start in starts:
                 raw_image = gray_full[start : start + self.batch_length]
-                raw_image = self._resize_sequence(raw_image)
+                # Bug fix: resize raw_image to SafetyNet resolution, not RSSM resolution
+                raw_image = self._resize_sequence(raw_image, self.safety_img_height, self.safety_img_width)
                 raw_image = self._build_raw_image(raw_image)
 
                 if rgb_full is not None:
@@ -221,7 +250,7 @@ class FPVDataset(IterableDataset):
                 is_last = torch.zeros(self.batch_length, dtype=torch.bool)
                 is_last[-1] = True
 
-                if self.require_osd and sample.get("has_osd", False):
+                if sample.get("has_osd", False):  # Bug #4 fix: require_osd is a dataset-level filter, not per-sample action gate
                     actions_full = torch.from_numpy(np.array(sample["actions"][0])).float()
                     actions = actions_full[start : start + self.batch_length]
                 else:
@@ -248,7 +277,10 @@ class FPVDataset(IterableDataset):
                 drone_value = sample.get("drone_id", 0)
                 if isinstance(drone_value, (list, tuple, np.ndarray)):
                     drone_value = drone_value[0]
-                drone_id = int(drone_value)
+                # drone_id is zeroed out: Phase 2 is unsupervised (Barlow Twins on
+                # context encoder). Phase 1/3 use the embedding but the % num_drones
+                # guard in dreamer.py keeps it safe regardless.
+                drone_id = int(drone_value) % self.model_num_drones  # Bug #5 fix: model_num_drones now always set in __init__
                 drone_id = torch.full((self.batch_length,), drone_id, dtype=torch.long)
 
                 if safety is not None:
@@ -301,12 +333,18 @@ class FPVDataset(IterableDataset):
             return frames[..., None]
         return frames
 
-    def _resize_sequence(self, frames: torch.Tensor) -> torch.Tensor:
-        if frames.shape[1:3] == (self.img_height, self.img_width):
+    def _resize_sequence(self, frames: torch.Tensor, target_h: int = None, target_w: int = None) -> torch.Tensor:
+        """Resize a (T, H, W, C) sequence to (target_h, target_w).
+        Defaults to the RSSM resolution (img_height/img_width).  Pass
+        safety_img_height/safety_img_width explicitly for raw_image.
+        """
+        h = target_h if target_h is not None else self.img_height
+        w = target_w if target_w is not None else self.img_width
+        if frames.shape[1:3] == (h, w):
             return frames
         resized = F.interpolate(
             frames.permute(0, 3, 1, 2),
-            size=(self.img_height, self.img_width),
+            size=(h, w),
             mode="bilinear",
             align_corners=False,
         )
@@ -348,7 +386,6 @@ class FPVDataset(IterableDataset):
         if overlay is None:
             overlay = torch.zeros((length, fallback_image.shape[1], fallback_image.shape[2], 1), dtype=torch.float32)
         return overlay, torch.full((length, 1), float(has_overlay), dtype=torch.float32)
-
 
 class SafetyRawImageSource:
     def __init__(self, raw_cfg, output_size, raw_image_mode: str):
@@ -532,7 +569,7 @@ class Augmentation:
         return x
 
     def _random_resolution_scale(self, x):
-        # x: (B, T, H, W, C)
+        
         _, _, h, w, _ = x.shape
         scale = self.resolution_scale_min + torch.rand(1, device=x.device).item() * (
             self.resolution_scale_max - self.resolution_scale_min
@@ -565,9 +602,8 @@ class Augmentation:
         diff[:, 1:] = rgb[:, 1:] - rgb[:, :-1]
         return torch.cat([rgb, diff], dim=-1)
 
-
 class OfflineTrainer:
-    def __init__(self, config, dataset, logger, logdir):
+    def __init__(self, config, dataset, logger, logdir, phase: int = 1):  # Bug #7 fix: explicit phase param
         self.dataset = dataset
         self.logger = logger
         self.logdir = pathlib.Path(logdir)
@@ -579,8 +615,8 @@ class OfflineTrainer:
         self.num_workers = int(config.num_workers)
         self.augmentation = Augmentation(
             config.augmentation,
-            phase=int(getattr(config, "phase", 1)),
-            use_depth=bool(getattr(config, "use_depth", False)),
+            phase=phase,  # Bug #7 fix: was getattr(config.trainer, 'phase', 1) → always 1
+            use_depth=bool(getattr(config, "use_depth_aux", False)),  # Bug #6 fix: was use_depth
         )
         self.accumulation_steps = config.get("accumulation_steps", 8)
         self.eval_batches = int(config.get("eval_batches", 8))
@@ -688,8 +724,10 @@ class OfflineTrainer:
             pin_memory=True,
             drop_last=True
         )
+        # Bug #12 fix: separate eval dataset with different shuffle seed → different stream position
+        _eval_dataset = self.dataset.clone_for_eval(seed=137)
         self._eval_loader = DataLoader(
-            self.dataset,
+            _eval_dataset,
             batch_size=self.batch_per_gpu,
             shuffle=False,
             num_workers=max(1, self.num_workers // 2),
@@ -723,7 +761,11 @@ class OfflineTrainer:
                     self.accelerator.backward(loss)
                     
                     if self.accelerator.sync_gradients:
-                        self.accelerator.clip_grad_norm_(agent.parameters(), max_norm=100.0)
+                        # Bug #11 fix: was clip_grad_norm_(max_norm=100.0) — never effective.
+                        # Delegate to agent._agc() (Adaptive Gradient Clipping, agc=0.3)
+                        # which is what train_step() uses in the Online path.
+                        _agc_params = [p for p in train_agent.parameters() if p.grad is not None]
+                        train_agent._agc(_agc_params)
 
                     optimizer.step()
                     scheduler.step()
@@ -759,7 +801,6 @@ class OfflineTrainer:
         self.accelerator.wait_for_everyone()
         if self.accelerator.is_main_process:
             self._save_checkpoint(step)
-
 
 class OnlineTrainer:
     def __init__(self, config, logger, logdir):

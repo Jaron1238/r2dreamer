@@ -1,6 +1,5 @@
 from . import parallel, wrappers
 
-
 def make_envs(config):
     def env_constructor(idx):
         return lambda: make_env(config, idx)
@@ -10,7 +9,6 @@ def make_envs(config):
     obs_space = train_envs.observation_space
     act_space = train_envs.action_space
     return train_envs, eval_envs, obs_space, act_space
-
 
 def make_env(config, id):
     suite, task = config.task.split("_", 1)

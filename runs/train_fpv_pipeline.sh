@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# =============================================================================
-# train_fpv_pipeline.sh  –  R2-Dreamer FPV Training Pipeline
-# =============================================================================
 
 set -euo pipefail
 
@@ -24,7 +21,6 @@ init_env() {
         log "Kein venv gefunden. Erstelle neues Virtual Environment..."
         python3 -m venv venv
     fi
-    # shellcheck source=/dev/null
     source venv/bin/activate
 
     if [[ -f "requirements.txt" ]]; then
@@ -119,7 +115,7 @@ run_phase3() {
         "${args[@]}" "${EXTRA_ARGS[@]}"
 }
 
-if [[ $# -eq 0 ]]; then
+if [[ $
     echo "Usage: $0 [phase1|phase2|phase3|all] [Extra Args]"
     exit 1
 fi

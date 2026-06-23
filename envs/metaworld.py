@@ -1,7 +1,6 @@
 import gymnasium as gym
 import numpy as np
 
-
 class MetaWorld(gym.Env):
     def __init__(
         self,
@@ -40,7 +39,7 @@ class MetaWorld(gym.Env):
 
     @property
     def action_space(self):
-        # action range in original environmens is -1 ~ 1
+        
         return gym.spaces.Box(
             self._env.action_space.low,
             self._env.action_space.high,
@@ -57,14 +56,14 @@ class MetaWorld(gym.Env):
             reward += rew
             if terminated or truncated:
                 break
-        # make sure success is always 0 or 1
+        
         success = bool(min(success, 1.0))
-        # meta-world doesn't reset env after success in training mode
+        
         is_last = terminated or truncated
         obs = {
             "is_first": False,
             "is_last": is_last,
-            # success is not terminate, to allow bootstrapping
+            
             "is_terminal": terminated,
             "image": self.render(),
             "state": state,
