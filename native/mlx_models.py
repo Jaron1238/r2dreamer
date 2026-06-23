@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 from dataclasses import dataclass
 from typing import Callable
@@ -473,7 +475,14 @@ class _MLXResBlock(nn.Module):
 class MLXSafetyNet(nn.Module):
     
 
-    def __init__(self, in_channels: int = 1, action_dim: int = 4, speed_dim: int = 1, hidden: int = 64, frame_stack: int = 3):
+    def __init__(
+        self,
+        in_channels: int = 1,
+        action_dim: int = 4,
+        speed_dim: int = 1,
+        hidden: int = 64,
+        frame_stack: int = 3,
+    ):
         super().__init__()
         self.action_dim = action_dim
         self.hidden     = hidden
@@ -571,57 +580,76 @@ class MLXContextEncoder(nn.Module):
         encoder_type: str = "gru",
     ):
         super().__init__()
-        self.ctx_len = int(ctx_len)
-        self.bottleneck = int(bottleneck)
-        self.out_dim = int(out_dim)
+        self.ctx_len      = int(ctx_len)
+        self.bottleneck   = int(bottleneck)
+        self.out_dim      = int(out_dim)
         self.encoder_type = str(encoder_type)
 
-        inp_dim = flat_stoch + deter + act_dim
+        inp_dim = int(flat_stoch + deter + act_dim)
 
         
         self.proj = nn.Sequential(
-            nn.Linear(inp_dim, bottleneck),
-            RMSNorm(bottleneck),
+            nn.Linear(inp_dim, self.bottleneck, bias=True),
+            RMSNorm(self.bottleneck, eps=1e-4, dtype=mx.float32),
             nn.SiLU(),
-            nn.Linear(bottleneck, bottleneck),
-            RMSNorm(bottleneck),
+            nn.Linear(self.bottleneck, self.bottleneck, bias=True),
+            RMSNorm(self.bottleneck, eps=1e-4, dtype=mx.float32),
             nn.SiLU(),
         )
 
         
         if self.encoder_type == "gru":
-            
-            
-            self.rnn = nn.GRU(bottleneck, bottleneck, num_layers=2)
+            self.rnn = nn.GRU(
+                input_size=self.bottleneck,
+                hidden_size=self.bottleneck,
+                num_layers=2,
+                batch_first=True,
+                dropout=0.0,
+            )
         elif self.encoder_type == "transformer":
-            half_dim = self.bottleneck // 2
             
-            freqs = 1.0 / (10_000 ** (mx.arange(0, half_dim, dtype=mx.float32) / half_dim))
-            self.rope_freqs = freqs
+            half_dim = self.bottleneck // 2
+            rope_freqs = 1.0 / (10_000 ** (mx.arange(0, half_dim, dtype=mx.float32) / half_dim))
+            self.rope_freqs = rope_freqs
 
-            num_heads = max(1, self.bottleneck // 64)
-            self.transformer_layers =[
-                MLXTransformerEncoderLayer(self.bottleneck, num_heads) for _ in range(2)
-            ]
+            num_heads = max(1, self.bottleneck // 64)  
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=self.bottleneck,
+                nhead=num_heads,
+                dim_feedforward=self.bottleneck * 4,
+                dropout=0.0,
+                batch_first=True,
+                norm_first=True,          
+                activation="gelu",
+            )
+            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         else:
-            raise ValueError(f"Unbekannter encoder_type='{encoder_type}'")
+            raise ValueError(f"ContextEncoder: unbekannter encoder_type='{encoder_type}'. "
+                             f"Erlaubt: 'gru', 'transformer'.")
 
         
-        self.temporal_attn = nn.Linear(self.bottleneck, 1)
-        self.out_head = nn.Linear(self.bottleneck, self.out_dim)
+        self.temporal_attn = nn.Linear(self.bottleneck, 1, bias=True)
 
+        
+        self.out_head = nn.Linear(self.bottleneck, self.out_dim, bias=True)
+
+        self.apply(weight_init_)
+
+    
     def _apply_rope(self, x: mx.array) -> mx.array:
         
+
         B, T, D = x.shape
         half = D // 2
 
+        
         positions = mx.arange(T, dtype=x.dtype)
-        angles = mx.outer(positions, self.rope_freqs.astype(x.dtype))
-        cos = mx.expand_dims(mx.cos(angles), 0)
-        sin = mx.expand_dims(mx.sin(angles), 0)
+        angles = mx.outer(positions, self.rope_freqs.astype(x.dtype))  
+        cos = mx.expand_dims(mx.cos(angles), 0)   
+        sin = mx.expand_dims(mx.sin(angles), 0)   
 
-        x1 = x[..., :half]
-        x2 = x[..., half : half * 2]
+        x1 = x[..., :half]               
+        x2 = x[..., half : half * 2]     
         x_rot = mx.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
 
         
@@ -636,49 +664,49 @@ class MLXContextEncoder(nn.Module):
         action: mx.array,
         valid_len: mx.array | None = None,
     ) -> mx.array:
+        
+
         B, T, _ = flat_stoch.shape
 
         
-        padding_mask = None
+        
+        
+        padding_mask: mx.array | None = None
         if valid_len is not None:
-            positions = mx.expand_dims(mx.arange(T, dtype=mx.int32), 0)
-            valid_start = mx.expand_dims(T - mx.clip(valid_len, None, T), 1)
-            padding_mask = positions < valid_start  
+            
+            positions  = mx.arange(T, dtype=flat_stoch.dtype).unsqueeze(0)  
+            valid_start = (T - valid_len.clamp(max=T)).unsqueeze(1)               
+            padding_mask = positions < valid_start                                 
 
-        x = mx.concatenate([flat_stoch, deter, action], axis=-1)
-        x = self.proj(x)
+        
+        x = mx.concatenate([flat_stoch, deter, action], axis=-1)   
+        x = self.proj(x)                                      
 
         
         if self.encoder_type == "gru":
-            x = self.rnn(x)
-        else:
-            x = self._apply_rope(x)
-            attn_mask = None
+            # Bug #15 fix: zero out leading padded positions before the GRU so that
+            # padding-contaminated states don't bleed into valid hidden states.
+            # The temporal-attention pool below already masks via padding_mask, but
+            # zeroing the inputs makes the GRU path consistent with the transformer path.
             if padding_mask is not None:
-                
-                attn_mask = mx.expand_dims(mx.expand_dims(padding_mask, 1), 1)
-                attn_mask = mx.where(
-                    attn_mask,
-                    mx.array(-float("inf"), dtype=x.dtype),
-                    mx.array(0.0, dtype=x.dtype),
-                )
-
-            for layer in self.transformer_layers:
-                x = layer(x, mask=attn_mask)
+                x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+            x, _ = self.rnn(x)                               
+        else:  
+            x = self._apply_rope(x)                          
+            
+            
+            x = self.transformer(x, src_key_padding_mask=padding_mask)  
 
         
-        attn_logits = self.temporal_attn(x)  
+        
+        attn_logits = self.temporal_attn(x)                  
         if padding_mask is not None:
-            attn_logits = mx.where(
-                mx.expand_dims(padding_mask, -1),
-                mx.array(-float("inf"), dtype=x.dtype),
-                attn_logits,
-            )
-
+            attn_logits = attn_logits.masked_fill(padding_mask.unsqueeze(-1), float("-inf"))
         attn_w = mx.softmax(attn_logits, axis=1)
-        ctx = mx.sum(attn_w * x, axis=1)
+        ctx    = (attn_w * x).sum(dim=1)                     
 
-        return self.out_head(ctx)
+        
+        return self.out_head(ctx)                             
 
 class MLXProjector(nn.Module):
     
@@ -703,6 +731,7 @@ class MLXInvDynHead(nn.Module):
             nn.Linear(hidden, hidden), nn.SiLU(),
             nn.Linear(hidden, act_dim), nn.Tanh(),
         )
+        self.apply(weight_init_)
 
     def __call__(
         self,
@@ -769,7 +798,7 @@ class MLXDreamer(nn.Module):
         self.barlow_lambd        = float(getattr(cfg, "barlow_lambd", 5e-3))
         self.inv_dyn_loss_weight = float(getattr(cfg, "inv_dyn_loss_weight", 1.0))
         self.ctx_len             = int(getattr(cfg, "ctx_len", 16))
-        self.ctx_warmup_steps    = int(getattr(ctx, "ctx_warmup_steps", 1000))
+        self.ctx_warmup_steps    = int(getattr(cfg, "ctx_warmup_steps", 1000))
         self.ctx_consistency_w   = float(getattr(cfg, "ctx_consistency_weight", 1.0))
         self._ctx_updates        = 0
         self._loss_scales        = dict(cfg.loss_scales)
@@ -1105,26 +1134,6 @@ class MLXDreamer(nn.Module):
                 mx.stop_gradient(weight[:, :-1])
                 * (-val_dist.log_prob(mx.stop_gradient(tar_padded))
                    - val_dist.log_prob(slow_val))[:, :-1, None]
-            )
-
-            
-            replay_pi_inp = mx.concatenate([feat, d_emb], axis=-1)
-            last_f  = data["is_last"].astype(mx.float32)
-            term_f  = data["is_terminal"].astype(mx.float32)
-            rew_f   = data["reward"].astype(mx.float32)
-            boot    = ret[:, 0].reshape(B, -1, 1)[:, :T]
-            rval    = mx.stop_gradient(
-                symexp_twohot(self.value(replay_pi_inp), bin_num=255).mode()
-            )
-            slow_rval = mx.stop_gradient(rval)
-            ret_r     = self._lambda_return(last_f, term_f, rew_f, rval, boot, disc, self.lamb)
-            ret_r_pad = mx.concatenate([ret_r, mx.zeros_like(ret_r[:, -1:])], axis=1)
-            rval_dist = symexp_twohot(self.value(replay_pi_inp), bin_num=255)
-            weight_r  = (1.0 - last_f)
-            losses["repval"] = mx.mean(
-                weight_r[:, :-1]
-                * (-rval_dist.log_prob(mx.stop_gradient(ret_r_pad))
-                   - rval_dist.log_prob(slow_rval))[:, :-1, None]
             )
 
             
