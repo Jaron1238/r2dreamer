@@ -30,7 +30,7 @@ def _make_cfg():
         barlow=1.0, inv_dyn=1.0, ctx_consistency=1.0,
     )
     rssm = NS(stoch=4, discrete=4, deter=32, hidden=32, act_dim=4,
-               embed_size=32, d_emb_dim=8, obs_layers=1, img_layers=1,
+               embed_size=1280, d_emb_dim=8, obs_layers=1, img_layers=1,
                dyn_layers=1, blocks=2, unimix_ratio=0.01, motor_inertia_alpha=1.0)
     encoder = NS(in_ch=6, input_h=32, input_w=32, depth=8,
                  mults=(1, 2, 2, 2))
@@ -38,13 +38,13 @@ def _make_cfg():
     cont    = NS(units=32, layers=1)
     actor   = NS(units=32, layers=1, min_std=0.1, max_std=2.0)
     value   = NS(units=32, layers=1, dist=NS(bin_num=7))
-    safety_net = NS(in_channels=2, hidden=16, frame_stack=2)
+    safety_net = NS(in_channels=6, hidden=16, frame_stack=2)
 
     return NS(
         phase=1,
         kl_free=0.5, act_entropy=3e-4,
         imag_horizon=3, horizon=3, lamb=0.95,
-        embed_size=32, num_drones=2, drone_embed_dim=8,
+        embed_size=1280, num_drones=2, drone_embed_dim=8,
         ctx_len=4, ctx_warmup_steps=10, ctx_consistency_weight=1.0,
         ctx_bottleneck=16, ctx_encoder_type="gru",
         loss_scales=loss_scales,
@@ -57,13 +57,12 @@ def _make_cfg():
 def run_smoke_test():
     try:
         import mlx.core as mx
-        import mlx.nn as nn
     except ImportError:
         print("[SKIP] mlx not installed — skipping MLX smoke test.")
         return
 
     from native.mlx_models import MLXDreamer
-    from native.mlx_types import RSSMState, ContextState, DreamerMLXState
+    from native.mlx_types import RSSMState
 
     print("[smoke_mlx] Building tiny MLXDreamer config …")
     cfg = _make_cfg()
@@ -80,8 +79,9 @@ def run_smoke_test():
 
     # 1) Encoder
     print("[smoke_mlx] Testing encoder …")
-    img = mx.zeros((B, H, W, C))
-    embed = model.encoder({"image": img})
+    img = mx.zeros((B, 1, H, W, C))
+    embed_seq = model.encoder(img)
+    embed = embed_seq[:, 0]
     mx.eval(embed)
     assert embed.shape == (B, cfg.embed_size), \
         f"embed shape mismatch: {embed.shape} != ({B}, {cfg.embed_size})"
@@ -110,18 +110,18 @@ def run_smoke_test():
     print("[smoke_mlx] Testing actor + value …")
     feat = model.rssm.get_feat(new_state.stoch, new_state.deter)   # (B, feat_size)
     actor_in = mx.concatenate([feat, d_emb], axis=-1)               # (B, feat_size + d_emb_dim)
-    act_dist = model.actor(actor_in)
-    val_dist = model.value(actor_in)
-    action   = act_dist.sample()
-    mx.eval(action)
+    action = model.actor(actor_in, sample=True)
+    value_logits = model.value(actor_in)
+    mx.eval(action, value_logits)
 
     assert action.shape == (B, A), f"action shape: {action.shape}"
+    assert value_logits.shape[0] == B, f"value batch shape: {value_logits.shape}"
     print(f"           ✓ actor output shape: {action.shape}")
 
     # 4) Encoder output for safety_net
     print("[smoke_mlx] Testing safety_net …")
     SH, SW, SC = 32, 32, cfg.safety_net.in_channels * cfg.safety_net.frame_stack
-    safety_img = mx.zeros((B, SH, SW, SC))
+    safety_img = mx.zeros((B, 1, SH, SW, SC))
     speed      = mx.zeros((B, 1, 1))
     act_seq    = mx.zeros((B, 1, A))
     safety_prob, safe_act = model.safety_net(safety_img, speed, act_seq)

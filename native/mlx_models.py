@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass
 from typing import Callable
@@ -8,6 +9,21 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from native.mlx_types import RSSMState
+
+
+def _cfg_get(obj, name: str, default=None):
+    if obj is None:
+        return default
+    if hasattr(obj, name):
+        return getattr(obj, name)
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return default
+
+def weight_init_(module: nn.Module) -> None:
+    """Compatibility hook for modules that are initialized from PyTorch weights."""
+    _ = module
+
 
 @dataclass
 class RSSMConfig:
@@ -567,6 +583,51 @@ class MLXTransformerEncoderLayer(nn.Module):
 
         return x
 
+
+class MLXStackedGRU(nn.Module):
+    """Small MLX-native stack that mirrors PyTorch's multi-layer GRU shape contract."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 2):
+        super().__init__()
+        self.layers = [
+            nn.GRU(input_size if i == 0 else hidden_size, hidden_size)
+            for i in range(num_layers)
+        ]
+
+    def __call__(self, x: mx.array) -> tuple[mx.array, list[mx.array]]:
+        states: list[mx.array] = []
+        for layer in self.layers:
+            x = layer(x)
+            states.append(x[:, -1])
+        return x, states
+
+
+class MLXTransformerEncoder(nn.Module):
+    """MLX-native Transformer encoder with PyTorch-compatible pre-norm math."""
+
+    def __init__(self, d_model: int, nhead: int, num_layers: int = 2):
+        super().__init__()
+        self.layers = [
+            MLXTransformerEncoderLayer(d_model, nhead, d_model * 4)
+            for _ in range(num_layers)
+        ]
+
+    @staticmethod
+    def _additive_attention_mask(padding_mask: mx.array, dtype) -> mx.array:
+        return mx.where(
+            padding_mask[:, None, None, :],
+            mx.array(-mx.inf, dtype=dtype),
+            mx.array(0.0, dtype=dtype),
+        )
+
+    def __call__(self, x: mx.array, padding_mask: mx.array | None = None) -> mx.array:
+        mask = None
+        if padding_mask is not None:
+            mask = self._additive_attention_mask(padding_mask, x.dtype)
+        for layer in self.layers:
+            x = layer(x, mask=mask)
+        return x
+
 class MLXContextEncoder(nn.Module):
     
     def __init__(
@@ -590,21 +651,19 @@ class MLXContextEncoder(nn.Module):
         
         self.proj = nn.Sequential(
             nn.Linear(inp_dim, self.bottleneck, bias=True),
-            RMSNorm(self.bottleneck, eps=1e-4, dtype=mx.float32),
+            RMSNorm(self.bottleneck, eps=1e-4),
             nn.SiLU(),
             nn.Linear(self.bottleneck, self.bottleneck, bias=True),
-            RMSNorm(self.bottleneck, eps=1e-4, dtype=mx.float32),
+            RMSNorm(self.bottleneck, eps=1e-4),
             nn.SiLU(),
         )
 
         
         if self.encoder_type == "gru":
-            self.rnn = nn.GRU(
+            self.rnn = MLXStackedGRU(
                 input_size=self.bottleneck,
                 hidden_size=self.bottleneck,
                 num_layers=2,
-                batch_first=True,
-                dropout=0.0,
             )
         elif self.encoder_type == "transformer":
             
@@ -613,16 +672,11 @@ class MLXContextEncoder(nn.Module):
             self.rope_freqs = rope_freqs
 
             num_heads = max(1, self.bottleneck // 64)  
-            encoder_layer = nn.TransformerEncoderLayer(
+            self.transformer = MLXTransformerEncoder(
                 d_model=self.bottleneck,
                 nhead=num_heads,
-                dim_feedforward=self.bottleneck * 4,
-                dropout=0.0,
-                batch_first=True,
-                norm_first=True,          
-                activation="gelu",
+                num_layers=2,
             )
-            self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
         else:
             raise ValueError(f"ContextEncoder: unbekannter encoder_type='{encoder_type}'. "
                              f"Erlaubt: 'gru', 'transformer'.")
@@ -674,8 +728,8 @@ class MLXContextEncoder(nn.Module):
         padding_mask: mx.array | None = None
         if valid_len is not None:
             
-            positions  = mx.arange(T, dtype=flat_stoch.dtype).unsqueeze(0)  
-            valid_start = (T - valid_len.clamp(max=T)).unsqueeze(1)               
+            positions  = mx.expand_dims(mx.arange(T), axis=0)
+            valid_start = mx.expand_dims(T - mx.clip(valid_len, None, T), axis=1)
             padding_mask = positions < valid_start                                 
 
         
@@ -689,24 +743,80 @@ class MLXContextEncoder(nn.Module):
             # The temporal-attention pool below already masks via padding_mask, but
             # zeroing the inputs makes the GRU path consistent with the transformer path.
             if padding_mask is not None:
-                x = x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+                x = mx.where(mx.expand_dims(padding_mask, axis=-1), mx.zeros_like(x), x)
             x, _ = self.rnn(x)                               
         else:  
             x = self._apply_rope(x)                          
             
             
-            x = self.transformer(x, src_key_padding_mask=padding_mask)  
+            x = self.transformer(x, padding_mask=padding_mask)
 
         
         
         attn_logits = self.temporal_attn(x)                  
         if padding_mask is not None:
-            attn_logits = attn_logits.masked_fill(padding_mask.unsqueeze(-1), float("-inf"))
+            attn_logits = mx.where(
+                mx.expand_dims(padding_mask, axis=-1),
+                mx.array(-mx.inf, dtype=attn_logits.dtype),
+                attn_logits,
+            )
         attn_w = mx.softmax(attn_logits, axis=1)
-        ctx    = (attn_w * x).sum(dim=1)                     
+        ctx    = mx.sum(attn_w * x, axis=1)
 
         
         return self.out_head(ctx)                             
+
+class MLXCausalTemporalTransformer(nn.Module):
+    """Causal transformer used by NeDreamer with PyTorch-compatible parameter names."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        model_dim: int,
+        num_layers: int,
+        num_heads: int,
+        max_len: int,
+        action_proj_dim: int = 32,
+    ):
+        super().__init__()
+        self.action_proj = nn.Linear(action_dim, action_proj_dim, bias=True)
+        self.in_proj = nn.Linear(state_dim + action_proj_dim, model_dim, bias=True)
+        self.pos_embed = mx.zeros((1, max_len, model_dim))
+        self.encoder = MLXTransformerEncoder(model_dim, num_heads, num_layers=num_layers)
+
+    @staticmethod
+    def _causal_attention_mask(seq_len: int, dtype) -> mx.array:
+        idx = mx.arange(seq_len)
+        mask = mx.expand_dims(idx, axis=1) < mx.expand_dims(idx, axis=0)
+        return mx.where(mask, mx.array(-mx.inf, dtype=dtype), mx.array(0.0, dtype=dtype))
+
+    def __call__(self, state_seq: mx.array, prev_action_seq: mx.array) -> mx.array:
+        action_emb = self.action_proj(prev_action_seq)
+        x = mx.concatenate([state_seq, action_emb], axis=-1)
+        x = self.in_proj(x)
+        x = x + self.pos_embed[:, : x.shape[1], :]
+        mask = self._causal_attention_mask(x.shape[1], x.dtype)
+        for layer in self.encoder.layers:
+            x = layer(x, mask=mask)
+        return x
+
+
+class MLXNEPredictorHead(nn.Module):
+    """MLX port of networks.NEPredictorHead."""
+
+    def __init__(self, in_dim: int, out_dim: int):
+        super().__init__()
+        hidden = max(in_dim, out_dim)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.net(x)
+
 
 class MLXProjector(nn.Module):
     
@@ -785,11 +895,13 @@ class MLXDreamer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         from functools import partial
-        from native.mlx_distributions import (
-            symexp_twohot, binary, bounded_normal,
-        )
+        from native.mlx_distributions import binary, symexp_twohot
 
-        self.phase               = int(getattr(cfg, "phase", 1))
+        self.config = cfg
+        root_cfg = cfg
+        cfg = _cfg_get(root_cfg, "model", root_cfg)
+
+        self.phase               = int(_cfg_get(root_cfg, "phase", _cfg_get(cfg, "phase", 1)))
         self.kl_free             = float(cfg.kl_free)
         self.act_entropy         = float(cfg.act_entropy)
         self.imag_horizon        = int(cfg.imag_horizon)
@@ -805,10 +917,14 @@ class MLXDreamer(nn.Module):
         self.num_drones          = int(getattr(cfg, "num_drones", 1))
         self.d_emb_dim           = int(getattr(cfg, "drone_embed_dim", 16))
         self.embed_size          = int(cfg.embed_size)
+        self.rep_loss            = str(_cfg_get(cfg, "rep_loss", "r2dreamer"))
+        self.safety_threshold    = float(_cfg_get(cfg, "safety_threshold", 0.4))
+        self.safety_input_key    = str(_cfg_get(cfg, "safety_input_key", "image"))
 
         rssm_cfg = RSSMConfig(**cfg.rssm)
         self.rssm = MLXRSSM(rssm_cfg)
 
+        self.obs_shape = (int(cfg.encoder.input_h), int(cfg.encoder.input_w), int(cfg.encoder.in_ch))
         self.encoder = MLXConvEncoder(
             in_ch    = int(cfg.encoder.in_ch),
             input_h  = int(cfg.encoder.input_h),
@@ -834,6 +950,27 @@ class MLXDreamer(nn.Module):
 
         self.projector        = MLXProjector(feat_size, self.embed_size)
         self.projector_target = MLXProjector(self.embed_size, self.embed_size)
+
+        if self.rep_loss == "nedreamer":
+            ne_cfg = _cfg_get(cfg, "nedreamer")
+            self.barlow_lambd = float(_cfg_get(ne_cfg, "lambd", self.barlow_lambd))
+            self.use_ema_target = bool(_cfg_get(ne_cfg, "use_ema_target", False))
+            ne_hidden = int(_cfg_get(ne_cfg, "hidden_dim", 256))
+            trainer_cfg = _cfg_get(root_cfg, "trainer")
+            max_len = int(
+                _cfg_get(root_cfg, "batch_length", _cfg_get(trainer_cfg, "batch_length", self.horizon))
+            )
+            self.nedreamer_transformer = MLXCausalTemporalTransformer(
+                state_dim=feat_size,
+                action_dim=rssm_cfg.act_dim,
+                model_dim=ne_hidden,
+                num_layers=int(_cfg_get(ne_cfg, "transformer_layers", 2)),
+                num_heads=int(_cfg_get(ne_cfg, "transformer_heads", 4)),
+                max_len=max_len,
+                action_proj_dim=32,
+            )
+            self.nedreamer_predictor = MLXNEPredictorHead(ne_hidden, self.embed_size)
+            self.target_encoder = copy.deepcopy(self.encoder) if self.use_ema_target else None
 
         rew_bins = int(getattr(cfg.reward.dist, "bin_num", 255))
         self.reward_head = MLXMLPHead(
@@ -877,20 +1014,31 @@ class MLXDreamer(nn.Module):
 
     @staticmethod
     def _barlow_loss(z_a: mx.array, z_b: mx.array, lambd: float) -> tuple[mx.array, dict]:
-        N, D      = z_a.shape
-        eps       = 1e-8
-        z_a_norm  = (z_a - z_a.mean(axis=0)) / (z_a.std(axis=0) + eps)
-        z_b_norm  = (z_b - z_b.mean(axis=0)) / (z_b.std(axis=0) + eps)
-        c         = mx.matmul(z_a_norm.T, z_b_norm) / N          
-        diag      = mx.diag(c)
-        inv_loss  = mx.sum((diag - 1.0) ** 2)
-        off_diag  = c - mx.diag(diag)
-        red_loss  = mx.sum(off_diag ** 2)
-        loss      = inv_loss + lambd * red_loss
-        metrics   = {
+        weights = mx.ones((z_a.shape[0],), dtype=z_a.dtype)
+        return MLXDreamer._barlow_loss_masked(z_a, z_b, weights, lambd)
+
+    @staticmethod
+    def _barlow_loss_masked(z_a: mx.array, z_b: mx.array, weights: mx.array, lambd: float) -> tuple[mx.array, dict]:
+        eps = 1e-8
+        weights = weights.astype(z_a.dtype)
+        weights = weights / mx.maximum(mx.sum(weights), mx.array(1.0, dtype=z_a.dtype))
+        w = mx.expand_dims(weights, axis=-1)
+        mean_a = mx.sum(z_a * w, axis=0)
+        mean_b = mx.sum(z_b * w, axis=0)
+        var_a = mx.sum(((z_a - mean_a) ** 2) * w, axis=0)
+        var_b = mx.sum(((z_b - mean_b) ** 2) * w, axis=0)
+        z_a_norm = (z_a - mean_a) / mx.sqrt(var_a + eps)
+        z_b_norm = (z_b - mean_b) / mx.sqrt(var_b + eps)
+        c = mx.matmul((z_a_norm * w).T, z_b_norm)
+        diag = mx.diag(c)
+        inv_loss = mx.sum((diag - 1.0) ** 2)
+        off_diag = c - mx.diag(diag)
+        red_loss = mx.sum(off_diag ** 2)
+        loss = inv_loss + lambd * red_loss
+        metrics = {
             "barlow/invariance": float(inv_loss.item()),
             "barlow/redundancy": float(red_loss.item()),
-            "barlow/std_mean":   float(z_a_norm.std(axis=0).mean().item()),
+            "barlow/std_mean": float(mx.sqrt(var_a + eps).mean().item()),
         }
         return loss, metrics
 
@@ -924,16 +1072,32 @@ class MLXDreamer(nn.Module):
         stacked = mx.concatenate(frames[-n:], axis=-1)
         return stacked
 
+
+    def _update_nedreamer_ema_target(self) -> None:
+        if self.rep_loss != "nedreamer" or getattr(self, "target_encoder", None) is None:
+            return
+        from mlx.utils import tree_flatten
+
+        model_cfg = _cfg_get(self.config, "model", self.config)
+        ne_cfg = _cfg_get(model_cfg, "nedreamer")
+        ema_rate = float(_cfg_get(ne_cfg, "ema_rate", 0.99))
+        online = dict(tree_flatten(self.encoder.parameters()))
+        target = dict(tree_flatten(self.target_encoder.parameters()))
+        updated = [
+            (name, ema_rate * target[name] + (1.0 - ema_rate) * online[name])
+            for name in target
+            if name in online
+        ]
+        if updated:
+            self.target_encoder.load_weights(updated, strict=False)
+
     def compute_losses(
         self,
         data:    dict,
         initial: RSSMState | None = None,
     ) -> tuple[mx.array, dict, dict]:
         
-        from native.mlx_distributions import (
-            masked_mean, focal_bce, symexp_twohot, binary,
-        )
-        from functools import partial
+        from native.mlx_distributions import focal_bce, masked_mean, symexp_twohot
 
         losses:  dict = {}
         metrics: dict = {}
@@ -1013,10 +1177,35 @@ class MLXDreamer(nn.Module):
             losses["inv_dyn"] = self.inv_dyn_loss_weight * masked_mean(inv_mse, inv_mask)
 
         
-        x1 = self.projector(feat.reshape(B * T, -1))
-        x2 = self.projector_target(mx.stop_gradient(embed.reshape(B * T, -1)))
-        losses["barlow"], barlow_metrics = self._barlow_loss(x1, x2, self.barlow_lambd)
-        metrics.update(barlow_metrics)
+        if self.rep_loss == "nedreamer":
+            if T > 1:
+                state_seq = self.rssm.get_feat(post_stoch, post_deter)
+                tr_out = self.nedreamer_transformer(state_seq, action)
+                target_embed = (
+                    self.target_encoder(image)
+                    if getattr(self, "target_encoder", None) is not None
+                    else embed
+                )
+                pred = self.nedreamer_predictor(tr_out[:, :-1])
+                target = mx.stop_gradient(target_embed[:, 1:])
+                valid = (1.0 - data["is_terminal"][:, :-1].astype(mx.float32))
+                if burn_in_mask is not None:
+                    valid = valid * burn_in_mask[:, :-1].astype(mx.float32)
+                flat_pred = mx.reshape(pred, (B * (T - 1), -1))
+                flat_target = mx.reshape(target, (B * (T - 1), -1))
+                flat_valid = mx.reshape(valid, (B * (T - 1),)).astype(mx.float32)
+                losses["nedreamer"], barlow_metrics = self._barlow_loss_masked(
+                    flat_pred, flat_target, flat_valid, self.barlow_lambd
+                )
+            else:
+                losses["nedreamer"] = mx.zeros(())
+                barlow_metrics = {"barlow/invariance": 0.0, "barlow/redundancy": 0.0, "barlow/std_mean": 0.0}
+            metrics.update({f"nedreamer/{k.split('/')[-1]}": v for k, v in barlow_metrics.items()})
+        else:
+            x1 = self.projector(feat.reshape(B * T, -1))
+            x2 = self.projector_target(mx.stop_gradient(embed.reshape(B * T, -1)))
+            losses["barlow"], barlow_metrics = self._barlow_loss(x1, x2, self.barlow_lambd)
+            metrics.update(barlow_metrics)
 
         
         losses["rew"] = mx.mean(-self.reward_head(feat).log_prob(
@@ -1038,7 +1227,7 @@ class MLXDreamer(nn.Module):
             policy_inp = mx.concatenate([
                 mx.stop_gradient(feat), mx.stop_gradient(d_emb)
             ], axis=-1)
-            from native.mlx_distributions import BoundedNormalDist, bounded_normal
+            from native.mlx_distributions import bounded_normal
             actor_out  = mx.concatenate(
                 mx.split(self.actor.backbone(policy_inp), 2, axis=-1), axis=-1
             )
@@ -1115,7 +1304,7 @@ class MLXDreamer(nn.Module):
             adv    = (ret - imag_val[:, :-1]) / ret_scale
 
             policy_inp  = mx.concatenate([imag_feat, imag_d_emb], axis=-1)
-            from native.mlx_distributions import BoundedNormalDist, bounded_normal
+            from native.mlx_distributions import bounded_normal
             actor_raw   = mx.concatenate(
                 mx.split(self.actor.backbone(policy_inp[:, :-1]), 2, axis=-1), axis=-1
             )
