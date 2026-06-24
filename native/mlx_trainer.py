@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pathlib
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import numpy as np
@@ -13,7 +13,6 @@ import mlx.nn as nn
 import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_map
 
-from native.mlx_types import TransitionBatch
 
 def _np2mx(batch: dict) -> dict:
     
@@ -34,12 +33,10 @@ def _mx_save(path: pathlib.Path, model: nn.Module) -> None:
     if sfx == ".safetensors":
         mx.save_safetensors(str(path), flat)
     else:
-            mx.savez(str(path), **flat)
+        mx.savez(str(path), **flat)
 
 def _mx_load(path: pathlib.Path, model: nn.Module) -> None:
-    
-    
-    data   = mx.load(str(path))          
+    data = mx.load(str(path))
     model.load_weights(list(data.items()))
 
 @dataclass
@@ -269,6 +266,60 @@ class MLXOnlineTrainer:
                 print(f"[MLX] Checkpoint → {ckpt}")
 
         print("[MLXTrainer] Offline training complete.")
+
+    @staticmethod
+    def _online_context_embedding(
+        model: nn.Module,
+        ctx_stoch: list[np.ndarray],
+        ctx_deter: list[np.ndarray],
+        ctx_action: list[np.ndarray],
+    ) -> mx.array:
+        if not ctx_stoch:
+            return mx.zeros((1, model.d_emb_dim))
+        flat_stoch = mx.array(np.stack(ctx_stoch, axis=1))
+        deter = mx.array(np.stack(ctx_deter, axis=1))
+        action = mx.array(np.stack(ctx_action, axis=1))
+        valid_len = mx.array([flat_stoch.shape[1]], dtype=mx.int32)
+        return model.context_encoder(flat_stoch, deter, action, valid_len=valid_len)
+
+    @staticmethod
+    def _maybe_override_unsafe_action(
+        model: nn.Module,
+        obs: dict[str, np.ndarray],
+        action: mx.array,
+        safety_frames: list[np.ndarray],
+    ) -> mx.array:
+        safety_key = getattr(model, "safety_input_key", "image")
+        safety_img = obs.get(safety_key, obs["image"])
+        safety_frames.append(np.array(safety_img, dtype=np.float32))
+        del safety_frames[:-int(model.safety_net.frame_stack)]
+        if len(safety_frames) != int(model.safety_net.frame_stack):
+            return action
+
+        stacked = np.concatenate(safety_frames, axis=-1)[None, None]
+        speed_value = float(np.asarray(obs.get("speed", 0.0)).reshape(-1)[0])
+        speed = mx.array([[[speed_value]]])
+        safety_logit, safe_action = model.safety_net(
+            mx.array(stacked), speed, mx.expand_dims(action, axis=1)
+        )
+        unsafe = bool((mx.sigmoid(safety_logit)[0, 0, 0] > model.safety_threshold).item())
+        return safe_action[:, 0] if unsafe else action
+
+    @staticmethod
+    def _append_context_step(
+        model: nn.Module,
+        rssm_state,
+        action_np: np.ndarray,
+        ctx_stoch: list[np.ndarray],
+        ctx_deter: list[np.ndarray],
+        ctx_action: list[np.ndarray],
+    ) -> None:
+        ctx_stoch.append(np.array(mx.reshape(rssm_state.stoch, (1, -1))[0]))
+        ctx_deter.append(np.array(rssm_state.deter[0]))
+        ctx_action.append(action_np.astype(np.float32))
+        del ctx_stoch[:-int(model.ctx_len)]
+        del ctx_deter[:-int(model.ctx_len)]
+        del ctx_action[:-int(model.ctx_len)]
 
     def _begin_online(self, model: nn.Module, env) -> None:
         

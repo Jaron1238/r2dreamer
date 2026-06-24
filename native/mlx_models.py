@@ -895,9 +895,7 @@ class MLXDreamer(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         from functools import partial
-        from native.mlx_distributions import (
-            symexp_twohot, binary, bounded_normal,
-        )
+        from native.mlx_distributions import binary, symexp_twohot
 
         self.config = cfg
         root_cfg = cfg
@@ -1095,10 +1093,7 @@ class MLXDreamer(nn.Module):
         initial: RSSMState | None = None,
     ) -> tuple[mx.array, dict, dict]:
         
-        from native.mlx_distributions import (
-            masked_mean, focal_bce, symexp_twohot, binary,
-        )
-        from functools import partial
+        from native.mlx_distributions import focal_bce, masked_mean, symexp_twohot
 
         losses:  dict = {}
         metrics: dict = {}
@@ -1228,7 +1223,7 @@ class MLXDreamer(nn.Module):
             policy_inp = mx.concatenate([
                 mx.stop_gradient(feat), mx.stop_gradient(d_emb)
             ], axis=-1)
-            from native.mlx_distributions import BoundedNormalDist, bounded_normal
+            from native.mlx_distributions import bounded_normal
             actor_out  = mx.concatenate(
                 mx.split(self.actor.backbone(policy_inp), 2, axis=-1), axis=-1
             )
@@ -1305,7 +1300,7 @@ class MLXDreamer(nn.Module):
             adv    = (ret - imag_val[:, :-1]) / ret_scale
 
             policy_inp  = mx.concatenate([imag_feat, imag_d_emb], axis=-1)
-            from native.mlx_distributions import BoundedNormalDist, bounded_normal
+            from native.mlx_distributions import bounded_normal
             actor_raw   = mx.concatenate(
                 mx.split(self.actor.backbone(policy_inp[:, :-1]), 2, axis=-1), axis=-1
             )

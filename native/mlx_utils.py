@@ -539,35 +539,35 @@ def _remap_pytorch_name_to_mlx(name: str, obs_layers: int = 1, img_layers: int =
         name,
     )
     
-    # MLX-specific mappings for transformer
+    # Transformer mappings for active MLX wrapper layouts.
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.query_proj\.weight$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.query_proj.weight",
+        r"^context_encoder\.transformer\.layers\.(\d+)\.self_attn\.(query_proj|key_proj|value_proj|out_proj)\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.attention.{m.group(2)}.{m.group(3)}",
         name,
     )
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.query_proj\.bias$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.query_proj.bias",
+        r"^context_encoder\.transformer\.layers\.(\d+)\.norm1\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.ln1.{m.group(2)}",
         name,
     )
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.key_proj\.weight$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.key_proj.weight",
+        r"^context_encoder\.transformer\.layers\.(\d+)\.norm2\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.ln2.{m.group(2)}",
         name,
     )
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.key_proj\.bias$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.key_proj.bias",
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.self_attn\.(query_proj|key_proj|value_proj|out_proj)\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.attention.{m.group(2)}.{m.group(3)}",
         name,
     )
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.value_proj\.weight$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.value_proj.weight",
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.norm1\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.ln1.{m.group(2)}",
         name,
     )
     name = re.sub(
-        r"^context_encoder\.transformer_layers\.(\d+)\.self_attn\.value_proj\.bias$",
-        lambda m: f"context_encoder.transformer_layers.{int(m.group(1))}.attention.value_proj.bias",
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.norm2\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.ln2.{m.group(2)}",
         name,
     )
     name = re.sub(
