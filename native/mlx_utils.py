@@ -621,6 +621,37 @@ def _remap_pytorch_name_to_mlx(name: str, obs_layers: int = 1, img_layers: int =
         name,
     )
     
+
+    name = re.sub(
+        r"^context_encoder\.transformer\.layers\.(\d+)\.self_attn\.(query_proj|key_proj|value_proj|out_proj)\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.attention.{m.group(2)}.{m.group(3)}",
+        name,
+    )
+    name = re.sub(
+        r"^context_encoder\.transformer\.layers\.(\d+)\.norm1\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.ln1.{m.group(2)}",
+        name,
+    )
+    name = re.sub(
+        r"^context_encoder\.transformer\.layers\.(\d+)\.norm2\.(weight|bias)$",
+        lambda m: f"context_encoder.transformer.layers.{int(m.group(1))}.ln2.{m.group(2)}",
+        name,
+    )
+    name = re.sub(
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.self_attn\.(query_proj|key_proj|value_proj|out_proj)\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.attention.{m.group(2)}.{m.group(3)}",
+        name,
+    )
+    name = re.sub(
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.norm1\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.ln1.{m.group(2)}",
+        name,
+    )
+    name = re.sub(
+        r"^nedreamer_transformer\.encoder\.layers\.(\d+)\.norm2\.(weight|bias)$",
+        lambda m: f"nedreamer_transformer.encoder.layers.{int(m.group(1))}.ln2.{m.group(2)}",
+        name,
+    )
     return name
 
 def _remap_efficientnet_encoder_name(name: str) -> str:
@@ -633,9 +664,9 @@ def _preprocess_transformer_weights(state_dict: dict[str, torch.Tensor]) -> dict
 
     new_dict = {}
     for key, tensor in state_dict.items():
-        if "context_encoder.transformer.layers" in key:
+        if "context_encoder.transformer.layers" in key or "nedreamer_transformer.encoder.layers" in key:
             
-            new_key = key.replace("context_encoder.transformer.layers.", "context_encoder.transformer_layers.")
+            new_key = key
 
             
             if "self_attn.in_proj_weight" in new_key:
