@@ -956,17 +956,13 @@ class MLXDreamer(nn.Module):
             self.barlow_lambd = float(_cfg_get(ne_cfg, "lambd", self.barlow_lambd))
             self.use_ema_target = bool(_cfg_get(ne_cfg, "use_ema_target", False))
             ne_hidden = int(_cfg_get(ne_cfg, "hidden_dim", 256))
-            trainer_cfg = _cfg_get(root_cfg, "trainer")
-            max_len = int(
-                _cfg_get(root_cfg, "batch_length", _cfg_get(trainer_cfg, "batch_length", self.horizon))
-            )
             self.nedreamer_transformer = MLXCausalTemporalTransformer(
                 state_dim=feat_size,
                 action_dim=rssm_cfg.act_dim,
                 model_dim=ne_hidden,
                 num_layers=int(_cfg_get(ne_cfg, "transformer_layers", 2)),
                 num_heads=int(_cfg_get(ne_cfg, "transformer_heads", 4)),
-                max_len=max_len,
+                max_len=int(_cfg_get(root_cfg, "batch_length", _cfg_get(_cfg_get(root_cfg, "trainer"), "batch_length", self.horizon))),
                 action_proj_dim=32,
             )
             self.nedreamer_predictor = MLXNEPredictorHead(ne_hidden, self.embed_size)
