@@ -53,15 +53,12 @@ def main(config):
             agent.load_state_dict(ckpt["model"])
             print(f"Checkpoint geladen: {ckpt_path} (Phase {ckpt_phase})")
 
-    if int(getattr(config, "phase", 1)) >= 3:
-        from envs.drone_sim import DroneSimEnv
-        trainer = OnlineTrainer(config.trainer, logger, logdir)
-        env = DroneSimEnv(config)
-        trainer.begin(agent, env)
-    elif bool(getattr(config, "use_mlx", False)):
+    ran_mlx = False
+    if bool(getattr(config, "use_mlx", False)):
+        import mlx.core as mx
         from native.mlx_models import MLXDreamer
         from native.mlx_utils import load_pytorch_to_mlx
-        from native.mlx_trainer import MLXOnlineTrainer
+        from native.mlx_trainer import MLXOnlineTrainer, _mx_save
         from mlx.utils import tree_flatten
 
         mlx_agent = MLXDreamer(config)
@@ -73,9 +70,22 @@ def main(config):
         )
         if report["skipped"] or report["missing"]:
             print("[MLX] Skipped/missing details:", report["details"])
-        mlx_agent.load_weights(list(converted.items()))
+        mlx_agent.load_weights(list(converted.items()), strict=False)
+        mx.eval(mlx_agent.parameters())
         trainer = MLXOnlineTrainer(config.trainer, logger, logdir)
-        trainer.begin(mlx_agent)
+        if int(getattr(config, "phase", 1)) >= 3:
+            from envs.drone_sim import DroneSimEnv
+            env = DroneSimEnv(config)
+            trainer.begin(mlx_agent, env)
+        else:
+            trainer.begin(mlx_agent)
+        _mx_save(logdir / "latest.safetensors", mlx_agent)
+        ran_mlx = True
+    elif int(getattr(config, "phase", 1)) >= 3:
+        from envs.drone_sim import DroneSimEnv
+        trainer = OnlineTrainer(config.trainer, logger, logdir)
+        env = DroneSimEnv(config)
+        trainer.begin(agent, env)
     else:
         dataset = FPVDataset(
             config,
@@ -85,11 +95,12 @@ def main(config):
         trainer = OfflineTrainer(config.trainer, dataset, logger, logdir, phase=int(getattr(config, 'phase', 1)))  # Bug #7 fix
         trainer.begin(agent)
 
-    raw_agent = trainer.accelerator.unwrap_model(agent) if hasattr(trainer, "accelerator") else agent
-    torch.save(
-        {"model": raw_agent.state_dict(), "phase": config.phase},
-        logdir / "latest.pt",
-    )
+    if not ran_mlx:
+        raw_agent = trainer.accelerator.unwrap_model(agent) if hasattr(trainer, "accelerator") else agent
+        torch.save(
+            {"model": raw_agent.state_dict(), "phase": config.phase},
+            logdir / "latest.pt",
+        )
 
 if __name__ == "__main__":
     main()

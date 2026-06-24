@@ -142,6 +142,9 @@ class _MLXUpdateEngine:
     def step(self, batch: dict) -> dict[str, Any]:
         total, gnorm, losses = self._compiled(batch)
         mx.eval(self.model.parameters(), self.optimizer.state)
+        if hasattr(self.model, "_update_nedreamer_ema_target"):
+            self.model._update_nedreamer_ema_target()
+            mx.eval(self.model.parameters())
         metrics = {
             "total_loss":    float(total.item()),
             "opt/grad_norm": float(gnorm.item()),
@@ -278,6 +281,10 @@ class MLXOnlineTrainer:
         raw_obs, _  = env.reset()
         obs         = {k: np.array(v) for k, v in raw_obs.items()}
         is_first    = True
+        ctx_stoch: list[np.ndarray] = []
+        ctx_deter: list[np.ndarray] = []
+        ctx_action: list[np.ndarray] = []
+        safety_frames: list[np.ndarray] = []
         step        = 0
         num_eps     = 0
         t0          = time.perf_counter()
@@ -285,9 +292,15 @@ class MLXOnlineTrainer:
         print(f"[MLXTrainer] Online training | steps={cfg.steps}")
 
         while step < cfg.steps:
-            img_mx = mx.array(obs["image"][None, None])         
+            img_mx = mx.array(obs["image"][None, None])
             embed  = model.encoder(img_mx)
             d_emb  = mx.zeros((1, model.d_emb_dim))
+            if len(ctx_stoch) > 0:
+                flat_stoch = mx.array(np.stack(ctx_stoch, axis=1))
+                deter = mx.array(np.stack(ctx_deter, axis=1))
+                act_hist = mx.array(np.stack(ctx_action, axis=1))
+                valid_len = mx.array([flat_stoch.shape[1]], dtype=mx.int32)
+                d_emb = model.context_encoder(flat_stoch, deter, act_hist, valid_len=valid_len)
             rssm_state, _ = model.rssm.obs_step(
                 rssm_state,
                 embed[:, 0],
@@ -297,8 +310,26 @@ class MLXOnlineTrainer:
             feat   = model.rssm.get_feat(rssm_state.stoch, rssm_state.deter)
             pi_inp = mx.concatenate([feat, d_emb], axis=-1)
             action = model.actor(pi_inp, sample=True)
+
+            safety_key = getattr(model, "safety_input_key", "image")
+            safety_img = obs.get(safety_key, obs["image"])
+            safety_frames.append(np.array(safety_img, dtype=np.float32))
+            safety_frames = safety_frames[-int(model.safety_net.frame_stack):]
+            if len(safety_frames) == int(model.safety_net.frame_stack):
+                stacked = np.concatenate(safety_frames, axis=-1)[None, None]
+                speed = mx.array([[[float(np.asarray(obs.get("speed", 0.0)).reshape(-1)[0])]]])
+                safety_logit, safe_action = model.safety_net(mx.array(stacked), speed, mx.expand_dims(action, axis=1))
+                unsafe = bool((mx.sigmoid(safety_logit)[0, 0, 0] > model.safety_threshold).item())
+                if unsafe:
+                    action = safe_action[:, 0]
             mx.eval(action)
             action_np = np.array(action[0])
+            ctx_stoch.append(np.array(mx.reshape(rssm_state.stoch, (1, -1))[0]))
+            ctx_deter.append(np.array(rssm_state.deter[0]))
+            ctx_action.append(action_np.astype(np.float32))
+            ctx_stoch = ctx_stoch[-int(model.ctx_len):]
+            ctx_deter = ctx_deter[-int(model.ctx_len):]
+            ctx_action = ctx_action[-int(model.ctx_len):]
 
             raw_next, reward, terminated, truncated, _ = env.step(action_np)
             done = bool(terminated or truncated)
@@ -330,6 +361,7 @@ class MLXOnlineTrainer:
                 raw_obs, _ = env.reset()
                 obs        = {k: np.array(v) for k, v in raw_obs.items()}
                 rssm_state = model.rssm.initial(1)
+                ctx_stoch.clear(); ctx_deter.clear(); ctx_action.clear(); safety_frames.clear()
 
             if step % cfg.log_every == 0:
                 sps = cfg.log_every / max(time.perf_counter() - t0, 1e-6)
