@@ -368,6 +368,7 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
+        "extractor_args": {"youtube": ["player_client=android,ios,web"]},
     }
     # Only inject cookies when the file actually exists (written by CI from secret)
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
