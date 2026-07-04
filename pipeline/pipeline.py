@@ -286,7 +286,7 @@ def save_progress_to_gist(resume_file: str, logger: logging.Logger) -> None:
       GH_TOKEN    – GitHub token (set as a workflow secret)
     The gh CLI must be available on PATH (pre-installed on GitHub runners).
     """
-    gist_id = os.environ.get("GH_GIST_ID", "")
+    gist_id = os.environ.get("GH_GIST_ID", "").strip()
     if not gist_id:
         return
     try:
@@ -1504,6 +1504,10 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
 
     logger.info("Triggering final pack and HF-Upload...")
     hf_upload_and_clear(output_dir, cfg.hf_repo_id, logger, cfg.upload_workers, int(cfg.pack_chunk_gb * 1024 ** 3))
+    # NEU: Crash-Dataset hier flushen und hochladen!
+    crash_exp.flush()
+    if cfg.hf_crash_repo_id:
+        upload_crash_dataset(output_dir / "crash_parquet", cfg.hf_crash_repo_id, logger)
     # Save final progress so the next shard/run knows what was done
     save_progress_to_gist(cfg.resume_file, logger)
     shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1586,11 +1590,7 @@ def main() -> None:
             p.terminate()
             p.join(timeout=10)
 
-    # ── Final flush + upload of crash safety dataset ───────────────────────
-    crash_exp.flush()
-    if cfg.hf_crash_repo_id:
-        upload_crash_dataset(output_dir / "crash_parquet", cfg.hf_crash_repo_id, logger)
-
+   
     logger.info("==========================================================")
     logger.info(" Pipeline completed. Dataset is HF-streamable.")
     logger.info("==========================================================")
