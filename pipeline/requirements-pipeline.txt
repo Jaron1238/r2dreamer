@@ -1,0 +1,13 @@
+opencv-python>=4.12.0.88,<5.0.0
+numpy>=2.0.0,<3.0.0
+pandas
+pyarrow
+pytesseract
+pillow
+scipy
+tqdm
+yt-dlp
+huggingface-hub
+datasets
+av
+requests
