@@ -371,10 +371,16 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "extractor_args": {"youtube": ["player_client=android,ios,web"]},
     }
     # Only inject cookies when the file actually exists (written by CI from secret)
-    if cookies_path.exists() and cookies_path.stat().st_size > 0:
-        ydl_opts["cookiefile"] = str(cookies_path)
+    if cookies_path.exists():
+        size = cookies_path.stat().st_size
+        with open(cookies_path, "r", encoding="utf-8") as f:
+            first_line = f.readline().strip()
+        logger.warning(f"DIAGNOSE: cookies.txt gefunden! Größe: {size} Bytes. Erste Zeile: '{first_line}'")
+        
+        if size > 0:
+            ydl_opts["cookiefile"] = str(cookies_path)
     else:
-        logger.debug("[yt-dlp] cookies.txt not found – proceeding without cookies.")
+        logger.warning(f"DIAGNOSE: FEHLER! cookies.txt fehlt komplett unter: {cookies_path}")
     downloaded = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
