@@ -1,0 +1,170 @@
+# ============================================================
+#  FPV Data Pipeline — GitHub Actions Workflow
+# ============================================================
+#
+# FIRST-TIME SETUP (run these once locally):
+#
+#   1. Create a GitHub Gist to persist processed_urls.txt:
+#        gh gist create --public processed_urls.txt
+#      Copy the Gist ID from the output URL (the hash at the end).
+#
+#   2. Add the following Secrets in:
+#      Repo → Settings → Secrets and variables → Actions → New repository secret
+#
+#        HF_TOKEN      — Hugging Face write token (hf.co → Settings → Access Tokens)
+#        GH_TOKEN      — GitHub PAT with scopes: repo, gist, workflow
+#                        (github.com → Settings → Developer settings → Personal access tokens)
+#        GH_GIST_ID    — The Gist ID from step 1
+#        YT_COOKIES    — Contents of your cookies.txt file (optional, for age-gated videos)
+#
+#   3. Trigger the first run manually:
+#        gh workflow run fpv_pipeline.yml
+#      or via the GitHub Actions UI → "FPV Data Pipeline" → "Run workflow"
+#
+# ============================================================
+
+name: FPV Data Pipeline
+
+on:
+  # Manual trigger — also lets you override num_shards on the fly
+  workflow_dispatch:
+    inputs:
+      num_shards:
+        description: "Number of parallel shards (default: 10)"
+        required: false
+        default: "10"
+
+  # Automatic daily run at 02:00 UTC — adjust to your timezone
+  schedule:
+    - cron: "0 2 * * *"
+
+# Cancel any in-progress run for the same branch when a new one starts
+concurrency:
+  group: fpv-pipeline
+  cancel-in-progress: false   # keep false: we don't want to abort an active upload
+
+jobs:
+  pipeline:
+    name: "Shard ${{ matrix.shard }} / ${{ github.event.inputs.num_shards || 10 }}"
+    runs-on: ubuntu-latest
+
+    # Hard cap just below GitHub's 6-hour limit.
+    # The Python code itself stops at 5.5 h for a graceful upload.
+    timeout-minutes: 340
+
+    strategy:
+      fail-fast: false   # one shard failing must not cancel the others
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Free up disk space (~30 GB extra) ──────────────────────────────
+      # GitHub runners ship with Android SDK, .NET, Haskell etc. pre-installed
+      # — none of which we need. Remove them before anything else runs.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          df -h
+
+      # ── System dependencies ─────────────────────────────────────────────
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg \
+            tesseract-ocr \
+            tesseract-ocr-eng \
+            libgl1 \
+            libglib2.0-0
+
+      # ── Python setup ────────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── Secrets → files ─────────────────────────────────────────────────
+      - name: Write cookies.txt (if secret is set)
+        # The secret is optional — the pipeline falls back gracefully if absent
+        run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
+
+      # ── Restore progress from Gist ───────────────────────────────────────
+      # Download whatever URLs were already processed in previous runs so
+      # this shard can skip them immediately.
+      - name: Restore processed_urls.txt from Gist
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh gist view "${{ secrets.GH_GIST_ID }}" --raw > processed_urls.txt 2>/dev/null || true
+          echo "Restored $(wc -l < processed_urls.txt) already-processed URLs."
+
+      # ── Run pipeline ─────────────────────────────────────────────────────
+      - name: Run pipeline shard ${{ matrix.shard }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+        run: |
+          python pipeline/pipeline.py \
+            --shard ${{ matrix.shard }} \
+            --num-shards ${{ github.event.inputs.num_shards || 10 }}
+
+      # ── Upload progress as artifact (avoids Gist race condition) ────────
+      # Each shard uploads its own processed_urls.txt independently.
+      # A separate merge job (below) combines all shards and pushes to Gist once.
+      - name: Upload processed_urls artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: processed-urls-shard-${{ matrix.shard }}
+          path: processed_urls.txt
+          retention-days: 7
+
+      # ── Upload logs as artifact (always, even on failure) ───────────────
+      - name: Upload pipeline log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-log-shard-${{ matrix.shard }}
+          path: pipeline.log
+          retention-days: 7
+
+  # ── Merge job: combines all shard progress files into one Gist ─────────
+  # Runs after ALL shards finish (even if some failed).
+  # This avoids the race condition where 10 runners simultaneously
+  # try to overwrite the same Gist with gh gist edit.
+  merge-progress:
+    name: "Merge processed URLs → Gist"
+    runs-on: ubuntu-latest
+    needs: pipeline
+    if: always()
+    steps:
+      - name: Download all processed-urls artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: processed-urls-shard-*
+          merge-multiple: false
+          path: ./shard-artifacts
+
+      - name: Merge and deduplicate URLs
+        run: |
+          find ./shard-artifacts -name "processed_urls.txt" -exec cat {} \; \
+            | sort -u > merged_processed_urls.txt
+          echo "Total unique processed URLs: $(wc -l < merged_processed_urls.txt)"
+
+      - name: Push merged file to Gist
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GH_GIST_ID }}" merged_processed_urls.txt
