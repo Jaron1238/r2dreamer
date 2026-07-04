@@ -48,7 +48,7 @@ GRACEFUL_SHUTDOWN_SECONDS: float = 5.5 * 3600  # 5 h 30 min
 
 @dataclass
 class PipelineConfig:
-    csv_path: str = "fpv_videos_augmented_v2.csv"
+    csv_path: str = "pipeline/fpv_videos_augmented_v2.csv"
     output_root: str = "output"
     tmp_root: str = "tmp_downloads"
     resume_file: str = "processed_urls.txt"
