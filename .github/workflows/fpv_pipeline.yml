@@ -98,7 +98,7 @@ jobs:
       # ── Secrets → files ─────────────────────────────────────────────────
       - name: Write cookies.txt (if secret is set)
         # The secret is optional — the pipeline falls back gracefully if absent
-        run: echo "${{ secrets.YT_COOKIES }}" > cookies.txt
+        run: echo "${{ secrets.YT_COOKIES }}" > pipeline/cookies.txt
 
       # ── Restore progress from Gist ───────────────────────────────────────
       # Download whatever URLs were already processed in previous runs so
