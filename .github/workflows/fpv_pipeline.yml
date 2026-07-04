@@ -97,13 +97,12 @@ jobs:
 
       # ── Secrets → files ─────────────────────────────────────────────────
       - name: Write cookies.txt (if secret is set)
-        if: secrets.YT_COOKIES != ''
+        env:
+          COOKIE_DATA: ${{ secrets.YT_COOKIES }}
+        if: ${{ env.COOKIE_DATA != '' }}
         run: |
           mkdir -p pipeline
-          cat << 'EOF' > pipeline/cookies.txt
-          ${{ secrets.YT_COOKIES }}
-          EOF
-
+          echo "$COOKIE_DATA" > pipeline/cookies.txt
       # ── Restore progress from Gist ───────────────────────────────────────
       # Download whatever URLs were already processed in previous runs so
       # this shard can skip them immediately.
