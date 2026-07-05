@@ -8,6 +8,7 @@ pandas
 pyarrow   
 pytesseract  
 yt-dlp       
+bgutil-ytdlp-pot-provider
 requests    
 huggingface-hub 
 datasets    

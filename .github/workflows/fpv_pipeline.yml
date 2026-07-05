@@ -84,6 +84,12 @@ jobs:
             libgl1 \
             libglib2.0-0
 
+      # ── Deno setup ──────────────────────────────────────────────────────
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v1.x
+
       # ── Python setup ────────────────────────────────────────────────────
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
