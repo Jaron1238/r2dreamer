@@ -368,20 +368,27 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
-        "extractor_args": {"youtube": ["player_client=web"]},
-        "plugin_args": {"youtube": ["pot_provider=bgutil"]},
+        # player_client: tv_embedded/ios_downgraded are dead (removed upstream); web+web_safari
+        # is currently the most reliable combo, mweb as a third fallback.
+        "extractor_args": {
+            "youtube": {"player_client": ["web", "web_safari", "mweb"]},
+        },
+        # bgutil-ytdlp-pot-provider is auto-detected as an installed plugin (see
+        # requirements-pipeline.txt) as long as a JS runtime (deno, set up in the workflow) is
+        # on PATH - there is no "plugin_args"/"pot_provider" ydl_opts key to force it.
+        # Throttling: reduces the odds of tripping rate-based bot heuristics in the first place.
+        "sleep_interval_requests": 1,
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
     }
     # Only inject cookies when the file actually exists (written by CI from secret)
     if cookies_path.exists():
         size = cookies_path.stat().st_size
-        with open(cookies_path, "r", encoding="utf-8") as f:
-            first_line = f.readline().strip()
-        logger.warning(f"DIAGNOSE: cookies.txt gefunden! Größe: {size} Bytes. Erste Zeile: '{first_line}'")
-        
+        logger.info(f"cookies.txt gefunden ({size} Bytes).")
         if size > 0:
             ydl_opts["cookiefile"] = str(cookies_path)
     else:
-        logger.warning(f"DIAGNOSE: FEHLER! cookies.txt fehlt komplett unter: {cookies_path}")
+        logger.warning(f"cookies.txt fehlt unter: {cookies_path}")
     downloaded = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1142,11 +1149,17 @@ def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegist
         dl_dir = tmp_dir / "yt" / hashlib.md5(url.encode()).hexdigest()[:10]
         try:
             paths = download_yt_dlp(url, dl_dir, logger)
-            for p in paths: yield p, True, False
-            registry.mark_done(url)
+            if paths:
+                for p in paths: yield p, True, False
+                registry.mark_done(url)
+            else:
+                # ignoreerrors=True lets yt-dlp swallow failures without raising - treat an
+                # empty result the same as a real failure and leave the URL for a retry.
+                logger.warning(f"[{url_type}] Download lieferte 0 Dateien, URL bleibt offen: {url}")
         except Exception as e:
+            # NICHT mark_done: nur bei echtem Erfolg oben markieren, sonst geht die URL
+            # beim naechsten Lauf erneut in den Retry statt fuer immer verloren zu sein.
             logger.warning(f"[{url_type}] Download error: {e}")
-            registry.mark_done(url)
         finally:
             shutil.rmtree(dl_dir, ignore_errors=True)
     elif url_type == "hf_dataset":
