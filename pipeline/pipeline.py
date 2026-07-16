@@ -368,15 +368,16 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
-        # player_client: tv_embedded/ios_downgraded are dead (removed upstream); web+web_safari
-        # is currently the most reliable combo, mweb as a third fallback.
+        # mweb ist laut yt-dlp PO-Token-Guide der aktuell empfohlene Client fuer GVS-Requests,
+        # WENN ein echter PO-Token-Provider laeuft (siehe bgutil-provider Service-Container in
+        # der .yml - nur das pip-Paket allein liefert keine Tokens, s. Chat). web_safari als
+        # Fallback, falls bgutil mal nicht erreichbar ist.
         "extractor_args": {
-            "youtube": {"player_client": ["web", "web_safari", "mweb"]},
+            "youtube": {"player_client": ["mweb", "web_safari"]},
         },
-        # bgutil-ytdlp-pot-provider is auto-detected as an installed plugin (see
-        # requirements-pipeline.txt) as long as a JS runtime (deno, set up in the workflow) is
-        # on PATH - there is no "plugin_args"/"pot_provider" ydl_opts key to force it.
-        # Throttling: reduces the odds of tripping rate-based bot heuristics in the first place.
+        # HTTP-Provider laeuft als Service-Container auf localhost:4416 (Default-Port, siehe
+        # .yml) - kein extra extractor_arg noetig, das Plugin findet ihn automatisch.
+        # Throttling: reduziert die Chance, überhaupt als Bot erkannt zu werden.
         "sleep_interval_requests": 1,
         "sleep_interval": 2,
         "max_sleep_interval": 5,
