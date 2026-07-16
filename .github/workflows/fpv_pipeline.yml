@@ -98,7 +98,14 @@ jobs:
           python-version: "3.11"
           cache: "pip"
           cache-dependency-path: "pipeline/requirements-pipeline.txt"
+      
+      - name: Install Deno (yt-dlp JS challenge solver)
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
 
+      - name: Verify Deno is on PATH
+        run: deno --version
       - name: Install Python dependencies
         run: pip install -r pipeline/requirements-pipeline.txt   
 
