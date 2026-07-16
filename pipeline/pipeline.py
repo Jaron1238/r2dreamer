@@ -368,6 +368,9 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
+        # TEMPORAER zur Diagnose: zeigt u.a. die "[pot] PO Token Providers: ..." Zeile im Log,
+        # damit wir sehen ob bgutil ueberhaupt erkannt/genutzt wird. Danach wieder auf False.
+        "verbose": True,
         # mweb ist laut yt-dlp PO-Token-Guide der aktuell empfohlene Client fuer GVS-Requests,
         # WENN ein echter PO-Token-Provider laeuft (siehe bgutil-provider Service-Container in
         # der .yml - nur das pip-Paket allein liefert keine Tokens, s. Chat). web_safari als
