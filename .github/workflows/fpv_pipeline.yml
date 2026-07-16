@@ -57,6 +57,12 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
+    services:
+      bgutil-provider:
+        image: brainicism/bgutil-ytdlp-pot-provider
+        ports:
+          - 4416:4416
+
     steps:
       # ── Checkout ────────────────────────────────────────────────────────
       - name: Checkout repository
@@ -84,11 +90,6 @@ jobs:
             libgl1 \
             libglib2.0-0
 
-      # ── Deno setup ──────────────────────────────────────────────────────
-      - name: Set up Deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v1.x
 
       # ── Python setup ────────────────────────────────────────────────────
       - name: Set up Python 3.11
@@ -178,3 +179,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gh gist edit "${{ secrets.GH_GIST_ID }}" merged_processed_urls.txt
+
