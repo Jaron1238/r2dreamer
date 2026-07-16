@@ -368,7 +368,6 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": False,
-        "verbose": True,
         "extractor_args": {
             "youtube": {"player_client": ["mweb", "web_safari"]},
         },
