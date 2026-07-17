@@ -1058,6 +1058,29 @@ def _array_record(name: str, array: np.ndarray) -> Dict[str, List[Any]]:
     }
 
 
+def _table_from_record_with_large_binary(record: Dict[str, List[Any]]) -> pa.Table:
+    """Build a pyarrow Table from an export record, forcing raw-bytes columns to
+    large_binary (64-bit offsets).
+
+    pa.Table.from_pandas()/pa.array() infer plain `bytes` values as pyarrow's
+    `binary` type, which uses 32-bit offsets and hard-caps a single value (and
+    the column's total buffer) at 2**31 - 2 bytes (~2GB). A single video
+    segment's frames_gray blob at safety resolution (1280x720) crosses that
+    limit at ~2330 frames, well within max_segment_frames=3600, causing
+    "ArrowCapacityError: array cannot contain more than 2147483646 bytes".
+    large_binary uses 64-bit offsets and has no such limit.
+    """
+    arrays: List[pa.Array] = []
+    names: List[str] = []
+    for name, values in record.items():
+        if len(values) == 1 and isinstance(values[0], (bytes, bytearray)):
+            arrays.append(pa.array(values, type=pa.large_binary()))
+        else:
+            arrays.append(pa.array(values))
+        names.append(name)
+    return pa.Table.from_arrays(arrays, names=names)
+
+
 
 # ---------------------------------------------------------------------------
 #  CrashDatasetExporter
@@ -1234,7 +1257,7 @@ class ParquetExporter:
             "segment_id":   [segment_id],
         }
 
-        table = pa.Table.from_pandas(pd.DataFrame(record), preserve_index=False)
+        table = _table_from_record_with_large_binary(record)
         out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
         pq.write_table(table, out_path, compression="snappy")
         self.total_bytes += out_path.stat().st_size
