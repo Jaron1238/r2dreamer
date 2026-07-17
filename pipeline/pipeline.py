@@ -97,7 +97,7 @@ class PipelineConfig:
     download_max_retries: int = 3
     download_stall_timeout_s: int = 60
     max_segment_frames: int = 3600
-    mmap_max_frames: int = 60
+ mmap_max_frames: int = 3600
     chunk_size_frames: int = 60
 
 CFG = PipelineConfig()
