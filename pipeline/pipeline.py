@@ -13,6 +13,7 @@ import hashlib
 import logging
 import multiprocessing
 import queue
+import random
 import re
 import shutil
 import struct
@@ -96,11 +97,53 @@ class PipelineConfig:
     max_single_file_gb: float = 4.0   # >14 GB würde den Runner killen (No space left)
     download_max_retries: int = 3
     download_stall_timeout_s: int = 60
+    playlist_batch_size: int = 3  # limit concurrent playlist downloads on 14 GB GitHub runners
     max_segment_frames: int = 3600
- mmap_max_frames: int = 3600
+    mmap_max_frames: int = 3600
     chunk_size_frames: int = 60
 
 CFG = PipelineConfig()
+
+
+def _estimated_task_hours(row: pd.Series) -> float:
+    """Return a deterministic sharding weight for one CSV row."""
+    value = pd.to_numeric(row.get("estimated_hours", 0.0), errors="coerce")
+    if pd.notna(value) and float(value) > 0:
+        return float(value)
+
+    platform = str(row.get("platform", "")).lower()
+    if "playlist" in platform:
+        return 1.0
+    return 0.15
+
+
+def split_dataframe_balanced_by_estimated_hours(df: pd.DataFrame, shard: int, num_shards: int) -> pd.DataFrame:
+    """Assign rows to shards by estimated work instead of raw row count.
+
+    GitHub Actions matrix shards cannot steal work from each other once they
+    have started, so simple ``df.iloc[shard::num_shards]`` slicing can leave one
+    runner with most of the long playlists.  A largest-processing-time-first
+    pass distributes high-cost rows across shards while remaining deterministic.
+    """
+    if num_shards <= 1:
+        return df.reset_index(drop=True)
+    if shard < 0 or shard >= num_shards:
+        raise ValueError(f"shard must be in [0, {num_shards}), got {shard}")
+
+    weighted_rows = [
+        (idx, _estimated_task_hours(row))
+        for idx, row in df.iterrows()
+    ]
+    shard_loads = [0.0] * num_shards
+    shard_indices: List[List[int]] = [[] for _ in range(num_shards)]
+
+    for idx, hours in sorted(weighted_rows, key=lambda item: (-item[1], item[0])):
+        target_shard = min(range(num_shards), key=lambda i: (shard_loads[i], i))
+        shard_indices[target_shard].append(idx)
+        shard_loads[target_shard] += hours
+
+    selected = sorted(shard_indices[shard])
+    return df.loc[selected].reset_index(drop=True)
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -354,11 +397,9 @@ def download_file_http(url: str, dest: Path, logger: logging.Logger) -> Optional
     return None
 
 
-def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Path]:
-    import yt_dlp
-    dest_dir.mkdir(parents=True, exist_ok=True)
+def _yt_dlp_options(dest_dir: Path, *, allow_playlist: bool) -> Dict[str, Any]:
     cookies_path = Path(__file__).parent / "cookies.txt"
-    ydl_opts = {
+    ydl_opts: Dict[str, Any] = {
         "format": "bestvideo+bestaudio/best",
         "format_sort": ["vcodec:h264", "acodec:aac", "quality", "res", "fps"],
         "merge_output_format": "mp4",
@@ -367,7 +408,7 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": True,
-        "noplaylist": False,
+        "noplaylist": not allow_playlist,
         "extractor_args": {
             "youtube": {"player_client": ["mweb", "web_safari"]},
         },
@@ -376,30 +417,87 @@ def download_yt_dlp(url: str, dest_dir: Path, logger: logging.Logger) -> List[Pa
         "sleep_interval": 2,
         "max_sleep_interval": 5,
     }
+    if cookies_path.exists() and cookies_path.stat().st_size > 0:
+        ydl_opts["cookiefile"] = str(cookies_path)
+    return ydl_opts
+
+
+def _download_yt_dlp_items(urls: List[str], dest_dir: Path, logger: logging.Logger) -> List[Path]:
+    import yt_dlp
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    cookies_path = Path(__file__).parent / "cookies.txt"
     # Only inject cookies when the file actually exists (written by CI from secret)
     if cookies_path.exists():
         size = cookies_path.stat().st_size
         logger.info(f"cookies.txt gefunden ({size} Bytes).")
-        if size > 0:
-            ydl_opts["cookiefile"] = str(cookies_path)
     else:
         logger.warning(f"cookies.txt fehlt unter: {cookies_path}")
     downloaded = []
     try:
+        ydl_opts = _yt_dlp_options(dest_dir, allow_playlist=False)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if info is None:
-                return []
-            entries = info.get("entries") or [info]
-            for entry in entries:
-                if entry is None:
+            for item_url in urls:
+                info = ydl.extract_info(item_url, download=True)
+                if info is None:
                     continue
-                p = dest_dir / f"{entry.get('id','video')}.{entry.get('ext','mp4')}"
-                if p.exists() and p.stat().st_size > 0:
-                    downloaded.append(p)
+                entries = info.get("entries") or [info]
+                for entry in entries:
+                    if entry is None:
+                        continue
+                    candidates = list(dest_dir.glob(f"{entry.get('id','video')}.*"))
+                    for p in candidates:
+                        if p.suffix.lower() in VIDEO_EXTS and p.stat().st_size > 0:
+                            downloaded.append(p)
+                            break
     except Exception as e:
-        raise RuntimeError(f"yt-dlp failed for {url}: {e}") from e
+        raise RuntimeError(f"yt-dlp failed for {urls[0] if urls else '<empty>'}: {e}") from e
     return downloaded
+
+
+def iter_yt_dlp_batched(url: str, dest_dir: Path, logger: logging.Logger, deadline_reached: Optional[Any] = None) -> Iterator[Path]:
+    """Download YouTube/AirVuz URLs in small batches and yield local files.
+
+    Playlists are first resolved without downloading.  Each batch is then
+    downloaded with playlist expansion disabled so at most
+    CFG.playlist_batch_size videos reside in ``dest_dir`` at once.
+    """
+    import yt_dlp
+
+    batch_size = max(1, int(CFG.playlist_batch_size))
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    ydl_opts = _yt_dlp_options(dest_dir, allow_playlist=True)
+    ydl_opts["extract_flat"] = "in_playlist"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if info is None:
+        return
+
+    entries = info.get("entries")
+    if entries:
+        item_urls = []
+        for entry in entries:
+            if entry is None:
+                continue
+            item_url = entry.get("webpage_url") or entry.get("url")
+            if not item_url:
+                continue
+            item_urls.append(item_url)
+    else:
+        item_urls = [url]
+
+    logger.info(f"[yt-dlp] Downloading {len(item_urls)} item(s) in batches of {batch_size}.")
+    for start in range(0, len(item_urls), batch_size):
+        if deadline_reached and deadline_reached():
+            logger.warning("[Shutdown] Deadline reached before next playlist batch; stopping URL without marking done.")
+            return
+        batch_urls = item_urls[start:start + batch_size]
+        batch_dir = dest_dir / f"batch_{start // batch_size:05d}"
+        paths = _download_yt_dlp_items(batch_urls, batch_dir, logger)
+        try:
+            for p in paths:
+                yield p
+        finally:
+            shutil.rmtree(batch_dir, ignore_errors=True)
 
 
 def iter_github_repo_videos(repo_url: str, tmp_dir: Path, logger: logging.Logger) -> Iterator[Tuple[Path, bool]]:
@@ -945,6 +1043,21 @@ def build_osd_array(speeds: np.ndarray, altitudes: np.ndarray, batteries: np.nda
     return osd
 
 
+def _array_record(name: str, array: np.ndarray) -> Dict[str, List[Any]]:
+    """Serialize an ndarray as bytes plus shape metadata for Parquet.
+
+    PyArrow cannot infer variable-sized nested list columns from multi-dimensional
+    numpy arrays reliably.  Storing contiguous bytes with an explicit shape keeps
+    Parquet writing stable and avoids exploding memory by converting video
+    tensors to huge Python nested lists.
+    """
+    arr = np.ascontiguousarray(array)
+    return {
+        name: [arr.tobytes()],
+        f"{name}_shape": [list(arr.shape)],
+    }
+
+
 
 # ---------------------------------------------------------------------------
 #  CrashDatasetExporter
@@ -1097,21 +1210,21 @@ class ParquetExporter:
 
         osd = build_osd_array(speeds, altitudes, batteries, n)
 
-        record = {
+        record: Dict[str, List[Any]] = {
             # r2dreamer FPVDataset primary fields
-            "frames_rgb":   [frames_rgb],                           # (T, H, W, 3) uint8 – RSSM resolution
-            # Bug fix: store frames_gray at SafetyNet resolution (safety_h x safety_w).
-            # Previously omitted — trainer was forced to upscale 512x288 → 1280x720 (bad quality).
-            # Now: downscaled from 1080p source in pipeline → high-quality obstacle detection.
-            **( {"frames_gray": [frames_gray]} if frames_gray is not None else {} ),
-            "cam_overlay":  [cam_overlay_mask],                     # (H, W) uint8
-            "osd":          [osd],                                  # (T, 8) float32
+            **_array_record("frames_rgb", frames_rgb.astype(np.uint8, copy=False)),  # (T, H, W, 3)
+            **(
+                _array_record("frames_gray", frames_gray.astype(np.uint8, copy=False))
+                if frames_gray is not None else {}
+            ),  # (T, safety_h, safety_w, 1)
+            **_array_record("cam_overlay", cam_overlay_mask.astype(np.uint8, copy=False)),  # (H, W)
+            **_array_record("osd", osd.astype(np.float32, copy=False)),  # (T, 8)
             # Shared fields (actions, telemetry, flags)
-            "actions":      [actions.astype(np.float32)],           # (T, 4)
-            "speeds":       [speeds.astype(np.float32)],            # (T,)
-            "altitudes":    [altitudes.astype(np.float32)],         # (T,)
-            "batteries":    [batteries.astype(np.float32)],         # (T,)
-            "is_terminal":  [is_terminal],                          # (T,) bool
+            **_array_record("actions", actions.astype(np.float32, copy=False)),  # (T, 4)
+            **_array_record("speeds", speeds.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("altitudes", altitudes.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("batteries", batteries.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("is_terminal", is_terminal.astype(np.bool_, copy=False)),  # (T,)
             # Scalar metadata
             "n_frames":     [n],
             "drone_id":     [drone_id],
@@ -1138,25 +1251,32 @@ def interp_nan(arr: np.ndarray) -> np.ndarray:
     return arr
 
 
-def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegistry, logger: logging.Logger) -> Iterator[Tuple[Path, bool, bool]]:
+def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegistry, logger: logging.Logger, deadline_reached: Optional[Any] = None) -> Iterator[Tuple[Path, bool, bool]]:
     url_type = classify_url(url, platform)
     if url_type in ("youtube", "airvuz"):
         dl_dir = tmp_dir / "yt" / hashlib.md5(url.encode()).hexdigest()[:10]
+        completed = False
         try:
-            paths = download_yt_dlp(url, dl_dir, logger)
-            if paths:
-                for p in paths: yield p, True, False
-                registry.mark_done(url)
-            else:
-                # ignoreerrors=True lets yt-dlp swallow failures without raising - treat an
-                # empty result the same as a real failure and leave the URL for a retry.
-                logger.warning(f"[{url_type}] Download lieferte 0 Dateien, URL bleibt offen: {url}")
+            yielded = 0
+            for p in iter_yt_dlp_batched(url, dl_dir, logger, deadline_reached):
+                if deadline_reached and deadline_reached():
+                    logger.warning("[Shutdown] Deadline reached inside playlist; stopping URL without marking done.")
+                    return
+                yielded += 1
+                yield p, True, False
+            completed = yielded > 0
         except Exception as e:
             # NICHT mark_done: nur bei echtem Erfolg oben markieren, sonst geht die URL
             # beim naechsten Lauf erneut in den Retry statt fuer immer verloren zu sein.
             logger.warning(f"[{url_type}] Download error: {e}")
         finally:
             shutil.rmtree(dl_dir, ignore_errors=True)
+        if completed and not (deadline_reached and deadline_reached()):
+            registry.mark_done(url)
+        elif not completed:
+            # ignoreerrors=True lets yt-dlp swallow failures without raising - treat an
+            # empty result the same as a real failure and leave the URL for a retry.
+            logger.warning(f"[{url_type}] Download lieferte 0 Dateien, URL bleibt offen: {url}")
     elif url_type == "hf_dataset":
         match = re.search(r"huggingface\.co/datasets/([^/\s?#]+/[^/\s?#]+)", url)
         if match:
@@ -1454,7 +1574,9 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
     seg_registry = SegmentRegistry(cfg.segment_done_file, threading.Lock())
 
     gist_save_interval = 300  # save progress every 5 minutes
-    last_gist_save = time.monotonic()
+    gist_jitter = random.uniform(0, gist_save_interval)
+    last_gist_save = time.monotonic() - gist_jitter
+    logger.info(f"[Gist] Periodic save jitter offset: {gist_jitter:.1f}s.")
 
     while True:
         # ── Deadline check: stop before GitHub kills us ────────────────────
@@ -1477,8 +1599,11 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
             continue
 
         logger.info(f"Processing: [{platform}] {title[:50]}...")
-        for video_path, is_fpv, _ in _iter_url_videos(url, platform, tmp_dir, registry, logger):
+        for video_path, is_fpv, _ in _iter_url_videos(url, platform, tmp_dir, registry, logger, _deadline_reached):
             try:
+                if _deadline_reached():
+                    logger.warning("[Shutdown] Deadline reached before processing next video; deleting current file and stopping.")
+                    break
                 _process_video_cpu(video_path, is_fpv, parquet_exp, crash_exp, output_dir, cfg, logger, takeoff_det, osd_det, stick_det, scene_seg, crash_det, drone_cls, seg_registry, tmp_dir)
             except Exception as e:
                 logger.error(f"[{video_path.stem}] Critical Error: {e}")
@@ -1507,6 +1632,10 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
                     video_path.unlink()
                 except Exception:
                     pass
+
+            if _deadline_reached():
+                logger.warning("[Shutdown] Deadline reached inside URL video loop; stopping task loop for final upload.")
+                break
 
         if progress_counter is not None and progress_lock is not None:
             with progress_lock:
@@ -1566,10 +1695,14 @@ def main() -> None:
         logger.critical(f"CSV load error: {e}")
         sys.exit(1)
 
-    # ── Sharding: slice the CSV so each runner processes a different block ──
+    # ── Sharding: balance estimated work so long playlists are spread out ──
     if args.num_shards > 1:
-        df = df.iloc[args.shard::args.num_shards].reset_index(drop=True)
-        logger.info(f"[Shard {args.shard}/{args.num_shards}] Processing {len(df)} entries.")
+        df = split_dataframe_balanced_by_estimated_hours(df, args.shard, args.num_shards)
+        shard_hours = sum(_estimated_task_hours(row) for _, row in df.iterrows())
+        logger.info(
+            f"[Shard {args.shard}/{args.num_shards}] Processing {len(df)} entries "
+            f"(estimated {shard_hours:.2f} h)."
+        )
 
     task_queue = multiprocessing.Queue()
     for _, row in df.iterrows():
