@@ -65,8 +65,8 @@ class PipelineConfig:
     # SafetyNet resolution — must match model.safety_img_height/width in configs.yaml
     safety_h: int = 720
     safety_w: int = 1280
-    depth_h: int = 1080
-    depth_w: int = 1920
+    depth_h: int = 720
+    depth_w: int = 1280
     pack_chunk_gb: float = 1.0  # keep peak RAM usage within CI runner budget
     takeoff_fps: float = 15.0
     takeoff_res: int = 128
