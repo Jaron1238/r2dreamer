@@ -105,6 +105,47 @@ class PipelineConfig:
 CFG = PipelineConfig()
 
 
+def _estimated_task_hours(row: pd.Series) -> float:
+    """Return a deterministic sharding weight for one CSV row."""
+    value = pd.to_numeric(row.get("estimated_hours", 0.0), errors="coerce")
+    if pd.notna(value) and float(value) > 0:
+        return float(value)
+
+    platform = str(row.get("platform", "")).lower()
+    if "playlist" in platform:
+        return 1.0
+    return 0.15
+
+
+def split_dataframe_balanced_by_estimated_hours(df: pd.DataFrame, shard: int, num_shards: int) -> pd.DataFrame:
+    """Assign rows to shards by estimated work instead of raw row count.
+
+    GitHub Actions matrix shards cannot steal work from each other once they
+    have started, so simple ``df.iloc[shard::num_shards]`` slicing can leave one
+    runner with most of the long playlists.  A largest-processing-time-first
+    pass distributes high-cost rows across shards while remaining deterministic.
+    """
+    if num_shards <= 1:
+        return df.reset_index(drop=True)
+    if shard < 0 or shard >= num_shards:
+        raise ValueError(f"shard must be in [0, {num_shards}), got {shard}")
+
+    weighted_rows = [
+        (idx, _estimated_task_hours(row))
+        for idx, row in df.iterrows()
+    ]
+    shard_loads = [0.0] * num_shards
+    shard_indices: List[List[int]] = [[] for _ in range(num_shards)]
+
+    for idx, hours in sorted(weighted_rows, key=lambda item: (-item[1], item[0])):
+        target_shard = min(range(num_shards), key=lambda i: (shard_loads[i], i))
+        shard_indices[target_shard].append(idx)
+        shard_loads[target_shard] += hours
+
+    selected = sorted(shard_indices[shard])
+    return df.loc[selected].reset_index(drop=True)
+
+
 def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     if logger.handlers:
@@ -424,7 +465,9 @@ def iter_yt_dlp_batched(url: str, dest_dir: Path, logger: logging.Logger, deadli
 
     batch_size = max(1, int(CFG.playlist_batch_size))
     dest_dir.mkdir(parents=True, exist_ok=True)
-    with yt_dlp.YoutubeDL(_yt_dlp_options(dest_dir, allow_playlist=True) | {"extract_flat": "in_playlist"}) as ydl:
+    ydl_opts = _yt_dlp_options(dest_dir, allow_playlist=True)
+    ydl_opts["extract_flat"] = "in_playlist"
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if info is None:
         return
@@ -1637,10 +1680,14 @@ def main() -> None:
         logger.critical(f"CSV load error: {e}")
         sys.exit(1)
 
-    # ── Sharding: slice the CSV so each runner processes a different block ──
+    # ── Sharding: balance estimated work so long playlists are spread out ──
     if args.num_shards > 1:
-        df = df.iloc[args.shard::args.num_shards].reset_index(drop=True)
-        logger.info(f"[Shard {args.shard}/{args.num_shards}] Processing {len(df)} entries.")
+        df = split_dataframe_balanced_by_estimated_hours(df, args.shard, args.num_shards)
+        shard_hours = sum(_estimated_task_hours(row) for _, row in df.iterrows())
+        logger.info(
+            f"[Shard {args.shard}/{args.num_shards}] Processing {len(df)} entries "
+            f"(estimated {shard_hours:.2f} h)."
+        )
 
     task_queue = multiprocessing.Queue()
     for _, row in df.iterrows():
