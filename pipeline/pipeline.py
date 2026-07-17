@@ -1043,6 +1043,21 @@ def build_osd_array(speeds: np.ndarray, altitudes: np.ndarray, batteries: np.nda
     return osd
 
 
+def _array_record(name: str, array: np.ndarray) -> Dict[str, List[Any]]:
+    """Serialize an ndarray as bytes plus shape metadata for Parquet.
+
+    PyArrow cannot infer variable-sized nested list columns from multi-dimensional
+    numpy arrays reliably.  Storing contiguous bytes with an explicit shape keeps
+    Parquet writing stable and avoids exploding memory by converting video
+    tensors to huge Python nested lists.
+    """
+    arr = np.ascontiguousarray(array)
+    return {
+        name: [arr.tobytes()],
+        f"{name}_shape": [list(arr.shape)],
+    }
+
+
 
 # ---------------------------------------------------------------------------
 #  CrashDatasetExporter
@@ -1195,21 +1210,21 @@ class ParquetExporter:
 
         osd = build_osd_array(speeds, altitudes, batteries, n)
 
-        record = {
+        record: Dict[str, List[Any]] = {
             # r2dreamer FPVDataset primary fields
-            "frames_rgb":   [frames_rgb],                           # (T, H, W, 3) uint8 – RSSM resolution
-            # Bug fix: store frames_gray at SafetyNet resolution (safety_h x safety_w).
-            # Previously omitted — trainer was forced to upscale 512x288 → 1280x720 (bad quality).
-            # Now: downscaled from 1080p source in pipeline → high-quality obstacle detection.
-            **( {"frames_gray": [frames_gray]} if frames_gray is not None else {} ),
-            "cam_overlay":  [cam_overlay_mask],                     # (H, W) uint8
-            "osd":          [osd],                                  # (T, 8) float32
+            **_array_record("frames_rgb", frames_rgb.astype(np.uint8, copy=False)),  # (T, H, W, 3)
+            **(
+                _array_record("frames_gray", frames_gray.astype(np.uint8, copy=False))
+                if frames_gray is not None else {}
+            ),  # (T, safety_h, safety_w, 1)
+            **_array_record("cam_overlay", cam_overlay_mask.astype(np.uint8, copy=False)),  # (H, W)
+            **_array_record("osd", osd.astype(np.float32, copy=False)),  # (T, 8)
             # Shared fields (actions, telemetry, flags)
-            "actions":      [actions.astype(np.float32)],           # (T, 4)
-            "speeds":       [speeds.astype(np.float32)],            # (T,)
-            "altitudes":    [altitudes.astype(np.float32)],         # (T,)
-            "batteries":    [batteries.astype(np.float32)],         # (T,)
-            "is_terminal":  [is_terminal],                          # (T,) bool
+            **_array_record("actions", actions.astype(np.float32, copy=False)),  # (T, 4)
+            **_array_record("speeds", speeds.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("altitudes", altitudes.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("batteries", batteries.astype(np.float32, copy=False)),  # (T,)
+            **_array_record("is_terminal", is_terminal.astype(np.bool_, copy=False)),  # (T,)
             # Scalar metadata
             "n_frames":     [n],
             "drone_id":     [drone_id],

@@ -157,6 +157,23 @@ class FPVDataset(IterableDataset):
             shuffle_seed=seed,
         )
 
+    def _sample_array(self, sample, key: str, dtype=None):
+        """Read either legacy nested-list arrays or byte+shape Parquet arrays."""
+        if key not in sample:
+            return None
+
+        value = sample[key]
+        shape = sample.get(f"{key}_shape")
+        if shape is not None and isinstance(value, (bytes, bytearray, memoryview)):
+            arr = np.frombuffer(value, dtype=dtype or np.uint8)
+            return arr.reshape(tuple(shape))
+
+        # Backward compatibility for existing Parquet shards where each segment
+        # was stored as a one-element nested array/list column.
+        if isinstance(value, (list, tuple)) and len(value) == 1:
+            value = value[0]
+        return np.array(value, dtype=dtype)
+
     def __iter__(self):
         worker_info = get_worker_info()
         ds_iter = self.ds
@@ -164,12 +181,12 @@ class FPVDataset(IterableDataset):
             ds_iter = ds_iter.shard(num_shards=worker_info.num_workers, index=worker_info.id)
         for sample in ds_iter:
             if "frames_gray" in sample:
-                gray_full = torch.from_numpy(np.array(sample["frames_gray"][0])).float() / 255.0
+                gray_full = torch.from_numpy(self._sample_array(sample, "frames_gray", np.uint8)).float() / 255.0
                 gray_full = self._ensure_channel_last(gray_full)
             elif "frames_rgb" in sample or "frames" in sample:
                 # frames_gray not present → derive from RGB on the fly
                 rgb_key = "frames_rgb" if "frames_rgb" in sample else "frames"
-                _rgb = torch.from_numpy(np.array(sample[rgb_key][0])).float() / 255.0
+                _rgb = torch.from_numpy(self._sample_array(sample, rgb_key, np.uint8)).float() / 255.0
                 _rgb = self._ensure_channel_last(_rgb)
                 if _rgb.shape[-1] == 3:
                     gray_full = _rgb.mean(dim=-1, keepdim=True)
@@ -179,15 +196,15 @@ class FPVDataset(IterableDataset):
                 continue  # no usable image key in this sample
             rgb_full = None
             if "frames_rgb" in sample:
-                rgb_full = torch.from_numpy(np.array(sample["frames_rgb"][0])).float() / 255.0
+                rgb_full = torch.from_numpy(self._sample_array(sample, "frames_rgb", np.uint8)).float() / 255.0
                 rgb_full = self._ensure_channel_last(rgb_full)
             has_precomputed_depth = "frames_depth" in sample
             if has_precomputed_depth:
-                depth_full = torch.from_numpy(np.array(sample["frames_depth"][0])).float() / 255.0
+                depth_full = torch.from_numpy(self._sample_array(sample, "frames_depth", np.uint8)).float() / 255.0
                 depth_full = self._ensure_channel_last(depth_full)
             else:
                 depth_full = None
-            is_terminal_full = torch.from_numpy(np.array(sample["is_terminal"][0])).bool()
+            is_terminal_full = torch.from_numpy(self._sample_array(sample, "is_terminal", np.bool_)).bool()
 
             T = gray_full.shape[0]
             if T < self.batch_length:
@@ -251,25 +268,25 @@ class FPVDataset(IterableDataset):
                 is_last[-1] = True
 
                 if sample.get("has_osd", False):  # Bug #4 fix: require_osd is a dataset-level filter, not per-sample action gate
-                    actions_full = torch.from_numpy(np.array(sample["actions"][0])).float()
+                    actions_full = torch.from_numpy(self._sample_array(sample, "actions", np.float32)).float()
                     actions = actions_full[start : start + self.batch_length]
                 else:
                     actions = torch.zeros((self.batch_length, self.action_dim), dtype=torch.float32)
                 osd, has_osd = self._extract_osd(sample, start, self.batch_length)
                 cam_overlay, has_cam_overlay = self._extract_cam_overlay(sample, start, self.batch_length, raw_image)
 
-                speed_full = torch.from_numpy(np.array(sample["speeds"][0])).float() if "speeds" in sample else None
+                speed_full = torch.from_numpy(self._sample_array(sample, "speeds", np.float32)).float() if "speeds" in sample else None
                 speed = speed_full[start : start + self.batch_length] if speed_full is not None else torch.zeros(
                     self.batch_length, 1, dtype=torch.float32
                 )
-                altitude_full = torch.from_numpy(np.array(sample["altitudes"][0])).float() if "altitudes" in sample else None
+                altitude_full = torch.from_numpy(self._sample_array(sample, "altitudes", np.float32)).float() if "altitudes" in sample else None
                 altitude = altitude_full[start : start + self.batch_length] if altitude_full is not None else torch.zeros(
                     self.batch_length, 1, dtype=torch.float32
                 )
                 if self.phase == 2:
                     speed = self._apply_telemetry_noise(speed, self.telemetry_jitter_std, self.telemetry_stale_prob)
                     altitude = self._apply_telemetry_noise(altitude, self.telemetry_jitter_std, self.telemetry_stale_prob)
-                battery_full = torch.from_numpy(np.array(sample["batteries"][0])).float() if "batteries" in sample else None
+                battery_full = torch.from_numpy(self._sample_array(sample, "batteries", np.float32)).float() if "batteries" in sample else None
                 battery = battery_full[start : start + self.batch_length] if battery_full is not None else torch.zeros(
                     self.batch_length, 1, dtype=torch.float32
                 )
@@ -362,7 +379,7 @@ class FPVDataset(IterableDataset):
     def _extract_osd(self, sample, start: int, length: int):
         has_osd = bool(sample.get("has_osd", False))
         if has_osd and "osd" in sample:
-            arr = torch.from_numpy(np.array(sample["osd"][0])).float()
+            arr = torch.from_numpy(self._sample_array(sample, "osd", np.float32)).float()
             osd = arr[start : start + length]
         else:
             osd = torch.zeros((length, 8), dtype=torch.float32)
@@ -373,7 +390,7 @@ class FPVDataset(IterableDataset):
         overlay = None
         for key in keys:
             if key in sample:
-                raw = torch.from_numpy(np.array(sample[key][0])).float()
+                raw = torch.from_numpy(self._sample_array(sample, key, np.uint8)).float()
                 if raw.max() > 1.5:
                     raw = raw / 255.0
                 raw = self._ensure_channel_last(raw)
