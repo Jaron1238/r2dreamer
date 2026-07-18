@@ -79,6 +79,19 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache
           df -h
 
+      # ── Add swap (safety net against OOM-kill of the whole runner) ─────
+      # ubuntu-latest ships with no swap. A RAM spike (long uncut scene →
+      # multi-GB frame buffers in pipeline.py) hard-kills the runner VM
+      # before any `if: always()` step (incl. log upload) can run. Swap
+      # lets the kernel degrade instead of killing the process outright.
+      - name: Add swap space
+        run: |
+          sudo fallocate -l 8G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
       # ── System dependencies ─────────────────────────────────────────────
       - name: Install system dependencies
         run: |
@@ -128,12 +141,21 @@ jobs:
           echo "Restored $(wc -l < processed_urls.txt) already-processed URLs."
 
       # ── Run pipeline ─────────────────────────────────────────────────────
+      # ulimit -v caps this process's own virtual memory (14GB, leaving ~2GB
+      # for the OS/runner-agent/ffmpeg subprocess on the 16GB public runner).
+      # If the pipeline exceeds it, ITS allocations fail (Python raises
+      # MemoryError) instead of the kernel OOM-killer picking a victim across
+      # the whole VM. That distinction matters: an OOM-killed runner agent
+      # can't run any further steps (incl. log upload) at all, whereas a
+      # ulimit'd Python process dying leaves the runner alive, so
+      # `if: always()` steps below still execute normally.
       - name: Run pipeline shard ${{ matrix.shard }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
         run: |
+          ulimit -v $((14 * 1024 * 1024))  # 14GB, in KB (ulimit -v unit)
           python pipeline/pipeline.py \
             --shard ${{ matrix.shard }} \
             --num-shards ${{ github.event.inputs.num_shards || 10 }}

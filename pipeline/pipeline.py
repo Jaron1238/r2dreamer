@@ -3,12 +3,14 @@
 import argparse
 import io
 import os
+import resource
 
 import cv2
 cv2.setNumThreads(0)  # let OpenCV manage its own threads on GitHub CI
 
 import contextlib
 import gc
+import ctypes
 import hashlib
 import logging
 import multiprocessing
@@ -1058,7 +1060,38 @@ def _array_record(name: str, array: np.ndarray) -> Dict[str, List[Any]]:
     }
 
 
-def _table_from_record_with_large_binary(record: Dict[str, List[Any]]) -> pa.Table:
+def _array_record_from_chunks(name: str, chunks: List[np.ndarray]) -> Dict[str, Any]:
+    """Same as _array_record, but builds a large_binary pa.Array directly from
+    a single np.concatenate of the chunks, via a zero-copy pa.py_buffer wrap —
+    instead of materializing a separate .tobytes() copy.
+
+    An earlier version of this function used b"".join(c.tobytes() for c in
+    chunks). That looked streaming but isn't: CPython's bytes.join() calls
+    PySequence_Fast() on its argument first, which fully materializes the
+    generator (i.e. all per-chunk .tobytes() copies) into a list *before*
+    concatenating them — verified via tracemalloc, it was a 3x-of-total-data
+    peak, identical to the plain np.concatenate + .tobytes() path it was
+    meant to replace.
+
+    This version: one np.concatenate (unavoidable — Arrow needs one
+    contiguous buffer per value) + pa.py_buffer, which wraps that numpy
+    array's memory directly without copying. Peak here is 2x total data
+    (the original open_bufs chunks, still referenced by the caller until
+    export_segment returns, plus the one concatenated copy) — confirmed via
+    tracemalloc.
+    """
+    if not chunks:
+        return {name: pa.array([b""], type=pa.large_binary()), f"{name}_shape": [[0]]}
+    merged = np.ascontiguousarray(np.concatenate(chunks, axis=0))
+    total_len = merged.shape[0]
+    tail_shape = list(merged.shape[1:])
+    data_buf = pa.py_buffer(merged)  # zero-copy: shares merged's memory, no .tobytes()
+    offsets_buf = pa.py_buffer(np.array([0, merged.nbytes], dtype=np.int64))
+    arr = pa.Array.from_buffers(pa.large_binary(), 1, [None, offsets_buf, data_buf])
+    return {name: arr, f"{name}_shape": [[total_len] + tail_shape]}
+
+
+def _table_from_record_with_large_binary(record: Dict[str, Any]) -> pa.Table:
     """Build a pyarrow Table from an export record, forcing raw-bytes columns to
     large_binary (64-bit offsets).
 
@@ -1073,7 +1106,11 @@ def _table_from_record_with_large_binary(record: Dict[str, List[Any]]) -> pa.Tab
     arrays: List[pa.Array] = []
     names: List[str] = []
     for name, values in record.items():
-        if len(values) == 1 and isinstance(values[0], (bytes, bytearray)):
+        if isinstance(values, pa.Array):
+            # Already a ready-built Array (zero-copy large_binary from
+            # _array_record_from_chunks) — using it as-is avoids another copy.
+            arrays.append(values)
+        elif len(values) == 1 and isinstance(values[0], (bytes, bytearray)):
             arrays.append(pa.array(values, type=pa.large_binary()))
         else:
             arrays.append(pa.array(values))
@@ -1217,8 +1254,8 @@ class ParquetExporter:
         self,
         stem: str,
         segment_id: int,
-        frames_rgb: np.ndarray,               # (T, H, W, 3) uint8 RGB – already inpainted
-        frames_gray: Optional[np.ndarray],    # (T, safety_h, safety_w, 1) uint8 – SafetyNet resolution; None = omit
+        frames_rgb_chunks: List[np.ndarray],           # list of (t, H, W, 3) uint8 RGB chunks – already inpainted
+        frames_gray_chunks: Optional[List[np.ndarray]],  # list of (t, safety_h, safety_w, 1) uint8 chunks; None/empty = omit
         cam_overlay_mask: np.ndarray,         # (H, W) uint8 binary mask
         actions: np.ndarray,           # (T, 4) float32
         speeds: np.ndarray,            # (T,) float32
@@ -1229,16 +1266,19 @@ class ParquetExporter:
         has_osd: bool,
         fps: float,
     ) -> Path:
-        n = len(frames_rgb)
+        n = sum(c.shape[0] for c in frames_rgb_chunks)
 
         osd = build_osd_array(speeds, altitudes, batteries, n)
 
-        record: Dict[str, List[Any]] = {
+        record: Dict[str, Any] = {
             # r2dreamer FPVDataset primary fields
-            **_array_record("frames_rgb", frames_rgb.astype(np.uint8, copy=False)),  # (T, H, W, 3)
+            # Byte-joined directly from chunks — avoids materializing a second
+            # full-segment copy via np.concatenate before serialization (see
+            # _array_record_from_chunks docstring for the memory rationale).
+            **_array_record_from_chunks("frames_rgb", frames_rgb_chunks),  # (T, H, W, 3)
             **(
-                _array_record("frames_gray", frames_gray.astype(np.uint8, copy=False))
-                if frames_gray is not None else {}
+                _array_record_from_chunks("frames_gray", frames_gray_chunks)
+                if frames_gray_chunks else {}
             ),  # (T, safety_h, safety_w, 1)
             **_array_record("cam_overlay", cam_overlay_mask.astype(np.uint8, copy=False)),  # (H, W)
             **_array_record("osd", osd.astype(np.float32, copy=False)),  # (T, 8)
@@ -1356,13 +1396,28 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
         fps: float = cfg.target_fps
         window_start_frame: int = 0
 
+        def _release_freed_memory() -> None:
+            """Force glibc to actually return freed heap memory to the OS.
+
+            Refcounting frees numpy/bytes buffers immediately once out of
+            scope, but glibc malloc often keeps the arena mapped for reuse
+            instead of returning it — especially with the varying chunk/
+            segment sizes here. Over many videos in the same long-lived
+            worker process that shows up as RSS creeping up without an
+            actual Python-level leak. gc.collect() also clears any
+            reference cycles the _flush_scene closure might hold.
+            """
+            gc.collect()
+            try:
+                ctypes.CDLL("libc.so.6").malloc_trim(0)
+            except Exception:
+                pass  # non-glibc platform — nothing to trim
+
         def _flush_scene(sid: int) -> None:
             n_chunks = len(open_bufs["frames_rgb"])
             if n_chunks == 0:
                 return
-            frames_rgb_seg = np.concatenate(open_bufs["frames_rgb"], axis=0)  # (T, H, W, 3)
-            frames_gray_seg = np.concatenate(open_bufs["frames_gray"], axis=0) if open_bufs["frames_gray"] else None  # (T, safety_h, safety_w, 1)
-            n = len(frames_rgb_seg)
+            n = sum(c.shape[0] for c in open_bufs["frames_rgb"])
             if n < cfg.min_scene_len_frames or seg_registry.is_done(stem, sid):
                 for k in open_bufs:
                     open_bufs[k].clear()
@@ -1376,10 +1431,14 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             # Use cam overlay mask; fall back to empty mask if not yet set
             mask = overlay_mask_cam if overlay_mask_cam is not None else np.zeros(out_hw_cam, dtype=np.uint8)
 
+            # frames_rgb/frames_gray are passed as chunk lists, not concatenated —
+            # np.concatenate here would briefly double the ~1.5-3.1GB buffer per
+            # field before serialization even touches it. See
+            # _array_record_from_chunks for the zero-copy pa.py_buffer wrap that replaces it.
             out_path = parquet_exp.export_segment(
                 stem, sid,
-                frames_rgb_seg,
-                frames_gray_seg,
+                open_bufs["frames_rgb"],
+                open_bufs["frames_gray"] if open_bufs["frames_gray"] else None,
                 mask,
                 actions_arr, speeds_arr, alts_arr, batts_arr,
                 terminal_arr,
@@ -1389,6 +1448,7 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             logger.info(f"[{stem}] Segment {sid:04d} ({n} frames) -> {out_path.name}")
             for k in open_bufs:
                 open_bufs[k].clear()
+            _release_freed_memory()
 
         while True:
             window_start_sec = start_sec + window_start_frame / fps
@@ -1434,6 +1494,8 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             chunk_size = cfg.chunk_size_frames
             for chunk_start in range(0, n_window, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, n_window)
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                logger.debug(f"[Mem] chunk {chunk_start}-{chunk_end}/{n_window} | RSS peak: {rss_mb:.0f} MB | open segment frames: {sum(len(b) for b in open_bufs['frames_rgb'])}")
 
                 chunk_1080p = frames_dep_mmap[chunk_start:chunk_end]
                 chunk_512p = np.stack(
@@ -1671,11 +1733,18 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
             last_gist_save = now
 
     logger.info("Triggering final pack and HF-Upload...")
-    hf_upload_and_clear(output_dir, cfg.hf_repo_id, logger, cfg.upload_workers, int(cfg.pack_chunk_gb * 1024 ** 3))
-    # NEU: Crash-Dataset hier flushen und hochladen!
-    crash_exp.flush()
-    if cfg.hf_crash_repo_id:
-        upload_crash_dataset(output_dir / "crash_parquet", cfg.hf_crash_repo_id, logger)
+    try:
+        hf_upload_and_clear(output_dir, cfg.hf_repo_id, logger, cfg.upload_workers, int(cfg.pack_chunk_gb * 1024 ** 3))
+        # NEU: Crash-Dataset hier flushen und hochladen!
+        crash_exp.flush()
+        if cfg.hf_crash_repo_id:
+            upload_crash_dataset(output_dir / "crash_parquet", cfg.hf_crash_repo_id, logger)
+    except Exception as e:
+        # Covers MemoryError too (Exception subclass) — with ulimit -v set in
+        # the workflow, an OOM here raises MemoryError instead of the kernel
+        # killing the whole runner, so this still gets a chance to log and
+        # clean up instead of dying silently mid-shutdown.
+        logger.error(f"[Shutdown] Final pack/upload failed: {e}")
     # Save final progress so the next shard/run knows what was done
     save_progress_to_gist(cfg.resume_file, logger)
     shutil.rmtree(tmp_dir, ignore_errors=True)
