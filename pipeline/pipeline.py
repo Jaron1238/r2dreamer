@@ -248,12 +248,32 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
         return out
 
     for fpath in seg_files:
+        fsize = fpath.stat().st_size
+
+        # A segment that's already >= target_bytes on its own can't be usefully
+        # batched with anything else anyway, so reading it via pq.read_table()
+        # just to immediately rewrite it via ParquetWriter would materialize
+        # the same multi-GB buffer in RAM a second time for zero benefit.
+        # Pass it straight through as its own chunk instead.
+        if fsize >= target_bytes:
+            if batch:
+                chunks.append(_flush(batch, chunk_idx))
+                for t in batch:
+                    del t
+                batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
+                gc.collect()
+            out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
+            shutil.move(str(fpath), str(out))
+            logger.info(f"[Pack] Segment already >= target ({fsize/1e9:.2f} GB) - passed through as {out.name}")
+            chunks.append(out)
+            chunk_idx += 1
+            continue
+
         try:
             tbl = pq.read_table(fpath)
         except Exception as e:
             logger.warning(f"[Pack] Skipping unreadable parquet {fpath.name}: {e}")
             continue
-        fsize = fpath.stat().st_size
         if batch and batch_bytes + fsize > target_bytes:
             chunks.append(_flush(batch, chunk_idx))
             for t in batch:
@@ -270,10 +290,11 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
         gc.collect()
 
     for fpath in seg_files:
-        try:
-            fpath.unlink()
-        except Exception:
-            pass
+        if fpath.exists():
+            try:
+                fpath.unlink()
+            except Exception:
+                pass
     return chunks
 
 
