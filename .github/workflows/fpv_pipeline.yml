@@ -127,19 +127,42 @@ jobs:
           echo "Restored $(wc -l < processed_urls.txt) already-processed URLs."
 
 
+
       - name: Run pipeline shard ${{ matrix.shard }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
         run: |
-          python pipeline/pipeline.py \
-            --shard ${{ matrix.shard }} \
-            --num-shards ${{ github.event.inputs.num_shards || 10 }}
+          ( while true; do
+              echo "$(date '+%H:%M:%S') $(free -m | awk '/Mem:/ {printf "used=%sMB free=%sMB avail=%sMB total=%sMB", $3, $4, $7, $2}')" >> mem_monitor.log
+              sleep 10
+            done ) &
+          MONITOR_PID=$!
 
-      # ── Upload progress as artifact (avoids Gist race condition) ────────
-      # Each shard uploads its own processed_urls.txt independently.
-      # A separate merge job (below) combines all shards and pushes to Gist once.
+          set +e
+          sudo systemd-run --scope -p MemoryMax=13G -p MemorySwapMax=0 \
+            --uid=$(id -u) --gid=$(id -g) --same-dir \
+            --setenv=HF_TOKEN="$HF_TOKEN" \
+            --setenv=GH_TOKEN="$GH_TOKEN" \
+            --setenv=GH_GIST_ID="$GH_GIST_ID" \
+            -- python pipeline/pipeline.py \
+              --shard ${{ matrix.shard }} \
+              --num-shards ${{ github.event.inputs.num_shards || 10 }}
+          PIPELINE_EXIT=$?
+          set -e
+
+          kill "$MONITOR_PID" 2>/dev/null || true
+          echo "Pipeline exited with code $PIPELINE_EXIT"
+          exit $PIPELINE_EXIT
+
+      - name: Upload memory monitor log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mem-monitor-shard-${{ matrix.shard }}
+          path: mem_monitor.log
+          retention-days: 7
       - name: Upload processed_urls artifact
         if: always()
         uses: actions/upload-artifact@v4
