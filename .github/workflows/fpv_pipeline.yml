@@ -78,20 +78,6 @@ jobs:
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache
           df -h
-
-      # ── Add swap (safety net against OOM-kill of the whole runner) ─────
-      # ubuntu-latest ships with no swap. A RAM spike (long uncut scene →
-      # multi-GB frame buffers in pipeline.py) hard-kills the runner VM
-      # before any `if: always()` step (incl. log upload) can run. Swap
-      # lets the kernel degrade instead of killing the process outright.
-      - name: Add swap space
-        run: |
-          sudo fallocate -l 8G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-          free -h
-
       # ── System dependencies ─────────────────────────────────────────────
       - name: Install system dependencies
         run: |
