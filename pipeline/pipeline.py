@@ -411,6 +411,7 @@ def _yt_dlp_options(dest_dir: Path, *, allow_playlist: bool) -> Dict[str, Any]:
         "no_warnings": True,
         "ignoreerrors": True,
         "noplaylist": not allow_playlist,
+        "verbose": True,
         "extractor_args": {
             "youtube": {"player_client": ["mweb", "web_safari"]},
         },
