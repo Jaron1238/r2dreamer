@@ -54,6 +54,16 @@ jobs:
 
     strategy:
       fail-fast: false   # one shard failing must not cancel the others
+      # All 10 shards share ONE YouTube account's cookies (must stay that
+      # way — anonymous requests get blocked much harder). Running all 10
+      # concurrently means 10x that account's normal request rate hitting
+      # YouTube at once, which is what trips the hour-long session rate
+      # limit. max-parallel caps how many shards GitHub actually runs at
+      # the same time; the rest queue and start as earlier ones finish,
+      # so the account never sees more than 3 concurrent sessions.
+      # Tune this against total wall-clock time you're willing to spend —
+      # lower = safer against rate limits, higher = faster overall.
+      max-parallel: 3
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
 
@@ -148,7 +158,7 @@ jobs:
           ls -la pipeline/cookies.txt 2>&1 || echo "cookies.txt fehlt hier schon!"
           wc -l pipeline/cookies.txt 2>&1
 
-          sudo systemd-run --scope -p MemoryMax=14.5G -p MemorySwapMax=0 \
+          sudo systemd-run --scope -p MemoryMax=13G -p MemorySwapMax=0 \
             --uid=$(id -u) --gid=$(id -g) --same-dir \
             --setenv=PATH="$PATH" \
             --setenv=HOME="$HOME" \
@@ -164,26 +174,6 @@ jobs:
           kill "$MONITOR_PID" 2>/dev/null || true
           echo "Pipeline exited with code $PIPELINE_EXIT"
           exit $PIPELINE_EXIT
-
-      - name: Dump kernel/system log
-        if: always()
-        run: |
-          sudo journalctl -k --since "-20 min" > kernel.log 2>&1 || true
-          sudo dmesg > dmesg.log 2>&1 || true
-          # Explicitly flag anything OOM/cgroup related so it's easy to spot
-          grep -iE "oom|killed process|memory cgroup|out of memory" kernel.log dmesg.log > oom_hits.log 2>&1 || true
-          echo "--- oom_hits.log ---"; cat oom_hits.log
-
-      - name: Upload kernel log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-log-shard-${{ matrix.shard }}
-          path: |
-            kernel.log
-            dmesg.log
-            oom_hits.log
-          retention-days: 7
 
       - name: Upload memory monitor log
         if: always()
@@ -237,4 +227,3 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           gh gist edit "${{ secrets.GH_GIST_ID }}" merged_processed_urls.txt
-
