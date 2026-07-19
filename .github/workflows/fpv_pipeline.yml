@@ -165,6 +165,26 @@ jobs:
           echo "Pipeline exited with code $PIPELINE_EXIT"
           exit $PIPELINE_EXIT
 
+      - name: Dump kernel/system log
+        if: always()
+        run: |
+          sudo journalctl -k --since "-20 min" > kernel.log 2>&1 || true
+          sudo dmesg > dmesg.log 2>&1 || true
+          # Explicitly flag anything OOM/cgroup related so it's easy to spot
+          grep -iE "oom|killed process|memory cgroup|out of memory" kernel.log dmesg.log > oom_hits.log 2>&1 || true
+          echo "--- oom_hits.log ---"; cat oom_hits.log
+
+      - name: Upload kernel log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-log-shard-${{ matrix.shard }}
+          path: |
+            kernel.log
+            dmesg.log
+            oom_hits.log
+          retention-days: 7
+
       - name: Upload memory monitor log
         if: always()
         uses: actions/upload-artifact@v4
