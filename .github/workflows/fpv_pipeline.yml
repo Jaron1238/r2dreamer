@@ -148,7 +148,7 @@ jobs:
           ls -la pipeline/cookies.txt 2>&1 || echo "cookies.txt fehlt hier schon!"
           wc -l pipeline/cookies.txt 2>&1
 
-          sudo systemd-run --scope -p MemoryMax=13G -p MemorySwapMax=0 \
+          sudo systemd-run --scope -p MemoryMax=14.5G -p MemorySwapMax=0 \
             --uid=$(id -u) --gid=$(id -g) --same-dir \
             --setenv=PATH="$PATH" \
             --setenv=HOME="$HOME" \
