@@ -143,19 +143,23 @@ jobs:
           PYTHON_BIN="$(command -v python)"
           echo "Using interpreter: $PYTHON_BIN"
 
-          set +e
+          echo "--- Vor sudo (normale Shell) ---"
+          echo "whoami: $(whoami), HOME: $HOME"
+          ls -la pipeline/cookies.txt 2>&1 || echo "cookies.txt fehlt hier schon!"
+          wc -l pipeline/cookies.txt 2>&1
+
           sudo systemd-run --scope -p MemoryMax=13G -p MemorySwapMax=0 \
             --uid=$(id -u) --gid=$(id -g) --same-dir \
             --setenv=PATH="$PATH" \
+            --setenv=HOME="$HOME" \
             --setenv=PYTHONPATH="$PYTHONPATH" \
             --setenv=HF_TOKEN="$HF_TOKEN" \
             --setenv=GH_TOKEN="$GH_TOKEN" \
             --setenv=GH_GIST_ID="$GH_GIST_ID" \
-            -- "$PYTHON_BIN" pipeline/pipeline.py \
+            -- bash -c 'echo "--- In systemd-run scope ---"; echo "whoami: $(whoami), HOME: $HOME"; ls -la pipeline/cookies.txt; wc -l pipeline/cookies.txt; exec "$0" "$@"' \
+            "$PYTHON_BIN" pipeline/pipeline.py \
               --shard ${{ matrix.shard }} \
               --num-shards ${{ github.event.inputs.num_shards || 10 }}
-          PIPELINE_EXIT=$?
-          set -e
 
           kill "$MONITOR_PID" 2>/dev/null || true
           echo "Pipeline exited with code $PIPELINE_EXIT"
