@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import mmap as mmap_module
 import os
 import resource
 
@@ -711,6 +712,27 @@ def read_video_to_mmap(video_path: Path, out_hw: Tuple[int, int], target_fps: fl
 
 def open_mmap_video(mmap_path: Path, shape: Tuple) -> np.ndarray:
     return np.memmap(mmap_path, dtype=np.uint8, mode="r", shape=shape)
+
+
+def release_mmap_range(mm_array: np.memmap, frame_start: int, frame_end: int, frame_bytes: int) -> None:
+    """Tell the kernel to drop already-consumed pages of a read-only video mmap.
+
+    Without this, RSS grows ~linearly as we sequentially scan through the mmap
+    (each newly-touched page stays resident/page-cached until evicted under
+    memory pressure), even though the pages are never re-read. Since the data
+    is read-only and unmodified, the kernel can always re-fault it back in
+    from disk for free if we're ever wrong about not needing it again.
+    """
+    try:
+        underlying_mm = mm_array._mmap
+        offset = frame_start * frame_bytes
+        length = (frame_end - frame_start) * frame_bytes
+        page_size = mmap_module.ALLOCATIONGRANULARITY
+        aligned_offset = (offset // page_size) * page_size
+        aligned_length = length + (offset - aligned_offset)
+        underlying_mm.madvise(mmap_module.MADV_DONTNEED, aligned_offset, aligned_length)
+    except Exception:
+        pass  # best-effort only; never let memory-hygiene fail the pipeline
 
 
 class TakeoffDetector:
@@ -1514,6 +1536,7 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                     roi_512 = (int(stick_roi[0] * sx), int(stick_roi[1] * sy), int(stick_roi[2] * sx), int(stick_roi[3] * sy))
 
             chunk_size = cfg.chunk_size_frames
+            frame_bytes_depth = out_hw_depth[0] * out_hw_depth[1] * 3
             for chunk_start in range(0, n_window, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, n_window)
                 rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
@@ -1629,6 +1652,13 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
 
                 prev_gray_boundary = gray_chunk[-1].copy()
                 del chunk_1080p, chunk_512p, gray_chunk, gray_with_prev
+
+                # We scan the mmap strictly forward and never revisit earlier
+                # frames, so drop the pages for this chunk now instead of
+                # letting them sit resident until the whole ~3600-frame
+                # window has been swept (which is what was driving RSS up
+                # to ~13GB per segment before this fix).
+                release_mmap_range(frames_dep_mmap, chunk_start, chunk_end, frame_bytes_depth)
 
             del frames_dep_mmap
             mmap_path_dep.unlink(missing_ok=True)
