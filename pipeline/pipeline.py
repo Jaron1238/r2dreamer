@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import math
 import mmap as mmap_module
 import os
 import resource
@@ -104,6 +105,13 @@ class PipelineConfig:
     max_segment_frames: int = 3600
     mmap_max_frames: int = 3600
     chunk_size_frames: int = 60
+    # Frames per Parquet row for frames_rgb/frames_gray/actions/osd/etc.
+    # A segment with n_frames > this is written as multiple rows
+    # (chunk_id 0..n_chunks-1) instead of one giant blob-per-column row.
+    # Keeps np.concatenate + Snappy encoder peaks bounded to ~this many
+    # frames instead of the full segment (up to max_segment_frames).
+    # 240 frames @ 1280x720x1 (gray) ≈ 221 MB raw — well under CI RAM budget.
+    parquet_row_frames: int = 240
 
 CFG = PipelineConfig()
 
@@ -1089,72 +1097,66 @@ def build_osd_array(speeds: np.ndarray, altitudes: np.ndarray, batteries: np.nda
     return osd
 
 
-def _array_record(name: str, array: np.ndarray) -> Dict[str, List[Any]]:
-    """Serialize an ndarray as bytes plus shape metadata for Parquet.
+def _stream_windows(chunks: List[np.ndarray], window: int) -> Iterator[np.ndarray]:
+    """Yield fixed-size windows (along axis 0) from a list of arrays, without
+    ever materializing more than ~one window's worth of data at a time.
 
-    PyArrow cannot infer variable-sized nested list columns from multi-dimensional
-    numpy arrays reliably.  Storing contiguous bytes with an explicit shape keeps
-    Parquet writing stable and avoids exploding memory by converting video
-    tensors to huge Python nested lists.
-    """
-    arr = np.ascontiguousarray(array)
-    return {
-        name: [arr.tobytes()],
-        f"{name}_shape": [list(arr.shape)],
-    }
-
-
-def _array_record_from_chunks(name: str, chunks: List[np.ndarray]) -> Dict[str, Any]:
-    """Same as _array_record, but builds a large_binary pa.Array directly from
-    a single np.concatenate of the chunks, via a zero-copy pa.py_buffer wrap —
-    instead of materializing a separate .tobytes() copy.
-
-    An earlier version of this function used b"".join(c.tobytes() for c in
-    chunks). That looked streaming but isn't: CPython's bytes.join() calls
-    PySequence_Fast() on its argument first, which fully materializes the
-    generator (i.e. all per-chunk .tobytes() copies) into a list *before*
-    concatenating them — verified via tracemalloc, it was a 3x-of-total-data
-    peak, identical to the plain np.concatenate + .tobytes() path it was
-    meant to replace.
-
-    This version: one np.concatenate (unavoidable — Arrow needs one
-    contiguous buffer per value) + pa.py_buffer, which wraps that numpy
-    array's memory directly without copying. Peak here is 2x total data
-    (the original open_bufs chunks, still referenced by the caller until
-    export_segment returns, plus the one concatenated copy) — confirmed via
-    tracemalloc.
+    Replaces a single np.concatenate(chunks, axis=0) over the WHOLE segment
+    (peak = 2x full segment size: old chunks + one giant merged copy) with a
+    generator that copies into a small pre-allocated `window`-sized buffer as
+    it walks the input chunks. Peak here is ~window size, independent of how
+    long the segment is (up to max_segment_frames). The last window may be
+    shorter than `window` if the total frame count doesn't divide evenly.
     """
     if not chunks:
-        return {name: pa.array([b""], type=pa.large_binary()), f"{name}_shape": [[0]]}
-    merged = np.ascontiguousarray(np.concatenate(chunks, axis=0))
-    total_len = merged.shape[0]
-    tail_shape = list(merged.shape[1:])
-    data_buf = pa.py_buffer(merged)  # zero-copy: shares merged's memory, no .tobytes()
-    offsets_buf = pa.py_buffer(np.array([0, merged.nbytes], dtype=np.int64))
-    arr = pa.Array.from_buffers(pa.large_binary(), 1, [None, offsets_buf, data_buf])
-    return {name: arr, f"{name}_shape": [[total_len] + tail_shape]}
+        return
+    tail_shape = chunks[0].shape[1:]
+    dtype = chunks[0].dtype
+    out = np.empty((window, *tail_shape), dtype=dtype)
+    out_n = 0
+    for c in chunks:
+        pos = 0
+        while pos < c.shape[0]:
+            take = min(window - out_n, c.shape[0] - pos)
+            out[out_n:out_n + take] = c[pos:pos + take]
+            out_n += take
+            pos += take
+            if out_n == window:
+                yield out.copy()
+                out_n = 0
+    if out_n:
+        yield out[:out_n].copy()
 
 
-def _table_from_record_with_large_binary(record: Dict[str, Any]) -> pa.Table:
-    """Build a pyarrow Table from an export record, forcing raw-bytes columns to
-    large_binary (64-bit offsets).
+def _blob(array: np.ndarray) -> bytes:
+    """Serialize a small (single row-group) ndarray to contiguous bytes."""
+    return np.ascontiguousarray(array).tobytes()
 
-    pa.Table.from_pandas()/pa.array() infer plain `bytes` values as pyarrow's
-    `binary` type, which uses 32-bit offsets and hard-caps a single value (and
-    the column's total buffer) at 2**31 - 2 bytes (~2GB). A single video
-    segment's frames_gray blob at safety resolution (1280x720) crosses that
-    limit at ~2330 frames, well within max_segment_frames=3600, causing
-    "ArrowCapacityError: array cannot contain more than 2147483646 bytes".
-    large_binary uses 64-bit offsets and has no such limit.
+
+def _table_from_chunked_rows(rows: List[Dict[str, Any]]) -> pa.Table:
+    """Build a pyarrow Table from a list of per-chunk row dicts, forcing
+    raw-bytes fields to large_binary (64-bit offsets).
+
+    Unlike the old single-row-per-segment layout, each row here only covers
+    parquet_row_frames frames, so blob sizes stay small (tens/low-hundreds of
+    MB) and pa.array(values, type=large_binary()) can build the whole column
+    in one go without needing the zero-copy py_buffer trick — there's nothing
+    large enough left to worry about.
+
+    large_binary (not binary) is still required: even a single row-group can
+    theoretically approach the 2**31-2 byte binary-type cap at large
+    parquet_row_frames / resolutions, and large_binary has no such limit.
     """
+    if not rows:
+        return pa.Table.from_arrays([], names=[])
+    binary_fields = {
+        k for k, v in rows[0].items() if isinstance(v, (bytes, bytearray))
+    }
     arrays: List[pa.Array] = []
     names: List[str] = []
-    for name, values in record.items():
-        if isinstance(values, pa.Array):
-            # Already a ready-built Array (zero-copy large_binary from
-            # _array_record_from_chunks) — using it as-is avoids another copy.
-            arrays.append(values)
-        elif len(values) == 1 and isinstance(values[0], (bytes, bytearray)):
+    for name in rows[0].keys():
+        values = [r[name] for r in rows]
+        if name in binary_fields:
             arrays.append(pa.array(values, type=pa.large_binary()))
         else:
             arrays.append(pa.array(values))
@@ -1286,10 +1288,11 @@ class ParquetExporter:
     for its own encoder; frames_gray is exclusively consumed by the SafetyNet.
     """
 
-    def __init__(self, out_dir: Path):
+    def __init__(self, out_dir: Path, row_frames: int = CFG.parquet_row_frames):
         self.out_dir = out_dir
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.total_bytes: int = 0
+        self.row_frames = row_frames
 
     def reset_bytes(self) -> None:
         self.total_bytes = 0
@@ -1310,38 +1313,90 @@ class ParquetExporter:
         has_osd: bool,
         fps: float,
     ) -> Path:
+        """Write one segment as multiple parquet_row_frames-sized ROWS instead
+        of one giant blob-per-column row.
+
+        Rationale: the old path did one np.concatenate over the *whole*
+        segment (up to max_segment_frames, e.g. 3600 frames) per column, then
+        handed the ~GB-sized result to the Snappy encoder, which allocates its
+        own internal buffer in raw-data size on top. Combined peak could hit
+        ~3x a single column's raw size and blow past the CI runner's
+        MemoryMax.
+
+        Here, frames_rgb/frames_gray/actions/osd/speeds/altitudes/batteries/
+        is_terminal are all split into aligned windows of `self.row_frames`
+        frames via _stream_windows, and each window becomes its own row
+        (chunk_id 0..n_chunks-1, chunk_frame_offset = starting frame index).
+        Both np.concatenate and the Snappy encoder now only ever see one
+        window's worth of data (tens/low-hundreds of MB) at a time, so the
+        peak no longer scales with segment length. Compression stays ON
+        (snappy) — chunking doesn't change compression ratio, Snappy is
+        stateless per call.
+
+        cam_overlay is per-segment, not per-frame; it's small (H, W) and gets
+        duplicated into every row so a downstream reader can reconstruct a
+        segment from any single row without a separate join.
+
+        Downstream (FPVDataset) must group rows by (stem, segment_id), sort
+        by chunk_id, and concatenate the decoded frame windows back into one
+        (T, H, W, C) array per segment — that reassembly happens one segment
+        at a time at load time, where memory pressure is a non-issue.
+        """
         n = sum(c.shape[0] for c in frames_rgb_chunks)
-
         osd = build_osd_array(speeds, altitudes, batteries, n)
+        cam_overlay_bytes = _blob(cam_overlay_mask.astype(np.uint8, copy=False))
+        cam_overlay_shape = list(cam_overlay_mask.shape)
 
-        record: Dict[str, Any] = {
-            # r2dreamer FPVDataset primary fields
-            # Byte-joined directly from chunks — avoids materializing a second
-            # full-segment copy via np.concatenate before serialization (see
-            # _array_record_from_chunks docstring for the memory rationale).
-            **_array_record_from_chunks("frames_rgb", frames_rgb_chunks),  # (T, H, W, 3)
-            **(
-                _array_record_from_chunks("frames_gray", frames_gray_chunks)
-                if frames_gray_chunks else {}
-            ),  # (T, safety_h, safety_w, 1)
-            **_array_record("cam_overlay", cam_overlay_mask.astype(np.uint8, copy=False)),  # (H, W)
-            **_array_record("osd", osd.astype(np.float32, copy=False)),  # (T, 8)
-            # Shared fields (actions, telemetry, flags)
-            **_array_record("actions", actions.astype(np.float32, copy=False)),  # (T, 4)
-            **_array_record("speeds", speeds.astype(np.float32, copy=False)),  # (T,)
-            **_array_record("altitudes", altitudes.astype(np.float32, copy=False)),  # (T,)
-            **_array_record("batteries", batteries.astype(np.float32, copy=False)),  # (T,)
-            **_array_record("is_terminal", is_terminal.astype(np.bool_, copy=False)),  # (T,)
-            # Scalar metadata
-            "n_frames":     [n],
-            "drone_id":     [drone_id],
-            "has_osd":      [has_osd],
-            "fps":          [fps],
-            "stem":         [stem],
-            "segment_id":   [segment_id],
-        }
+        rgb_windows = _stream_windows(frames_rgb_chunks, self.row_frames)
+        gray_windows = (
+            _stream_windows(frames_gray_chunks, self.row_frames)
+            if frames_gray_chunks else None
+        )
 
-        table = _table_from_record_with_large_binary(record)
+        rows: List[Dict[str, Any]] = []
+        frame_offset = 0
+        for rgb_win in rgb_windows:
+            t = rgb_win.shape[0]
+            sl = slice(frame_offset, frame_offset + t)
+            row: Dict[str, Any] = {
+                "frames_rgb": _blob(rgb_win),
+                "frames_rgb_shape": list(rgb_win.shape),
+            }
+            if gray_windows is not None:
+                gray_win = next(gray_windows)
+                row["frames_gray"] = _blob(gray_win)
+                row["frames_gray_shape"] = list(gray_win.shape)
+            row["cam_overlay"] = cam_overlay_bytes
+            row["cam_overlay_shape"] = cam_overlay_shape
+            row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
+            row["osd_shape"] = list(osd[sl].shape)
+            row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
+            row["actions_shape"] = list(actions[sl].shape)
+            row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
+            row["speeds_shape"] = list(speeds[sl].shape)
+            row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
+            row["altitudes_shape"] = list(altitudes[sl].shape)
+            row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
+            row["batteries_shape"] = list(batteries[sl].shape)
+            row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
+            row["is_terminal_shape"] = list(is_terminal[sl].shape)
+            # Scalar / segment-level metadata (repeated per row)
+            row["n_frames"] = n
+            row["chunk_id"] = len(rows)
+            row["chunk_frame_offset"] = frame_offset
+            row["drone_id"] = drone_id
+            row["has_osd"] = has_osd
+            row["fps"] = fps
+            row["stem"] = stem
+            row["segment_id"] = segment_id
+            rows.append(row)
+            frame_offset += t
+
+        n_chunks = len(rows)
+        for row in rows:
+            row["n_chunks"] = n_chunks
+
+        table = _table_from_chunked_rows(rows)
         out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
         pq.write_table(table, out_path, compression="snappy")
         self.total_bytes += out_path.stat().st_size
