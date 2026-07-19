@@ -19,8 +19,6 @@ import multiprocessing
 import queue
 import random
 import re
-import signal
-import traceback
 import shutil
 import struct
 import subprocess
@@ -28,6 +26,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -234,50 +233,45 @@ class URLRegistry:
 
 
 def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: int, logger: logging.Logger) -> List[Path]:
-    """Pack many small per-segment parquet files into fewer ~target_bytes chunks.
-
-    Streaming version: never reads a whole segment file into RAM. Each input
-    file is opened as a pq.ParquetFile and its row groups are read and
-    written one at a time (`read_row_group` -> `writer.write_table` ->
-    discard), so peak memory is bounded by a single row group, independent of
-    how many segments end up batched into one output chunk or how large the
-    compressed files are on disk. This replaces the old approach of
-    `pq.read_table()`-ing every file into a `batch: List[pa.Table]` and only
-    flushing once the *compressed on-disk* size crossed target_bytes, which
-    let several multi-GB uncompressed tables pile up in RAM at once (this was
-    the actual cause of the OOM kill: anon-rss ~15GB against a 14.5G cgroup
-    limit).
-    """
     seg_files = sorted(parquet_dir.glob("*_seg*.parquet"))
     if not seg_files:
         return []
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunks: List[Path] = []
-    ts = int(time.time())
+    batch: List[pa.Table] = []
+    batch_bytes = 0
     chunk_idx = 0
+    ts = int(time.time())
 
-    writer: Optional[pq.ParquetWriter] = None
-    writer_path: Optional[Path] = None
-    written_bytes = 0  # sum of *source* (compressed, on-disk) bytes routed into the currently-open writer
-
-    def _close_writer() -> None:
-        nonlocal writer, writer_path, chunk_idx, written_bytes
-        if writer is not None:
-            writer.close()
-            logger.info(f"[Pack] Chunk {chunk_idx:04d} written: {writer_path.stat().st_size/1e9:.2f} GB -> {writer_path.name}")
-            chunks.append(writer_path)
-            chunk_idx += 1
-        writer, writer_path, written_bytes = None, None, 0
+    def _flush(batch_tables: List[pa.Table], idx: int) -> Path:
+        out = chunk_dir / f"chunk_{ts}_{idx:04d}.parquet"
+        writer = None
+        try:
+            for tbl in batch_tables:
+                if writer is None:
+                    writer = pq.ParquetWriter(out, tbl.schema, compression="snappy")
+                writer.write_table(tbl)
+        finally:
+            if writer:
+                writer.close()
+        logger.info(f"[Pack] Chunk {idx:04d} written: {len(batch_tables)} segments, {out.stat().st_size/1e9:.2f} GB -> {out.name}")
+        return out
 
     for fpath in seg_files:
         fsize = fpath.stat().st_size
 
         # A segment that's already >= target_bytes on its own can't be usefully
-        # batched with anything else anyway, so don't even open it via
-        # pyarrow - just move the file. Close out whatever chunk is currently
-        # being written first so ordering/boundaries stay sane.
+        # batched with anything else anyway, so reading it via pq.read_table()
+        # just to immediately rewrite it via ParquetWriter would materialize
+        # the same multi-GB buffer in RAM a second time for zero benefit.
+        # Pass it straight through as its own chunk instead.
         if fsize >= target_bytes:
-            _close_writer()
+            if batch:
+                chunks.append(_flush(batch, chunk_idx))
+                for t in batch:
+                    del t
+                batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
+                gc.collect()
             out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
             shutil.move(str(fpath), str(out))
             logger.info(f"[Pack] Segment already >= target ({fsize/1e9:.2f} GB) - passed through as {out.name}")
@@ -286,33 +280,24 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
             continue
 
         try:
-            pf = pq.ParquetFile(fpath)
+            tbl = pq.read_table(fpath)
         except Exception as e:
             logger.warning(f"[Pack] Skipping unreadable parquet {fpath.name}: {e}")
             continue
+        if batch and batch_bytes + fsize > target_bytes:
+            chunks.append(_flush(batch, chunk_idx))
+            for t in batch:
+                del t
+            batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
+            gc.collect()
+        batch.append(tbl)
+        batch_bytes += fsize
 
-        # Roll over to a new output chunk if this file would push the
-        # currently-open one past target_bytes.
-        if writer is not None and written_bytes + fsize > target_bytes:
-            _close_writer()
-
-        if writer is None:
-            out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
-            writer = pq.ParquetWriter(out, pf.schema_arrow, compression="snappy")
-            writer_path = out
-
-        # Stream row-group by row-group: at any point in time we hold at
-        # most one row group (a slice of one file, not the whole segment,
-        # and never the whole batch) in RAM.
-        for rg_idx in range(pf.num_row_groups):
-            rg_table = pf.read_row_group(rg_idx)
-            writer.write_table(rg_table)
-            del rg_table
-        written_bytes += fsize
-        del pf
+    if batch:
+        chunks.append(_flush(batch, chunk_idx))
+        for t in batch:
+            del t
         gc.collect()
-
-    _close_writer()
 
     for fpath in seg_files:
         if fpath.exists():
@@ -394,6 +379,181 @@ def save_progress_to_gist(resume_file: str, logger: logging.Logger) -> None:
         logger.warning(f"[Gist] Failed to save progress: {exc}")
 
 
+# ── Cross-shard YouTube download lock (best-effort, via shared Gist) ────
+# All shards must keep using the SAME account cookies (anonymous requests
+# get blocked harder). To stop 10 concurrent sessions on that one account
+# from tripping YouTube's hour-long rate limit, only one shard is allowed
+# to actually be mid-download at any instant. We use a second file in the
+# same Gist you already use for processed_urls.txt as a mutex: its content
+# is "<holder_id>|<epoch_seconds>", empty/missing/stale means free.
+#
+# This is NOT a real distributed lock (no compare-and-swap on gh gist
+# edit) — two shards can both see "free" and both write "claimed" within
+# the same short window. We mitigate that with a random settle delay +
+# re-read-to-verify after claiming, which makes true double-claims rare in
+# practice with ~10 low-frequency contenders. Worst case on a race is a
+# couple of shards briefly downloading at once for a few seconds — not
+# the 10x pileup we're trying to avoid, and it self-heals on the next
+# poll. If exact single-flight matters more than this pipeline needs it
+# to, that requires real infra (e.g. a tiny lock server) instead.
+_YT_LOCK_FILENAME = "yt_lock.json"
+
+
+def _yt_lock_read(gist_id: str) -> Optional[Tuple[str, float]]:
+    try:
+        out = subprocess.run(
+            ["gh", "gist", "view", gist_id, "--filename", _YT_LOCK_FILENAME, "--raw"],
+            timeout=15, capture_output=True, text=True,
+        )
+        content = out.stdout.strip()
+        if out.returncode != 0 or not content or "|" not in content:
+            return None
+        holder, ts = content.split("|", 1)
+        return (holder, float(ts))
+    except Exception:
+        return None
+
+
+def _yt_lock_write(gist_id: str, holder: str, ts: float) -> bool:
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / _YT_LOCK_FILENAME
+            lock_path.write_text(f"{holder}|{ts}")
+            # gh gist edit <id> <file> only UPDATES a file already present in
+            # the gist (matched by basename) — it does not create new ones.
+            # yt_lock.json won't exist yet on the very first call in a fresh
+            # gist, so that attempt fails once; --add creates it. All calls
+            # after that succeed via the plain edit path.
+            out = subprocess.run(
+                ["gh", "gist", "edit", gist_id, str(lock_path)],
+                timeout=15, capture_output=True, text=True,
+            )
+            if out.returncode == 0:
+                return True
+            out = subprocess.run(
+                ["gh", "gist", "edit", gist_id, "--add", str(lock_path)],
+                timeout=15, capture_output=True, text=True,
+            )
+            return out.returncode == 0
+    except Exception:
+        return False
+
+
+# Active heartbeat threads keyed by holder_id, so a long-running download
+# keeps re-stamping the lock's timestamp instead of relying on a single
+# stale_after_s window sized for the worst-case download duration. This lets
+# stale_after_s stay tight (fast recovery if a shard crashes/gets killed
+# mid-download) without a genuinely still-running download getting reaped by
+# another shard that thinks it's stale.
+_yt_lock_heartbeats: Dict[str, Tuple[threading.Event, threading.Thread]] = {}
+
+
+def _yt_lock_heartbeat_loop(gist_id: str, holder_id: str, stop_event: threading.Event,
+                             interval_s: float, logger: logging.Logger) -> None:
+    while not stop_event.wait(interval_s):
+        lock = _yt_lock_read(gist_id)
+        if lock and lock[0] == holder_id:
+            _yt_lock_write(gist_id, holder_id, time.time())
+        else:
+            # Lost the lock somehow (e.g. another shard's clock/network hiccup
+            # caused a false-stale reap). Nothing to renew anymore; stop.
+            logger.warning(f"[yt-lock] Heartbeat for {holder_id} found lock no longer ours; stopping renewal.")
+            return
+
+
+def acquire_yt_download_lock(logger: logging.Logger, max_wait_s: float = 600.0, stale_after_s: float = 120.0,
+                              heartbeat_interval_s: float = 30.0) -> Optional[str]:
+    """Block (polling the Gist) until this process holds the cross-shard
+    YouTube download lock, or max_wait_s elapses. Returns this process's
+    holder id on success (pass it to release_yt_download_lock), or None if
+    it timed out — callers should treat None as "proceed anyway" rather
+    than stalling forever, since this is a throughput throttle, not a
+    correctness requirement.
+
+    On success, spawns a background thread that re-stamps the lock every
+    heartbeat_interval_s for as long as we hold it, so stale_after_s only
+    has to cover "how long until we notice a crashed holder", not "how long
+    could the longest possible download take". stale_after_s should stay
+    a small multiple of heartbeat_interval_s (default: 4x) to tolerate an
+    occasional missed heartbeat without false-reaping an active holder.
+    """
+    gist_id = os.environ.get("GH_GIST_ID", "").strip()
+    if not gist_id:
+        return None  # no gist configured -> no coordination possible, don't block
+    my_id = f"{os.environ.get('GITHUB_RUN_ID', 'local')}-{uuid.uuid4().hex[:8]}"
+    deadline = time.monotonic() + max_wait_s
+    while time.monotonic() < deadline:
+        lock = _yt_lock_read(gist_id)
+        now = time.time()
+        free = lock is None or (now - lock[1]) > stale_after_s
+        if free:
+            _yt_lock_write(gist_id, my_id, now)
+            time.sleep(random.uniform(0.8, 2.0))  # let any racing claim settle
+            check = _yt_lock_read(gist_id)
+            if check and check[0] == my_id:
+                stop_event = threading.Event()
+                t = threading.Thread(
+                    target=_yt_lock_heartbeat_loop,
+                    args=(gist_id, my_id, stop_event, heartbeat_interval_s, logger),
+                    daemon=True,
+                )
+                t.start()
+                _yt_lock_heartbeats[my_id] = (stop_event, t)
+                return my_id  # won the race
+        time.sleep(random.uniform(2.0, 5.0))
+    logger.warning("[yt-lock] Timed out waiting for cross-shard download lock; proceeding without it.")
+    return None
+
+
+def release_yt_download_lock(holder_id: Optional[str], logger: logging.Logger) -> None:
+    gist_id = os.environ.get("GH_GIST_ID", "").strip()
+    if not gist_id or holder_id is None:
+        return
+    heartbeat = _yt_lock_heartbeats.pop(holder_id, None)
+    if heartbeat is not None:
+        stop_event, t = heartbeat
+        stop_event.set()
+        t.join(timeout=5.0)
+    lock = _yt_lock_read(gist_id)
+    if lock and lock[0] == holder_id:
+        _yt_lock_write(gist_id, "", 0.0)
+
+
+# ── YouTube session rate-limit cooldown ─────────────────────────────────
+# yt-dlp's "current session has been rate-limited by YouTube for up to an
+# hour" error (see https://github.com/yt-dlp/yt-dlp/issues/14921) is not a
+# transient per-request failure: once YouTube trips it, every further
+# request from this process is doomed for up to an hour. Our normal
+# per-URL retry/backoff just burns CI minutes and requests against an
+# already-tripped limiter, and can make the ban stick longer. We track it
+# as a process-wide (per-shard) cooldown and skip all further YouTube/
+# AirVuz downloads until it expires.
+_YT_RATE_LIMIT_RE = re.compile(r"rate-limited by YouTube", re.IGNORECASE)
+_yt_rate_limit_lock = threading.Lock()
+_yt_rate_limit_until: float = 0.0  # time.monotonic() timestamp, 0 = not limited
+
+
+def _yt_rate_limited_now() -> bool:
+    with _yt_rate_limit_lock:
+        return time.monotonic() < _yt_rate_limit_until
+
+
+def _note_if_yt_rate_limit(exc: BaseException, logger: logging.Logger, cooldown_s: float = 3600.0) -> None:
+    """Check whether `exc` is YouTube's session rate-limit error; if so, arm
+    the process-wide cooldown so callers stop issuing further YouTube/AirVuz
+    requests instead of retrying into a limit that won't lift for up to an
+    hour regardless of retry count."""
+    if not _YT_RATE_LIMIT_RE.search(str(exc)):
+        return
+    global _yt_rate_limit_until
+    with _yt_rate_limit_lock:
+        _yt_rate_limit_until = time.monotonic() + cooldown_s
+    logger.error(
+        f"[yt-dlp] YouTube session rate limit hit — pausing all YouTube/AirVuz "
+        f"downloads in this shard for {cooldown_s / 60:.0f} min."
+    )
+
+
 def check_content_length_gb(url: str) -> Optional[float]:
     try:
         r = requests.head(url, timeout=15, allow_redirects=True)
@@ -462,9 +622,15 @@ def _yt_dlp_options(dest_dir: Path, *, allow_playlist: bool) -> Dict[str, Any]:
             "youtube": {"player_client": ["mweb", "web_safari"]},
         },
         "remote_components": ["ejs:github"],
-        "sleep_interval_requests": 1,
-        "sleep_interval": 2,
-        "max_sleep_interval": 5,
+        # Bumped from 1/2/5: with up to 10 parallel CI shards potentially
+        # sharing one account's cookies, the old values let combined request
+        # rate spike far above what a single YouTube session tolerates
+        # before tripping the hour-long session rate limit (see
+        # https://github.com/yt-dlp/yt-dlp/issues/14921). These are per-shard
+        # values, so effective combined rate is roughly num_shards x higher.
+        "sleep_interval_requests": 3,
+        "sleep_interval": 5,
+        "max_sleep_interval": 15,
     }
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
@@ -486,7 +652,11 @@ def _download_yt_dlp_items(urls: List[str], dest_dir: Path, logger: logging.Logg
         ydl_opts = _yt_dlp_options(dest_dir, allow_playlist=False)
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             for item_url in urls:
-                info = ydl.extract_info(item_url, download=True)
+                lock_id = acquire_yt_download_lock(logger)
+                try:
+                    info = ydl.extract_info(item_url, download=True)
+                finally:
+                    release_yt_download_lock(lock_id, logger)
                 if info is None:
                     continue
                 entries = info.get("entries") or [info]
@@ -499,6 +669,7 @@ def _download_yt_dlp_items(urls: List[str], dest_dir: Path, logger: logging.Logg
                             downloaded.append(p)
                             break
     except Exception as e:
+        _note_if_yt_rate_limit(e, logger)
         raise RuntimeError(f"yt-dlp failed for {urls[0] if urls else '<empty>'}: {e}") from e
     return downloaded
 
@@ -1357,25 +1528,11 @@ class ParquetExporter:
         by chunk_id, and concatenate the decoded frame windows back into one
         (T, H, W, C) array per segment — that reassembly happens one segment
         at a time at load time, where memory pressure is a non-issue.
-
-        Streaming note: rows are no longer collected into a `rows: List[Dict]`
-        and handed to `_table_from_chunked_rows` in one shot at the end. That
-        still meant every window of a segment (up to n_chunks ~= 15 at
-        row_frames=240) sat in RAM simultaneously before a single
-        `pq.write_table()` call. Instead each window is built, wrapped as its
-        own single-row pa.Table, written immediately via a `ParquetWriter`
-        (one row group per window), and dropped before the next window is
-        built. Peak RAM for the row-building/writing part is now ~one
-        window's worth of data, independent of segment length or row_frames.
         """
         n = sum(c.shape[0] for c in frames_rgb_chunks)
         osd = build_osd_array(speeds, altitudes, batteries, n)
         cam_overlay_bytes = _blob(cam_overlay_mask.astype(np.uint8, copy=False))
         cam_overlay_shape = list(cam_overlay_mask.shape)
-
-        # Total window count is known up front from frame count alone, so we
-        # don't need to materialize all windows first just to learn n_chunks.
-        n_chunks = math.ceil(n / self.row_frames) if n > 0 else 0
 
         rgb_windows = _stream_windows(frames_rgb_chunks, self.row_frames)
         gray_windows = (
@@ -1383,65 +1540,52 @@ class ParquetExporter:
             if frames_gray_chunks else None
         )
 
-        out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
-        writer: Optional[pq.ParquetWriter] = None
+        rows: List[Dict[str, Any]] = []
         frame_offset = 0
-        chunk_id = 0
-        try:
-            for rgb_win in rgb_windows:
-                t = rgb_win.shape[0]
-                sl = slice(frame_offset, frame_offset + t)
-                row: Dict[str, Any] = {
-                    "frames_rgb": _blob(rgb_win),
-                    "frames_rgb_shape": list(rgb_win.shape),
-                }
-                if gray_windows is not None:
-                    gray_win = next(gray_windows)
-                    row["frames_gray"] = _blob(gray_win)
-                    row["frames_gray_shape"] = list(gray_win.shape)
-                row["cam_overlay"] = cam_overlay_bytes
-                row["cam_overlay_shape"] = cam_overlay_shape
-                row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
-                row["osd_shape"] = list(osd[sl].shape)
-                row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
-                row["actions_shape"] = list(actions[sl].shape)
-                row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
-                row["speeds_shape"] = list(speeds[sl].shape)
-                row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
-                row["altitudes_shape"] = list(altitudes[sl].shape)
-                row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
-                row["batteries_shape"] = list(batteries[sl].shape)
-                row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
-                row["is_terminal_shape"] = list(is_terminal[sl].shape)
-                # Scalar / segment-level metadata (repeated per row)
-                row["n_frames"] = n
-                row["chunk_id"] = chunk_id
-                row["chunk_frame_offset"] = frame_offset
-                row["drone_id"] = drone_id
-                row["has_osd"] = has_osd
-                row["fps"] = fps
-                row["stem"] = stem
-                row["segment_id"] = segment_id
-                row["n_chunks"] = n_chunks
+        for rgb_win in rgb_windows:
+            t = rgb_win.shape[0]
+            sl = slice(frame_offset, frame_offset + t)
+            row: Dict[str, Any] = {
+                "frames_rgb": _blob(rgb_win),
+                "frames_rgb_shape": list(rgb_win.shape),
+            }
+            if gray_windows is not None:
+                gray_win = next(gray_windows)
+                row["frames_gray"] = _blob(gray_win)
+                row["frames_gray_shape"] = list(gray_win.shape)
+            row["cam_overlay"] = cam_overlay_bytes
+            row["cam_overlay_shape"] = cam_overlay_shape
+            row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
+            row["osd_shape"] = list(osd[sl].shape)
+            row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
+            row["actions_shape"] = list(actions[sl].shape)
+            row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
+            row["speeds_shape"] = list(speeds[sl].shape)
+            row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
+            row["altitudes_shape"] = list(altitudes[sl].shape)
+            row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
+            row["batteries_shape"] = list(batteries[sl].shape)
+            row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
+            row["is_terminal_shape"] = list(is_terminal[sl].shape)
+            # Scalar / segment-level metadata (repeated per row)
+            row["n_frames"] = n
+            row["chunk_id"] = len(rows)
+            row["chunk_frame_offset"] = frame_offset
+            row["drone_id"] = drone_id
+            row["has_osd"] = has_osd
+            row["fps"] = fps
+            row["stem"] = stem
+            row["segment_id"] = segment_id
+            rows.append(row)
+            frame_offset += t
 
-                row_table = _table_from_chunked_rows([row])
-                if writer is None:
-                    writer = pq.ParquetWriter(out_path, row_table.schema, compression="snappy")
-                writer.write_table(row_table)
-                del row, row_table
+        n_chunks = len(rows)
+        for row in rows:
+            row["n_chunks"] = n_chunks
 
-                frame_offset += t
-                chunk_id += 1
-        finally:
-            if writer is not None:
-                writer.close()
-
-        if writer is None:
-            # n == 0 edge case: no frames at all. Still produce a (schema-less
-            # but valid) parquet file so downstream globbing/packing doesn't
-            # choke on a missing segment file.
-            pq.write_table(pa.Table.from_arrays([], names=[]), out_path, compression="snappy")
-
+        table = _table_from_chunked_rows(rows)
+        out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
+        pq.write_table(table, out_path, compression="snappy")
         self.total_bytes += out_path.stat().st_size
         return out_path
 
@@ -1459,6 +1603,9 @@ def interp_nan(arr: np.ndarray) -> np.ndarray:
 def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegistry, logger: logging.Logger, deadline_reached: Optional[Any] = None) -> Iterator[Tuple[Path, bool, bool]]:
     url_type = classify_url(url, platform)
     if url_type in ("youtube", "airvuz"):
+        if _yt_rate_limited_now():
+            logger.info(f"[{url_type}] Skipping (YouTube session rate limit active): {url}")
+            return
         dl_dir = tmp_dir / "yt" / hashlib.md5(url.encode()).hexdigest()[:10]
         completed = False
         try:
@@ -1473,6 +1620,7 @@ def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegist
         except Exception as e:
             # NICHT mark_done: nur bei echtem Erfolg oben markieren, sonst geht die URL
             # beim naechsten Lauf erneut in den Retry statt fuer immer verloren zu sein.
+            _note_if_yt_rate_limit(e, logger)
             logger.warning(f"[{url_type}] Download error: {e}")
         finally:
             shutil.rmtree(dl_dir, ignore_errors=True)
@@ -1788,28 +1936,6 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
     logger = get_logger(f"Worker-{worker_id}")
     logger.info(f"Started Worker {worker_id}")
 
-    # ── Diagnostic SIGTERM handler ──────────────────────────────────────────
-    # We've been dying with exit code 143 (SIGTERM) at random points with no
-    # Python traceback, since signals don't raise exceptions by default.
-    # This logs exactly which line was executing when the signal arrived,
-    # then re-raises so the process still exits with the expected code.
-    def _log_sigterm(signum, frame):
-        logger.error(f"[Worker-{worker_id}] === SIGTERM received (signum={signum}) ===")
-        logger.error(f"[Worker-{worker_id}] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
-        for h in logger.handlers:
-            try:
-                h.flush()
-            except Exception:
-                pass
-        sys.stderr.flush()
-        sys.stdout.flush()
-        # Restore default handler and re-send so the process actually dies
-        # with the normal SIGTERM semantics (exit code 143) instead of hanging.
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, _log_sigterm)
-
     # ── Graceful-Shutdown timer ────────────────────────────────────────────
     # GitHub Actions kills a job after exactly 6 hours.  We stop accepting
     # new tasks after GRACEFUL_SHUTDOWN_SECONDS so the final HF upload can
@@ -1942,22 +2068,6 @@ def main() -> None:
     Path(cfg.tmp_root).mkdir(parents=True, exist_ok=True)
 
     logger = get_logger("Main")
-
-    def _log_sigterm_main(signum, frame):
-        logger.error(f"[Main] === SIGTERM received (signum={signum}) ===")
-        logger.error("[Main] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
-        for h in logger.handlers:
-            try:
-                h.flush()
-            except Exception:
-                pass
-        sys.stderr.flush()
-        sys.stdout.flush()
-        signal.signal(signal.SIGTERM, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGTERM)
-
-    signal.signal(signal.SIGTERM, _log_sigterm_main)
-
     logger.info("==========================================================")
     logger.info(" FPV Data Pipeline — GitHub CI Edition")
     logger.info("==========================================================")
