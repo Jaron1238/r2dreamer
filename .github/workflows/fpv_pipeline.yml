@@ -140,13 +140,18 @@ jobs:
             done ) &
           MONITOR_PID=$!
 
+          PYTHON_BIN="$(command -v python)"
+          echo "Using interpreter: $PYTHON_BIN"
+
           set +e
           sudo systemd-run --scope -p MemoryMax=13G -p MemorySwapMax=0 \
             --uid=$(id -u) --gid=$(id -g) --same-dir \
+            --setenv=PATH="$PATH" \
+            --setenv=PYTHONPATH="$PYTHONPATH" \
             --setenv=HF_TOKEN="$HF_TOKEN" \
             --setenv=GH_TOKEN="$GH_TOKEN" \
             --setenv=GH_GIST_ID="$GH_GIST_ID" \
-            -- python pipeline/pipeline.py \
+            -- "$PYTHON_BIN" pipeline/pipeline.py \
               --shard ${{ matrix.shard }} \
               --num-shards ${{ github.event.inputs.num_shards || 10 }}
           PIPELINE_EXIT=$?
