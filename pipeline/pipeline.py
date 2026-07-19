@@ -234,45 +234,50 @@ class URLRegistry:
 
 
 def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: int, logger: logging.Logger) -> List[Path]:
+    """Pack many small per-segment parquet files into fewer ~target_bytes chunks.
+
+    Streaming version: never reads a whole segment file into RAM. Each input
+    file is opened as a pq.ParquetFile and its row groups are read and
+    written one at a time (`read_row_group` -> `writer.write_table` ->
+    discard), so peak memory is bounded by a single row group, independent of
+    how many segments end up batched into one output chunk or how large the
+    compressed files are on disk. This replaces the old approach of
+    `pq.read_table()`-ing every file into a `batch: List[pa.Table]` and only
+    flushing once the *compressed on-disk* size crossed target_bytes, which
+    let several multi-GB uncompressed tables pile up in RAM at once (this was
+    the actual cause of the OOM kill: anon-rss ~15GB against a 14.5G cgroup
+    limit).
+    """
     seg_files = sorted(parquet_dir.glob("*_seg*.parquet"))
     if not seg_files:
         return []
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunks: List[Path] = []
-    batch: List[pa.Table] = []
-    batch_bytes = 0
-    chunk_idx = 0
     ts = int(time.time())
+    chunk_idx = 0
 
-    def _flush(batch_tables: List[pa.Table], idx: int) -> Path:
-        out = chunk_dir / f"chunk_{ts}_{idx:04d}.parquet"
-        writer = None
-        try:
-            for tbl in batch_tables:
-                if writer is None:
-                    writer = pq.ParquetWriter(out, tbl.schema, compression="snappy")
-                writer.write_table(tbl)
-        finally:
-            if writer:
-                writer.close()
-        logger.info(f"[Pack] Chunk {idx:04d} written: {len(batch_tables)} segments, {out.stat().st_size/1e9:.2f} GB -> {out.name}")
-        return out
+    writer: Optional[pq.ParquetWriter] = None
+    writer_path: Optional[Path] = None
+    written_bytes = 0  # sum of *source* (compressed, on-disk) bytes routed into the currently-open writer
+
+    def _close_writer() -> None:
+        nonlocal writer, writer_path, chunk_idx, written_bytes
+        if writer is not None:
+            writer.close()
+            logger.info(f"[Pack] Chunk {chunk_idx:04d} written: {writer_path.stat().st_size/1e9:.2f} GB -> {writer_path.name}")
+            chunks.append(writer_path)
+            chunk_idx += 1
+        writer, writer_path, written_bytes = None, None, 0
 
     for fpath in seg_files:
         fsize = fpath.stat().st_size
 
         # A segment that's already >= target_bytes on its own can't be usefully
-        # batched with anything else anyway, so reading it via pq.read_table()
-        # just to immediately rewrite it via ParquetWriter would materialize
-        # the same multi-GB buffer in RAM a second time for zero benefit.
-        # Pass it straight through as its own chunk instead.
+        # batched with anything else anyway, so don't even open it via
+        # pyarrow - just move the file. Close out whatever chunk is currently
+        # being written first so ordering/boundaries stay sane.
         if fsize >= target_bytes:
-            if batch:
-                chunks.append(_flush(batch, chunk_idx))
-                for t in batch:
-                    del t
-                batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
-                gc.collect()
+            _close_writer()
             out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
             shutil.move(str(fpath), str(out))
             logger.info(f"[Pack] Segment already >= target ({fsize/1e9:.2f} GB) - passed through as {out.name}")
@@ -281,24 +286,33 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
             continue
 
         try:
-            tbl = pq.read_table(fpath)
+            pf = pq.ParquetFile(fpath)
         except Exception as e:
             logger.warning(f"[Pack] Skipping unreadable parquet {fpath.name}: {e}")
             continue
-        if batch and batch_bytes + fsize > target_bytes:
-            chunks.append(_flush(batch, chunk_idx))
-            for t in batch:
-                del t
-            batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
-            gc.collect()
-        batch.append(tbl)
-        batch_bytes += fsize
 
-    if batch:
-        chunks.append(_flush(batch, chunk_idx))
-        for t in batch:
-            del t
+        # Roll over to a new output chunk if this file would push the
+        # currently-open one past target_bytes.
+        if writer is not None and written_bytes + fsize > target_bytes:
+            _close_writer()
+
+        if writer is None:
+            out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
+            writer = pq.ParquetWriter(out, pf.schema_arrow, compression="snappy")
+            writer_path = out
+
+        # Stream row-group by row-group: at any point in time we hold at
+        # most one row group (a slice of one file, not the whole segment,
+        # and never the whole batch) in RAM.
+        for rg_idx in range(pf.num_row_groups):
+            rg_table = pf.read_row_group(rg_idx)
+            writer.write_table(rg_table)
+            del rg_table
+        written_bytes += fsize
+        del pf
         gc.collect()
+
+    _close_writer()
 
     for fpath in seg_files:
         if fpath.exists():
@@ -1343,11 +1357,25 @@ class ParquetExporter:
         by chunk_id, and concatenate the decoded frame windows back into one
         (T, H, W, C) array per segment — that reassembly happens one segment
         at a time at load time, where memory pressure is a non-issue.
+
+        Streaming note: rows are no longer collected into a `rows: List[Dict]`
+        and handed to `_table_from_chunked_rows` in one shot at the end. That
+        still meant every window of a segment (up to n_chunks ~= 15 at
+        row_frames=240) sat in RAM simultaneously before a single
+        `pq.write_table()` call. Instead each window is built, wrapped as its
+        own single-row pa.Table, written immediately via a `ParquetWriter`
+        (one row group per window), and dropped before the next window is
+        built. Peak RAM for the row-building/writing part is now ~one
+        window's worth of data, independent of segment length or row_frames.
         """
         n = sum(c.shape[0] for c in frames_rgb_chunks)
         osd = build_osd_array(speeds, altitudes, batteries, n)
         cam_overlay_bytes = _blob(cam_overlay_mask.astype(np.uint8, copy=False))
         cam_overlay_shape = list(cam_overlay_mask.shape)
+
+        # Total window count is known up front from frame count alone, so we
+        # don't need to materialize all windows first just to learn n_chunks.
+        n_chunks = math.ceil(n / self.row_frames) if n > 0 else 0
 
         rgb_windows = _stream_windows(frames_rgb_chunks, self.row_frames)
         gray_windows = (
@@ -1355,52 +1383,65 @@ class ParquetExporter:
             if frames_gray_chunks else None
         )
 
-        rows: List[Dict[str, Any]] = []
-        frame_offset = 0
-        for rgb_win in rgb_windows:
-            t = rgb_win.shape[0]
-            sl = slice(frame_offset, frame_offset + t)
-            row: Dict[str, Any] = {
-                "frames_rgb": _blob(rgb_win),
-                "frames_rgb_shape": list(rgb_win.shape),
-            }
-            if gray_windows is not None:
-                gray_win = next(gray_windows)
-                row["frames_gray"] = _blob(gray_win)
-                row["frames_gray_shape"] = list(gray_win.shape)
-            row["cam_overlay"] = cam_overlay_bytes
-            row["cam_overlay_shape"] = cam_overlay_shape
-            row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
-            row["osd_shape"] = list(osd[sl].shape)
-            row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
-            row["actions_shape"] = list(actions[sl].shape)
-            row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
-            row["speeds_shape"] = list(speeds[sl].shape)
-            row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
-            row["altitudes_shape"] = list(altitudes[sl].shape)
-            row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
-            row["batteries_shape"] = list(batteries[sl].shape)
-            row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
-            row["is_terminal_shape"] = list(is_terminal[sl].shape)
-            # Scalar / segment-level metadata (repeated per row)
-            row["n_frames"] = n
-            row["chunk_id"] = len(rows)
-            row["chunk_frame_offset"] = frame_offset
-            row["drone_id"] = drone_id
-            row["has_osd"] = has_osd
-            row["fps"] = fps
-            row["stem"] = stem
-            row["segment_id"] = segment_id
-            rows.append(row)
-            frame_offset += t
-
-        n_chunks = len(rows)
-        for row in rows:
-            row["n_chunks"] = n_chunks
-
-        table = _table_from_chunked_rows(rows)
         out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
-        pq.write_table(table, out_path, compression="snappy")
+        writer: Optional[pq.ParquetWriter] = None
+        frame_offset = 0
+        chunk_id = 0
+        try:
+            for rgb_win in rgb_windows:
+                t = rgb_win.shape[0]
+                sl = slice(frame_offset, frame_offset + t)
+                row: Dict[str, Any] = {
+                    "frames_rgb": _blob(rgb_win),
+                    "frames_rgb_shape": list(rgb_win.shape),
+                }
+                if gray_windows is not None:
+                    gray_win = next(gray_windows)
+                    row["frames_gray"] = _blob(gray_win)
+                    row["frames_gray_shape"] = list(gray_win.shape)
+                row["cam_overlay"] = cam_overlay_bytes
+                row["cam_overlay_shape"] = cam_overlay_shape
+                row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
+                row["osd_shape"] = list(osd[sl].shape)
+                row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
+                row["actions_shape"] = list(actions[sl].shape)
+                row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
+                row["speeds_shape"] = list(speeds[sl].shape)
+                row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
+                row["altitudes_shape"] = list(altitudes[sl].shape)
+                row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
+                row["batteries_shape"] = list(batteries[sl].shape)
+                row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
+                row["is_terminal_shape"] = list(is_terminal[sl].shape)
+                # Scalar / segment-level metadata (repeated per row)
+                row["n_frames"] = n
+                row["chunk_id"] = chunk_id
+                row["chunk_frame_offset"] = frame_offset
+                row["drone_id"] = drone_id
+                row["has_osd"] = has_osd
+                row["fps"] = fps
+                row["stem"] = stem
+                row["segment_id"] = segment_id
+                row["n_chunks"] = n_chunks
+
+                row_table = _table_from_chunked_rows([row])
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, row_table.schema, compression="snappy")
+                writer.write_table(row_table)
+                del row, row_table
+
+                frame_offset += t
+                chunk_id += 1
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if writer is None:
+            # n == 0 edge case: no frames at all. Still produce a (schema-less
+            # but valid) parquet file so downstream globbing/packing doesn't
+            # choke on a missing segment file.
+            pq.write_table(pa.Table.from_arrays([], names=[]), out_path, compression="snappy")
+
         self.total_bytes += out_path.stat().st_size
         return out_path
 
