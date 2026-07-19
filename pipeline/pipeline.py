@@ -19,6 +19,8 @@ import multiprocessing
 import queue
 import random
 import re
+import signal
+import traceback
 import shutil
 import struct
 import subprocess
@@ -1745,6 +1747,28 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
     logger = get_logger(f"Worker-{worker_id}")
     logger.info(f"Started Worker {worker_id}")
 
+    # ── Diagnostic SIGTERM handler ──────────────────────────────────────────
+    # We've been dying with exit code 143 (SIGTERM) at random points with no
+    # Python traceback, since signals don't raise exceptions by default.
+    # This logs exactly which line was executing when the signal arrived,
+    # then re-raises so the process still exits with the expected code.
+    def _log_sigterm(signum, frame):
+        logger.error(f"[Worker-{worker_id}] === SIGTERM received (signum={signum}) ===")
+        logger.error(f"[Worker-{worker_id}] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stderr.flush()
+        sys.stdout.flush()
+        # Restore default handler and re-send so the process actually dies
+        # with the normal SIGTERM semantics (exit code 143) instead of hanging.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _log_sigterm)
+
     # ── Graceful-Shutdown timer ────────────────────────────────────────────
     # GitHub Actions kills a job after exactly 6 hours.  We stop accepting
     # new tasks after GRACEFUL_SHUTDOWN_SECONDS so the final HF upload can
@@ -1877,6 +1901,22 @@ def main() -> None:
     Path(cfg.tmp_root).mkdir(parents=True, exist_ok=True)
 
     logger = get_logger("Main")
+
+    def _log_sigterm_main(signum, frame):
+        logger.error(f"[Main] === SIGTERM received (signum={signum}) ===")
+        logger.error("[Main] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stderr.flush()
+        sys.stdout.flush()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _log_sigterm_main)
+
     logger.info("==========================================================")
     logger.info(" FPV Data Pipeline — GitHub CI Edition")
     logger.info("==========================================================")
