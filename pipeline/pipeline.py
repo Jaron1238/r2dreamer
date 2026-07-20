@@ -19,6 +19,8 @@ import multiprocessing
 import queue
 import random
 import re
+import signal
+import traceback
 import shutil
 import struct
 import subprocess
@@ -26,11 +28,12 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Generator, Iterator, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -103,7 +106,14 @@ class PipelineConfig:
     download_max_retries: int = 3
     download_stall_timeout_s: int = 60
     playlist_batch_size: int = 3  # limit concurrent playlist downloads on 14 GB GitHub runners
-    max_segment_frames: int = 3600
+    # NOTE: was == mmap_max_frames (3600), which meant the flush trigger in
+    # _flush_scene could only fire once ~the entire decode window had piled
+    # up in open_bufs. At safety_h/w=720x1280 (gray) + out_h/w=288x512 (rgb)
+    # that's ~1.36 MB/frame accumulated -> ~4.9 GB just for this buffer,
+    # which is what drove the OOM kill (see pipeline-log-shard-2, chunk
+    # 3540-3600/3600, RSS 620MB -> 5615MB). Decoupled + lowered so segments
+    # flush ~3x per window instead of ~once at the very end.
+    max_segment_frames: int = 1200
     mmap_max_frames: int = 3600
     chunk_size_frames: int = 60
     # Frames per Parquet row for frames_rgb/frames_gray/actions/osd/etc.
@@ -233,45 +243,50 @@ class URLRegistry:
 
 
 def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: int, logger: logging.Logger) -> List[Path]:
+    """Pack many small per-segment parquet files into fewer ~target_bytes chunks.
+
+    Streaming version: never reads a whole segment file into RAM. Each input
+    file is opened as a pq.ParquetFile and its row groups are read and
+    written one at a time (`read_row_group` -> `writer.write_table` ->
+    discard), so peak memory is bounded by a single row group, independent of
+    how many segments end up batched into one output chunk or how large the
+    compressed files are on disk. This replaces the old approach of
+    `pq.read_table()`-ing every file into a `batch: List[pa.Table]` and only
+    flushing once the *compressed on-disk* size crossed target_bytes, which
+    let several multi-GB uncompressed tables pile up in RAM at once (this was
+    the actual cause of the OOM kill: anon-rss ~15GB against a 14.5G cgroup
+    limit).
+    """
     seg_files = sorted(parquet_dir.glob("*_seg*.parquet"))
     if not seg_files:
         return []
     chunk_dir.mkdir(parents=True, exist_ok=True)
     chunks: List[Path] = []
-    batch: List[pa.Table] = []
-    batch_bytes = 0
-    chunk_idx = 0
     ts = int(time.time())
+    chunk_idx = 0
 
-    def _flush(batch_tables: List[pa.Table], idx: int) -> Path:
-        out = chunk_dir / f"chunk_{ts}_{idx:04d}.parquet"
-        writer = None
-        try:
-            for tbl in batch_tables:
-                if writer is None:
-                    writer = pq.ParquetWriter(out, tbl.schema, compression="snappy")
-                writer.write_table(tbl)
-        finally:
-            if writer:
-                writer.close()
-        logger.info(f"[Pack] Chunk {idx:04d} written: {len(batch_tables)} segments, {out.stat().st_size/1e9:.2f} GB -> {out.name}")
-        return out
+    writer: Optional[pq.ParquetWriter] = None
+    writer_path: Optional[Path] = None
+    written_bytes = 0  # sum of *source* (compressed, on-disk) bytes routed into the currently-open writer
+
+    def _close_writer() -> None:
+        nonlocal writer, writer_path, chunk_idx, written_bytes
+        if writer is not None:
+            writer.close()
+            logger.info(f"[Pack] Chunk {chunk_idx:04d} written: {writer_path.stat().st_size/1e9:.2f} GB -> {writer_path.name}")
+            chunks.append(writer_path)
+            chunk_idx += 1
+        writer, writer_path, written_bytes = None, None, 0
 
     for fpath in seg_files:
         fsize = fpath.stat().st_size
 
         # A segment that's already >= target_bytes on its own can't be usefully
-        # batched with anything else anyway, so reading it via pq.read_table()
-        # just to immediately rewrite it via ParquetWriter would materialize
-        # the same multi-GB buffer in RAM a second time for zero benefit.
-        # Pass it straight through as its own chunk instead.
+        # batched with anything else anyway, so don't even open it via
+        # pyarrow - just move the file. Close out whatever chunk is currently
+        # being written first so ordering/boundaries stay sane.
         if fsize >= target_bytes:
-            if batch:
-                chunks.append(_flush(batch, chunk_idx))
-                for t in batch:
-                    del t
-                batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
-                gc.collect()
+            _close_writer()
             out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
             shutil.move(str(fpath), str(out))
             logger.info(f"[Pack] Segment already >= target ({fsize/1e9:.2f} GB) - passed through as {out.name}")
@@ -280,24 +295,33 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
             continue
 
         try:
-            tbl = pq.read_table(fpath)
+            pf = pq.ParquetFile(fpath)
         except Exception as e:
             logger.warning(f"[Pack] Skipping unreadable parquet {fpath.name}: {e}")
             continue
-        if batch and batch_bytes + fsize > target_bytes:
-            chunks.append(_flush(batch, chunk_idx))
-            for t in batch:
-                del t
-            batch, batch_bytes, chunk_idx = [], 0, chunk_idx + 1
-            gc.collect()
-        batch.append(tbl)
-        batch_bytes += fsize
 
-    if batch:
-        chunks.append(_flush(batch, chunk_idx))
-        for t in batch:
-            del t
+        # Roll over to a new output chunk if this file would push the
+        # currently-open one past target_bytes.
+        if writer is not None and written_bytes + fsize > target_bytes:
+            _close_writer()
+
+        if writer is None:
+            out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
+            writer = pq.ParquetWriter(out, pf.schema_arrow, compression="snappy")
+            writer_path = out
+
+        # Stream row-group by row-group: at any point in time we hold at
+        # most one row group (a slice of one file, not the whole segment,
+        # and never the whole batch) in RAM.
+        for rg_idx in range(pf.num_row_groups):
+            rg_table = pf.read_row_group(rg_idx)
+            writer.write_table(rg_table)
+            del rg_table
+        written_bytes += fsize
+        del pf
         gc.collect()
+
+    _close_writer()
 
     for fpath in seg_files:
         if fpath.exists():
@@ -622,15 +646,9 @@ def _yt_dlp_options(dest_dir: Path, *, allow_playlist: bool) -> Dict[str, Any]:
             "youtube": {"player_client": ["mweb", "web_safari"]},
         },
         "remote_components": ["ejs:github"],
-        # Bumped from 1/2/5: with up to 10 parallel CI shards potentially
-        # sharing one account's cookies, the old values let combined request
-        # rate spike far above what a single YouTube session tolerates
-        # before tripping the hour-long session rate limit (see
-        # https://github.com/yt-dlp/yt-dlp/issues/14921). These are per-shard
-        # values, so effective combined rate is roughly num_shards x higher.
-        "sleep_interval_requests": 3,
-        "sleep_interval": 5,
-        "max_sleep_interval": 15,
+        "sleep_interval_requests": 1,
+        "sleep_interval": 2,
+        "max_sleep_interval": 5,
     }
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
@@ -1528,11 +1546,25 @@ class ParquetExporter:
         by chunk_id, and concatenate the decoded frame windows back into one
         (T, H, W, C) array per segment — that reassembly happens one segment
         at a time at load time, where memory pressure is a non-issue.
+
+        Streaming note: rows are no longer collected into a `rows: List[Dict]`
+        and handed to `_table_from_chunked_rows` in one shot at the end. That
+        still meant every window of a segment (up to n_chunks ~= 15 at
+        row_frames=240) sat in RAM simultaneously before a single
+        `pq.write_table()` call. Instead each window is built, wrapped as its
+        own single-row pa.Table, written immediately via a `ParquetWriter`
+        (one row group per window), and dropped before the next window is
+        built. Peak RAM for the row-building/writing part is now ~one
+        window's worth of data, independent of segment length or row_frames.
         """
         n = sum(c.shape[0] for c in frames_rgb_chunks)
         osd = build_osd_array(speeds, altitudes, batteries, n)
         cam_overlay_bytes = _blob(cam_overlay_mask.astype(np.uint8, copy=False))
         cam_overlay_shape = list(cam_overlay_mask.shape)
+
+        # Total window count is known up front from frame count alone, so we
+        # don't need to materialize all windows first just to learn n_chunks.
+        n_chunks = math.ceil(n / self.row_frames) if n > 0 else 0
 
         rgb_windows = _stream_windows(frames_rgb_chunks, self.row_frames)
         gray_windows = (
@@ -1540,52 +1572,65 @@ class ParquetExporter:
             if frames_gray_chunks else None
         )
 
-        rows: List[Dict[str, Any]] = []
-        frame_offset = 0
-        for rgb_win in rgb_windows:
-            t = rgb_win.shape[0]
-            sl = slice(frame_offset, frame_offset + t)
-            row: Dict[str, Any] = {
-                "frames_rgb": _blob(rgb_win),
-                "frames_rgb_shape": list(rgb_win.shape),
-            }
-            if gray_windows is not None:
-                gray_win = next(gray_windows)
-                row["frames_gray"] = _blob(gray_win)
-                row["frames_gray_shape"] = list(gray_win.shape)
-            row["cam_overlay"] = cam_overlay_bytes
-            row["cam_overlay_shape"] = cam_overlay_shape
-            row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
-            row["osd_shape"] = list(osd[sl].shape)
-            row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
-            row["actions_shape"] = list(actions[sl].shape)
-            row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
-            row["speeds_shape"] = list(speeds[sl].shape)
-            row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
-            row["altitudes_shape"] = list(altitudes[sl].shape)
-            row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
-            row["batteries_shape"] = list(batteries[sl].shape)
-            row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
-            row["is_terminal_shape"] = list(is_terminal[sl].shape)
-            # Scalar / segment-level metadata (repeated per row)
-            row["n_frames"] = n
-            row["chunk_id"] = len(rows)
-            row["chunk_frame_offset"] = frame_offset
-            row["drone_id"] = drone_id
-            row["has_osd"] = has_osd
-            row["fps"] = fps
-            row["stem"] = stem
-            row["segment_id"] = segment_id
-            rows.append(row)
-            frame_offset += t
-
-        n_chunks = len(rows)
-        for row in rows:
-            row["n_chunks"] = n_chunks
-
-        table = _table_from_chunked_rows(rows)
         out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
-        pq.write_table(table, out_path, compression="snappy")
+        writer: Optional[pq.ParquetWriter] = None
+        frame_offset = 0
+        chunk_id = 0
+        try:
+            for rgb_win in rgb_windows:
+                t = rgb_win.shape[0]
+                sl = slice(frame_offset, frame_offset + t)
+                row: Dict[str, Any] = {
+                    "frames_rgb": _blob(rgb_win),
+                    "frames_rgb_shape": list(rgb_win.shape),
+                }
+                if gray_windows is not None:
+                    gray_win = next(gray_windows)
+                    row["frames_gray"] = _blob(gray_win)
+                    row["frames_gray_shape"] = list(gray_win.shape)
+                row["cam_overlay"] = cam_overlay_bytes
+                row["cam_overlay_shape"] = cam_overlay_shape
+                row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
+                row["osd_shape"] = list(osd[sl].shape)
+                row["actions"] = _blob(actions[sl].astype(np.float32, copy=False))
+                row["actions_shape"] = list(actions[sl].shape)
+                row["speeds"] = _blob(speeds[sl].astype(np.float32, copy=False))
+                row["speeds_shape"] = list(speeds[sl].shape)
+                row["altitudes"] = _blob(altitudes[sl].astype(np.float32, copy=False))
+                row["altitudes_shape"] = list(altitudes[sl].shape)
+                row["batteries"] = _blob(batteries[sl].astype(np.float32, copy=False))
+                row["batteries_shape"] = list(batteries[sl].shape)
+                row["is_terminal"] = _blob(is_terminal[sl].astype(np.bool_, copy=False))
+                row["is_terminal_shape"] = list(is_terminal[sl].shape)
+                # Scalar / segment-level metadata (repeated per row)
+                row["n_frames"] = n
+                row["chunk_id"] = chunk_id
+                row["chunk_frame_offset"] = frame_offset
+                row["drone_id"] = drone_id
+                row["has_osd"] = has_osd
+                row["fps"] = fps
+                row["stem"] = stem
+                row["segment_id"] = segment_id
+                row["n_chunks"] = n_chunks
+
+                row_table = _table_from_chunked_rows([row])
+                if writer is None:
+                    writer = pq.ParquetWriter(out_path, row_table.schema, compression="snappy")
+                writer.write_table(row_table)
+                del row, row_table
+
+                frame_offset += t
+                chunk_id += 1
+        finally:
+            if writer is not None:
+                writer.close()
+
+        if writer is None:
+            # n == 0 edge case: no frames at all. Still produce a (schema-less
+            # but valid) parquet file so downstream globbing/packing doesn't
+            # choke on a missing segment file.
+            pq.write_table(pa.Table.from_arrays([], names=[]), out_path, compression="snappy")
+
         self.total_bytes += out_path.stat().st_size
         return out_path
 
@@ -1786,7 +1831,13 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             for chunk_start in range(0, n_window, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, n_window)
                 rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-                logger.debug(f"[Mem] chunk {chunk_start}-{chunk_end}/{n_window} | RSS peak: {rss_mb:.0f} MB | open segment frames: {sum(len(b) for b in open_bufs['frames_rgb'])}")
+                rgb_mb = sum(b.nbytes for b in open_bufs["frames_rgb"]) / 1e6
+                gray_mb = sum(b.nbytes for b in open_bufs["frames_gray"]) / 1e6
+                logger.debug(
+                    f"[Mem] chunk {chunk_start}-{chunk_end}/{n_window} | RSS peak: {rss_mb:.0f} MB | "
+                    f"open segment frames: {sum(len(b) for b in open_bufs['frames_rgb'])} "
+                    f"(frames_rgb: {rgb_mb:.0f} MB, frames_gray: {gray_mb:.0f} MB)"
+                )
 
                 chunk_1080p = frames_dep_mmap[chunk_start:chunk_end]
                 chunk_512p = np.stack(
@@ -1925,6 +1976,98 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
     gc.collect()
 
 
+# ── Moving-window memory tracer ──────────────────────────────────────────
+# Diffs a tracemalloc snapshot against the PREVIOUS snapshot (not the
+# lifetime baseline), so it shows what's growing *right now* instead of a
+# static cumulative total. A genuinely leaking buffer shows up as the same
+# file:line appearing with a large positive diff run after run; a one-off
+# allocation shows up once and then drops out of the diff. Complements the
+# explicit open_bufs byte-size logging in [Mem] chunk (which only covers
+# those two known buffers) by also catching anything else that grows —
+# decode buffers, mmap pages that don't get released, etc.
+#
+# Staged interval instead of a fixed one: OOM kills have been happening
+# ~6 min into a run, so early samples matter far more than later ones.
+# Default schedule: every 10s for the first 10 min, then every 60s after.
+# Pass a longer stage list for more/finer stages if needed.
+_DEFAULT_MEM_TRACE_STAGES: List[Tuple[float, float]] = [
+    (600.0, 10.0),   # first 10 min: sample every 10s
+    (float("inf"), 60.0),  # afterwards: every 60s
+]
+
+
+def _interval_for_elapsed(elapsed_s: float, stages: List[Tuple[float, float]]) -> float:
+    cumulative = 0.0
+    for stage_duration_s, stage_interval_s in stages:
+        cumulative += stage_duration_s
+        if elapsed_s < cumulative:
+            return stage_interval_s
+    return stages[-1][1]
+
+
+def _mem_tracer_loop(stop_event: threading.Event, stages: List[Tuple[float, float]], top_n: int,
+                      out_path: Path, logger: logging.Logger) -> None:
+    tracemalloc.start(10)
+    prev_snapshot = tracemalloc.take_snapshot()
+    prev_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    start = time.monotonic()
+    try:
+        with open(out_path, "a", encoding="utf-8") as f:
+            stage_desc = ", ".join(
+                f"{'rest' if d == float('inf') else f'{d:.0f}s'}@{iv:.0f}s" for d, iv in stages
+            )
+            f.write(f"=== mem tracer started {time.strftime('%H:%M:%S')} (stages: {stage_desc}) ===\n")
+            f.flush()
+            while True:
+                interval_s = _interval_for_elapsed(time.monotonic() - start, stages)
+                if stop_event.wait(interval_s):
+                    break
+                snapshot = tracemalloc.take_snapshot()
+                rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+                diff = snapshot.compare_to(prev_snapshot, "lineno")
+                f.write(f"\n--- {time.strftime('%H:%M:%S')} | RSS: {rss_mb:.0f} MB (delta {rss_mb - prev_rss_mb:+.0f} MB since last sample, interval={interval_s:.0f}s) ---\n")
+                for stat in diff[:top_n]:
+                    f.write(f"{stat}\n")
+                f.flush()
+                prev_snapshot = snapshot
+                prev_rss_mb = rss_mb
+    except Exception as e:
+        logger.warning(f"[MemTrace] Tracer loop stopped unexpectedly: {e}")
+
+
+def start_mem_tracer(worker_id: int, logger: logging.Logger,
+                      stages: List[Tuple[float, float]] = _DEFAULT_MEM_TRACE_STAGES, top_n: int = 15) -> Callable[[], None]:
+    """Start a background moving-window memory tracer for this worker process.
+
+    `stages` is a list of (duration_s, interval_s) applied in order from
+    worker start (e.g. the default samples every 10s for the first 10 min,
+    then every 60s after — use `float("inf")` as the last duration to run
+    that interval for the rest of the worker's life).
+
+    Writes to mem_trace_worker_<id>.log (upload as a CI artifact alongside
+    pipeline.log/mem_monitor.log to inspect after a run). Returns a callable
+    that stops the tracer thread; call it once at worker shutdown.
+    """
+    out_path = Path(f"mem_trace_worker_{worker_id}.log")
+    stop_event = threading.Event()
+    t = threading.Thread(
+        target=_mem_tracer_loop,
+        args=(stop_event, stages, top_n, out_path, logger),
+        daemon=True,
+    )
+    t.start()
+    logger.info(f"[MemTrace] Started moving-window memory tracer -> {out_path}.")
+
+    def _stop() -> None:
+        stop_event.set()
+        t.join(timeout=5.0)
+        try:
+            tracemalloc.stop()
+        except Exception:
+            pass
+    return _stop
+
+
 def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocessing.Lock, cfg: PipelineConfig, progress_counter: Optional[Any] = None, progress_lock: Optional[Any] = None) -> None:
     global CFG
     CFG = cfg
@@ -1935,6 +2078,29 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
 
     logger = get_logger(f"Worker-{worker_id}")
     logger.info(f"Started Worker {worker_id}")
+    stop_mem_tracer = start_mem_tracer(worker_id, logger)
+
+    # ── Diagnostic SIGTERM handler ──────────────────────────────────────────
+    # We've been dying with exit code 143 (SIGTERM) at random points with no
+    # Python traceback, since signals don't raise exceptions by default.
+    # This logs exactly which line was executing when the signal arrived,
+    # then re-raises so the process still exits with the expected code.
+    def _log_sigterm(signum, frame):
+        logger.error(f"[Worker-{worker_id}] === SIGTERM received (signum={signum}) ===")
+        logger.error(f"[Worker-{worker_id}] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stderr.flush()
+        sys.stdout.flush()
+        # Restore default handler and re-send so the process actually dies
+        # with the normal SIGTERM semantics (exit code 143) instead of hanging.
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _log_sigterm)
 
     # ── Graceful-Shutdown timer ────────────────────────────────────────────
     # GitHub Actions kills a job after exactly 6 hours.  We stop accepting
@@ -2046,6 +2212,7 @@ def worker(worker_id: int, task_queue: multiprocessing.Queue, lock: multiprocess
     # Save final progress so the next shard/run knows what was done
     save_progress_to_gist(cfg.resume_file, logger)
     shutil.rmtree(tmp_dir, ignore_errors=True)
+    stop_mem_tracer()
     logger.info("Worker gracefully shutting down.")
 
 
@@ -2068,6 +2235,22 @@ def main() -> None:
     Path(cfg.tmp_root).mkdir(parents=True, exist_ok=True)
 
     logger = get_logger("Main")
+
+    def _log_sigterm_main(signum, frame):
+        logger.error(f"[Main] === SIGTERM received (signum={signum}) ===")
+        logger.error("[Main] Stack at time of signal:\n" + "".join(traceback.format_stack(frame)))
+        for h in logger.handlers:
+            try:
+                h.flush()
+            except Exception:
+                pass
+        sys.stderr.flush()
+        sys.stdout.flush()
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    signal.signal(signal.SIGTERM, _log_sigterm_main)
+
     logger.info("==========================================================")
     logger.info(" FPV Data Pipeline — GitHub CI Edition")
     logger.info("==========================================================")
