@@ -394,7 +394,7 @@ def save_progress_to_gist(resume_file: str, logger: logging.Logger) -> None:
         return
     try:
         subprocess.run(
-            ["gh", "gist", "edit", gist_id, resume_file],
+            ["gh", "gist", "edit", gist_id, "--filename", Path(resume_file).name, resume_file],
             timeout=60,
             check=True,
             capture_output=True,
@@ -458,7 +458,7 @@ def _yt_lock_write(gist_id: str, holder: str, ts: float) -> bool:
             # gist, so that attempt fails once; --add creates it. All calls
             # after that succeed via the plain edit path.
             out = subprocess.run(
-                ["gh", "gist", "edit", gist_id, str(lock_path)],
+                ["gh", "gist", "edit", gist_id, "--filename", _YT_LOCK_FILENAME, str(lock_path)],
                 timeout=15, capture_output=True, text=True,
             )
             if out.returncode == 0:
