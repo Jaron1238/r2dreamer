@@ -63,7 +63,7 @@ class PipelineConfig:
     resume_file: str = "processed_urls.txt"
     segment_done_file: str = "segments_done.txt"
     log_file: str = "pipeline.log"
-    hf_repo_id: str = "jaron12/fpv-dataset"
+    hf_repo_id: str = "Jaron12/fpv-dataset"
     hf_upload_threshold_bytes: int = int(3.0 * 1024 ** 3)  # must be < runner RAM (7 GB)
     upload_workers: int = 1  # 2 upload threads + processing saturates 2 vCPUs
     n_workers: int = 1          # GitHub standard runner: 2 vCPUs / 7 GB RAM
@@ -94,7 +94,7 @@ class PipelineConfig:
     crash_sharpness_drop: float = 60.0
     near_miss_flow_threshold: float = 2.0
     # Crash / safety dataset
-    hf_crash_repo_id: str = "jaron12/fpv-crash-dataset"
+    hf_crash_repo_id: str = "Jaron12/fpv-crash-dataset"
     crash_context_frames: int = 30   # frames BEFORE crash to save as crash=1.0
     crash_upload_threshold_bytes: int = int(0.5 * 1024 ** 3)  # 500 MB
     drone_num_classes: int = 6
