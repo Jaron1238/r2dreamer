@@ -334,7 +334,7 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
 
 def hf_upload_and_clear(output_dir: Path, repo_id: str, logger: logging.Logger, max_workers: int = 2, pack_chunk_bytes: int = int(2.0 * 1024 ** 3)) -> None:
     from huggingface_hub import HfApi
-    api = HfApi()
+    api = HfApi(token=os.environ.get("HF_TOKEN"))
     parquet_dir = output_dir / "parquet"
     chunk_dir = output_dir / "chunks"
     seg_count = len(list(parquet_dir.glob("*_seg*.parquet")))
@@ -346,8 +346,11 @@ def hf_upload_and_clear(output_dir: Path, repo_id: str, logger: logging.Logger, 
         return
     try:
         api.create_repo(repo_id=repo_id, repo_type="dataset", exist_ok=True)
-    except Exception:
-        pass
+    except Exception as e:
+        # Swallowing this used to hide auth/permission problems entirely —
+        # every upload_file call below would then fail with a 404 that gave
+        # no hint the actual cause was here, not there.
+        logger.error(f"[HF-Upload] create_repo({repo_id}) failed, uploads will likely fail too: {e}")
     upload_errors = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures: Dict[Any, Path] = {
@@ -399,6 +402,12 @@ def save_progress_to_gist(resume_file: str, logger: logging.Logger) -> None:
         logger.info("[Gist] Progress saved to GitHub Gist.")
     except FileNotFoundError:
         logger.debug("[Gist] gh CLI not found – skipping gist save.")
+    except subprocess.CalledProcessError as exc:
+        # str(exc) alone only shows "returned non-zero exit status 1" with no
+        # indication why — the actual reason is in stderr, which
+        # capture_output=True already captured but we weren't logging.
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip() if isinstance(exc.stderr, bytes) else str(exc.stderr or "").strip()
+        logger.warning(f"[Gist] Failed to save progress: {exc}" + (f" | stderr: {stderr}" if stderr else ""))
     except Exception as exc:
         logger.warning(f"[Gist] Failed to save progress: {exc}")
 
