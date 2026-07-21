@@ -16,6 +16,9 @@
 #                        (github.com → Settings → Developer settings → Personal access tokens)
 #        GH_GIST_ID    — The Gist ID from step 1
 #        YT_COOKIES    — Contents of your cookies.txt file (optional, for age-gated videos)
+#        TS_OAUTH_CLIENT_ID — Tailscale OAuth client ID for CI runner tailnet join
+#        TS_OAUTH_SECRET    — Tailscale OAuth secret for CI runner tailnet join
+#        YT_PROXY      — SOCKS5 proxy for yt-dlp, e.g. socks5://user:passwort@tailscale-ip:1080
 #
 #   3. Trigger the first run manually:
 #        gh workflow run fpv_pipeline.yml
@@ -127,12 +130,34 @@ jobs:
           echo "Restored $(wc -l < processed_urls.txt) already-processed URLs."
 
 
+      - name: Join Tailnet for yt-dlp proxy
+        uses: tailscale/github-action@v2
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Verify yt-dlp proxy egress
+        env:
+          YT_PROXY: ${{ secrets.YT_PROXY }}
+        run: |
+          if [ -z "$YT_PROXY" ]; then
+            echo "YT_PROXY not configured; skipping proxy verification."
+            exit 0
+          fi
+          # Python's urllib ProxyHandler treats socks5:// as an HTTP CONNECT
+          # proxy and fails with BadStatusLine against real SOCKS5 servers.
+          # curl supports SOCKS5 proxies natively and matches yt-dlp's proxy URL.
+          echo "Proxy egress IP:"
+          curl --fail --silent --show-error --max-time 20 --proxy "$YT_PROXY" https://api.ipify.org
+          echo
 
       - name: Run pipeline shard ${{ matrix.shard }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
           GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
+          YT_PROXY: ${{ secrets.YT_PROXY }}
         run: |
           ( while true; do
               echo "$(date '+%H:%M:%S') $(free -m | awk '/Mem:/ {printf "used=%sMB free=%sMB avail=%sMB total=%sMB", $3, $4, $7, $2}')" >> mem_monitor.log
@@ -156,6 +181,7 @@ jobs:
             --setenv=HF_TOKEN="$HF_TOKEN" \
             --setenv=GH_TOKEN="$GH_TOKEN" \
             --setenv=GH_GIST_ID="$GH_GIST_ID" \
+            --setenv=YT_PROXY="$YT_PROXY" \
             -- bash -c 'echo "--- In systemd-run scope ---"; echo "whoami: $(whoami), HOME: $HOME"; ls -la pipeline/cookies.txt; wc -l pipeline/cookies.txt; exec "$0" "$@"' \
             "$PYTHON_BIN" pipeline/pipeline.py \
               --shard ${{ matrix.shard }} \
@@ -217,6 +243,17 @@ jobs:
           path: pipeline.log
           retention-days: 7
 
+      - name: Upload pipeline metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-metrics-shard-${{ matrix.shard }}
+          path: |
+            pipeline_metrics.jsonl
+            perceptual_hashes.txt
+          retention-days: 7
+          if-no-files-found: ignore
+
   # ── Merge job: combines all shard progress files into one Gist ─────────
   # Runs after ALL shards finish (even if some failed).
   # This avoids the race condition where 10 runners simultaneously
@@ -239,6 +276,44 @@ jobs:
           find ./shard-artifacts -name "processed_urls.txt" -exec cat {} \; \
             | sort -u > merged_processed_urls.txt
           echo "Total unique processed URLs: $(wc -l < merged_processed_urls.txt)"
+
+      - name: Download all metrics artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pipeline-metrics-shard-*
+          merge-multiple: false
+          path: ./metrics-artifacts
+
+      - name: Build progress dashboard
+        run: |
+          python - <<'PY'
+          import json, collections, pathlib
+          rows=[]
+          for p in pathlib.Path('metrics-artifacts').rglob('pipeline_metrics.jsonl'):
+              shard=p.parent.name.replace('pipeline-metrics-shard-','')
+              for line in p.read_text().splitlines():
+                  try:
+                      r=json.loads(line); r['shard']=shard; rows.append(r)
+                  except Exception: pass
+          by_kind=collections.Counter(r.get('kind','unknown') for r in rows)
+          rejections=collections.Counter(r.get('reason','unknown') for r in rows if r.get('kind')=='rejection')
+          dup=sum(1 for r in rows if r.get('kind')=='duplicate')
+          segs=[r for r in rows if r.get('kind')=='segment']
+          tags={k: collections.Counter(r.get(k,'unknown') for r in segs) for k in ['scene_type','lighting','motion_intensity']}
+          lines=['# FPV Pipeline Progress Dashboard','',f'Total metric rows: {len(rows)}',f'Processed segments: {len(segs)}',f'Duplicates skipped: {dup}','', '## Rejections']
+          lines += [f'- {k}: {v}' for k,v in rejections.items()] or ['- none']
+          lines += ['', '## Diversity tags']
+          for k,c in tags.items(): lines += [f'### {k}'] + ([f'- {a}: {b}' for a,b in c.items()] or ['- none'])
+          pathlib.Path('fpv_pipeline_dashboard.md').write_text('\n'.join(lines)+'\n')
+          print('\n'.join(lines))
+          PY
+
+      - name: Upload progress dashboard
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpv-pipeline-dashboard
+          path: fpv_pipeline_dashboard.md
+          retention-days: 30
 
       - name: Push merged file to Gist
         env:
