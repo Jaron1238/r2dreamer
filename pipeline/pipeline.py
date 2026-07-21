@@ -2,6 +2,7 @@
 
 import argparse
 import io
+import json
 import math
 import mmap as mmap_module
 import os
@@ -103,6 +104,24 @@ class PipelineConfig:
     drone_fingerprint_frames: int = 60
     inpaint_erode_px: int = 5
     max_single_file_gb: float = 4.0   # >14 GB würde den Runner killen (No space left)
+    min_download_width: int = 1280     # Pre-download quality gate; 0 disables the resolution check
+    min_download_height: int = 720
+    min_download_bitrate_kbps: float = 2500.0  # Uses yt-dlp tbr or filesize/duration estimate when available
+    min_download_size_kbps: float = 1500.0     # HTTP/HF/GitHub fallback: file size per second estimate
+    motion_diversity_min_score: float = 0.04   # Low-motion segments are flagged, not dropped
+    diversity_brightness_day: float = 95.0     # Cheap heuristic labels for sampling balance only
+    diversity_brightness_night: float = 45.0
+    diversity_green_ratio: float = 0.34
+    diversity_urban_gray_ratio: float = 0.42
+    diversity_flow_low: float = 0.7
+    diversity_flow_high: float = 2.5
+    reject_interference_area_threshold: float = 0.18
+    reject_interference_frame_fraction: float = 0.6
+    reject_text_overlay_area_threshold: float = 0.12
+    reject_homogeneous_area_threshold: float = 0.25
+    duplicate_hamming_threshold: int = 8
+    perceptual_hash_file: str = "perceptual_hashes.txt"
+    pipeline_metrics_file: str = "pipeline_metrics.jsonl"
     download_max_retries: int = 3
     download_stall_timeout_s: int = 60
     playlist_batch_size: int = 3  # limit concurrent playlist downloads on 14 GB GitHub runners
@@ -661,6 +680,9 @@ def _yt_dlp_options(dest_dir: Path, *, allow_playlist: bool) -> Dict[str, Any]:
     }
     if cookies_path.exists() and cookies_path.stat().st_size > 0:
         ydl_opts["cookiefile"] = str(cookies_path)
+    yt_proxy = os.environ.get("YT_PROXY", "").strip()
+    if yt_proxy:
+        ydl_opts["proxy"] = yt_proxy
     return ydl_opts
 
 
@@ -728,9 +750,12 @@ def iter_yt_dlp_batched(url: str, dest_dir: Path, logger: logging.Logger, deadli
             item_url = entry.get("webpage_url") or entry.get("url")
             if not item_url:
                 continue
-            item_urls.append(item_url)
+            if _quality_gate_from_info(entry, logger, item_url):
+                item_urls.append(item_url)
+        if not item_urls:
+            logger.info(f"[yt-dlp] All playlist entries skipped by quality gate: {url}")
     else:
-        item_urls = [url]
+        item_urls = [url] if _quality_gate_from_info(info, logger, url) else []
 
     logger.info(f"[yt-dlp] Downloading {len(item_urls)} item(s) in batches of {batch_size}.")
     for start in range(0, len(item_urls), batch_size):
@@ -768,7 +793,7 @@ def iter_github_repo_videos(repo_url: str, tmp_dir: Path, logger: logging.Logger
         if item.get("size", 0) > CFG.max_single_file_gb * 1024 ** 3:
             continue
         local = download_file_http(raw_url, dest, logger)
-        if local:
+        if local and _http_quality_gate(local, logger):
             yield local, any(Path(fpath).stem in d for d in depth_paths)
 
 
@@ -784,8 +809,9 @@ def iter_hf_dataset_videos(repo_id: str, tmp_dir: Path, logger: logging.Logger) 
     for vf in video_files:
         has_depth = any(Path(vf).stem in df for df in depth_files_set)
         try:
-            local = hf_hub_download(repo_id=repo_id, filename=vf, repo_type="dataset", local_dir=str(tmp_dir))
-            yield Path(local), has_depth
+            local = Path(hf_hub_download(repo_id=repo_id, filename=vf, repo_type="dataset", local_dir=str(tmp_dir)))
+            if _http_quality_gate(local, logger):
+                yield local, has_depth
         except Exception:
             continue
 
@@ -1526,6 +1552,12 @@ class ParquetExporter:
         drone_id: int,
         has_osd: bool,
         fps: float,
+        motion_diversity_score: float = 0.0,
+        is_low_motion: bool = False,
+        scene_type: str = "unknown",
+        lighting: str = "unknown",
+        motion_intensity: str = "unknown",
+        indoor_outdoor: str = "unknown",
     ) -> Path:
         """Write one segment as multiple parquet_row_frames-sized ROWS instead
         of one giant blob-per-column row.
@@ -1621,6 +1653,13 @@ class ParquetExporter:
                 row["stem"] = stem
                 row["segment_id"] = segment_id
                 row["n_chunks"] = n_chunks
+                # Schema extension: downstream readers should tolerate these optional metadata columns.
+                row["motion_diversity_score"] = float(motion_diversity_score)
+                row["is_low_motion"] = bool(is_low_motion)
+                row["scene_type"] = scene_type
+                row["lighting"] = lighting
+                row["motion_intensity"] = motion_intensity
+                row["indoor_outdoor"] = indoor_outdoor
 
                 row_table = _table_from_chunked_rows([row])
                 if writer is None:
@@ -1653,6 +1692,139 @@ def interp_nan(arr: np.ndarray) -> np.ndarray:
     arr[~mask] = np.interp(idx[~mask], idx[mask], arr[mask])
     return arr
 
+
+
+
+def _append_metric(kind: str, payload: Dict[str, Any], cfg: PipelineConfig = CFG) -> None:
+    row = {"kind": kind, "ts": time.time(), **payload}
+    try:
+        with open(cfg.pipeline_metrics_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def _quality_gate_from_info(info: Dict[str, Any], logger: logging.Logger, label: str) -> bool:
+    width = int(info.get("width") or 0)
+    height = int(info.get("height") or 0)
+    duration = float(info.get("duration") or 0.0)
+    filesize = float(info.get("filesize") or info.get("filesize_approx") or 0.0)
+    bitrate = float(info.get("tbr") or info.get("vbr") or 0.0)
+    if bitrate <= 0 and filesize > 0 and duration > 0:
+        bitrate = (filesize * 8.0 / duration) / 1000.0
+    if CFG.min_download_width and width and width < CFG.min_download_width:
+        logger.info(f"[QualityGate] Skipped {label}: width={width} < {CFG.min_download_width}")
+        _append_metric("rejection", {"reason": "quality_width", "label": label, "value": width, "threshold": CFG.min_download_width})
+        return False
+    if CFG.min_download_height and height and height < CFG.min_download_height:
+        logger.info(f"[QualityGate] Skipped {label}: height={height} < {CFG.min_download_height}")
+        _append_metric("rejection", {"reason": "quality_height", "label": label, "value": height, "threshold": CFG.min_download_height})
+        return False
+    if CFG.min_download_bitrate_kbps and bitrate and bitrate < CFG.min_download_bitrate_kbps:
+        logger.info(f"[QualityGate] Skipped {label}: bitrate={bitrate:.0f}kbps < {CFG.min_download_bitrate_kbps:.0f}kbps")
+        _append_metric("rejection", {"reason": "quality_bitrate", "label": label, "value": bitrate, "threshold": CFG.min_download_bitrate_kbps})
+        return False
+    return True
+
+
+def _http_quality_gate(local: Path, logger: logging.Logger) -> bool:
+    try:
+        w, h, fps = get_video_info(local)
+        cap = cv2.VideoCapture(str(local)); frames = cap.get(cv2.CAP_PROP_FRAME_COUNT); cap.release()
+        duration = float(frames) / max(float(fps), 1.0) if frames and frames > 0 else 0.0
+        kbps = (local.stat().st_size * 8.0 / max(duration, 1.0)) / 1000.0 if duration > 0 else 0.0
+        return _quality_gate_from_info({"width": w, "height": h, "duration": duration, "filesize": local.stat().st_size, "tbr": kbps}, logger, local.name)
+    except Exception:
+        return True
+
+
+def _binary_dhash(frames: np.ndarray, samples: int = 6) -> int:
+    if len(frames) == 0:
+        return 0
+    idxs = np.linspace(0, len(frames) - 1, num=min(samples, len(frames)), dtype=int)
+    bits = []
+    for i in idxs:
+        small = cv2.resize(frames[i], (9, 8), interpolation=cv2.INTER_AREA)
+        if small.ndim == 3:
+            small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+        bits.extend((small[:, 1:] > small[:, :-1]).reshape(-1).tolist())
+    h = 0
+    for b in bits[:64]:
+        h = (h << 1) | int(bool(b))
+    return h
+
+
+def _hamming(a: int, b: int) -> int:
+    return int((a ^ b).bit_count())
+
+
+def _check_and_record_duplicate(stem: str, dhash: int, cfg: PipelineConfig, logger: logging.Logger) -> bool:
+    path = Path(cfg.perceptual_hash_file)
+    path.touch(exist_ok=True)
+    existing = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2:
+            try: existing.append((parts[0], int(parts[1], 16)))
+            except Exception: pass
+    for other, oh in existing:
+        dist = _hamming(dhash, oh)
+        if dist <= cfg.duplicate_hamming_threshold:
+            logger.info(f"[{stem}] Duplicate skipped: dHash distance {dist} <= {cfg.duplicate_hamming_threshold} vs {other}")
+            _append_metric("duplicate", {"stem": stem, "match": other, "distance": dist, "threshold": cfg.duplicate_hamming_threshold}, cfg)
+            return True
+    with path.open("a", encoding="utf-8") as f:
+        f.write(f"{stem}\t{dhash:016x}\n")
+    return False
+
+
+def _quality_rejection(seg_rgb: np.ndarray, seg_gray: np.ndarray, overlay_mask: Optional[np.ndarray], cfg: PipelineConfig) -> Tuple[bool, str, Dict[str, float]]:
+    if len(seg_gray) == 0:
+        return False, "", {}
+    idxs = np.linspace(0, len(seg_gray) - 1, num=min(8, len(seg_gray)), dtype=int)
+    mask = overlay_mask if overlay_mask is not None else np.zeros(seg_gray.shape[1:], dtype=np.uint8)
+    if mask.shape != seg_gray.shape[1:]:
+        mask = cv2.resize(mask, (seg_gray.shape[2], seg_gray.shape[1]), interpolation=cv2.INTER_NEAREST)
+    valid = mask == 0
+    block_rates=[]; text_rates=[]; homog_rates=[]
+    for i in idxs:
+        g=seg_gray[i]
+        lap=np.abs(cv2.Laplacian(g, cv2.CV_32F)); block_rates.append(float(np.mean((lap > 35) & valid)))
+        edges=cv2.Canny(g,80,180); text_rates.append(float(np.mean((edges>0) & valid)))
+        std=cv2.blur((g.astype(np.float32)-cv2.blur(g.astype(np.float32),(31,31)))**2,(31,31))**0.5
+        homog_rates.append(float(np.mean((std < 4) & valid)))
+    metrics={"interference_area": float(np.mean(block_rates)), "text_edge_area": float(np.mean(text_rates)), "homogeneous_area": float(np.mean(homog_rates))}
+    persistent = float(np.mean(np.array(block_rates) > cfg.reject_interference_area_threshold))
+    if metrics["interference_area"] > cfg.reject_interference_area_threshold and persistent >= cfg.reject_interference_frame_fraction:
+        return True, "interference_blocks", metrics
+    if metrics["text_edge_area"] > cfg.reject_text_overlay_area_threshold:
+        return True, "large_text_overlay", metrics
+    if metrics["homogeneous_area"] > cfg.reject_homogeneous_area_threshold:
+        return True, "homogeneous_blocks", metrics
+    return False, "", metrics
+
+
+def _motion_diversity(flow_mags: np.ndarray) -> float:
+    if len(flow_mags) <= 1:
+        return 0.0
+    vals = flow_mags[1:].astype(np.float32, copy=False)
+    return float(np.std(vals) / (float(np.mean(vals)) + 1e-6))
+
+
+def _diversity_tags(seg_rgb: np.ndarray, flow_mags: np.ndarray, cfg: PipelineConfig) -> Dict[str, str]:
+    sample = seg_rgb[::max(1, len(seg_rgb)//8)] if len(seg_rgb) else seg_rgb
+    if len(sample) == 0:
+        return {"scene_type":"unknown","lighting":"unknown","motion_intensity":"unknown","indoor_outdoor":"unknown"}
+    rgb = sample.reshape(-1,3).astype(np.float32)
+    r,g,b = rgb[:,0], rgb[:,1], rgb[:,2]
+    bright = float(np.mean(0.299*r + 0.587*g + 0.114*b))
+    green_ratio = float(np.mean((g > r*1.08) & (g > b*1.08)))
+    gray_ratio = float(np.mean((np.max(rgb,axis=1)-np.min(rgb,axis=1)) < 22))
+    scene = "nature" if green_ratio >= cfg.diversity_green_ratio else ("urban" if gray_ratio >= cfg.diversity_urban_gray_ratio else "mixed")
+    lighting = "night" if bright < cfg.diversity_brightness_night else ("day" if bright >= cfg.diversity_brightness_day else "dusk")
+    mf = float(np.mean(flow_mags[1:])) if len(flow_mags)>1 else 0.0
+    motion = "low" if mf < cfg.diversity_flow_low else ("high" if mf >= cfg.diversity_flow_high else "medium")
+    return {"scene_type":scene,"lighting":lighting,"motion_intensity":motion,"indoor_outdoor":"outdoor" if lighting != "night" and scene in ("nature","urban") else "unknown"}
 
 def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegistry, logger: logging.Logger, deadline_reached: Optional[Any] = None) -> Iterator[Tuple[Path, bool, bool]]:
     url_type = classify_url(url, platform)
@@ -1701,7 +1873,10 @@ def _iter_url_videos(url: str, platform: str, tmp_dir: Path, registry: URLRegist
         if not fname or "." not in fname:
             fname = f"video_{hashlib.md5(url.encode()).hexdigest()[:8]}.mp4"
         local = download_file_http(url, tmp_dir / "http" / fname, logger)
-        if local: yield local, False, False
+        if local and _http_quality_gate(local, logger):
+            yield local, False, False
+        elif local:
+            local.unlink(missing_ok=True)
         registry.mark_done(url)
     else:
         registry.mark_done(url)
@@ -1732,6 +1907,10 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
         }
         open_drone_id: int = 0
         open_has_osd: bool = False
+        open_motion_scores: List[float] = []
+        open_low_motion: bool = False
+        open_diversity_counts: Dict[str, Dict[str, int]] = {"scene_type": {}, "lighting": {}, "motion_intensity": {}, "indoor_outdoor": {}}
+        duplicate_checked: bool = False
         osd_rois: Optional[Dict] = None
         stick_roi: Optional[Tuple[int, int, int, int]] = None
         overlay_mask_dep: Optional[np.ndarray] = None
@@ -1758,6 +1937,7 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                 pass  # non-glibc platform — nothing to trim
 
         def _flush_scene(sid: int) -> None:
+            nonlocal open_low_motion
             n_chunks = len(open_bufs["frames_rgb"])
             if n_chunks == 0:
                 return
@@ -1765,6 +1945,10 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             if n < cfg.min_scene_len_frames or seg_registry.is_done(stem, sid):
                 for k in open_bufs:
                     open_bufs[k].clear()
+                open_motion_scores.clear()
+                open_low_motion = False
+                for d in open_diversity_counts.values():
+                    d.clear()
                 return
             actions_arr = np.concatenate(open_bufs["actions"], axis=0) if open_bufs["actions"] else np.zeros((n, 4), dtype=np.float32)
             speeds_arr  = interp_nan(np.concatenate(open_bufs["speeds"])  if open_bufs["speeds"]  else np.full(n, np.nan, dtype=np.float32))
@@ -1774,6 +1958,11 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
 
             # Use cam overlay mask; fall back to empty mask if not yet set
             mask = overlay_mask_cam if overlay_mask_cam is not None else np.zeros(out_hw_cam, dtype=np.uint8)
+
+            motion_score = float(np.mean(open_motion_scores)) if open_motion_scores else 0.0
+            def _majority(key: str) -> str:
+                vals = open_diversity_counts.get(key, {})
+                return max(vals.items(), key=lambda kv: kv[1])[0] if vals else "unknown"
 
             # frames_rgb/frames_gray are passed as chunk lists, not concatenated —
             # np.concatenate here would briefly double the ~1.5-3.1GB buffer per
@@ -1787,11 +1976,22 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                 actions_arr, speeds_arr, alts_arr, batts_arr,
                 terminal_arr,
                 open_drone_id, open_has_osd, fps,
+                motion_diversity_score=motion_score,
+                is_low_motion=open_low_motion,
+                scene_type=_majority("scene_type"),
+                lighting=_majority("lighting"),
+                motion_intensity=_majority("motion_intensity"),
+                indoor_outdoor=_majority("indoor_outdoor"),
             )
             seg_registry.mark_done(stem, sid)
             logger.info(f"[{stem}] Segment {sid:04d} ({n} frames) -> {out_path.name}")
+            _append_metric("segment", {"stem": stem, "segment_id": sid, "frames": n, "motion_diversity_score": motion_score, "is_low_motion": open_low_motion, "scene_type": _majority("scene_type"), "lighting": _majority("lighting"), "motion_intensity": _majority("motion_intensity")}, cfg)
             for k in open_bufs:
                 open_bufs[k].clear()
+            open_motion_scores.clear()
+            open_low_motion = False
+            for d in open_diversity_counts.values():
+                d.clear()
             _release_freed_memory()
 
         while True:
@@ -1813,6 +2013,15 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                 break
 
             frames_dep_mmap = open_mmap_video(mmap_path_dep, mmap_shape_dep)
+
+            if not duplicate_checked and window_start_frame == 0:
+                sample_end = min(n_window, max(1, cfg.chunk_size_frames * 2))
+                sample_hash = _binary_dhash(np.array(frames_dep_mmap[:sample_end]))
+                if _check_and_record_duplicate(stem, sample_hash, cfg, logger):
+                    mmap_path_dep.unlink(missing_ok=True)
+                    mmap_path_dep = None
+                    return
+                duplicate_checked = True
 
             if window_start_frame == 0 and is_fpv:
                 scan_end = min(max(cfg.osd_scan_frames + 5, 65), n_window)
@@ -1915,6 +2124,22 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                         flow_pitches[fi] = float(np.mean(fl[..., 1]))
 
                     is_terminal_seg, crash_indices, _ = crash_det.detect(seg_gray, flow_mags=flow_mags)
+
+                    reject, reject_reason, reject_metrics = _quality_rejection(seg_512, seg_gray, overlay_mask_cam, cfg)
+                    if reject:
+                        logger.info(f"[{stem}] Segment rejected ({reject_reason}): {reject_metrics}")
+                        _append_metric("rejection", {"reason": reject_reason, "stem": stem, "segment_id": seg_id_counter, **reject_metrics}, cfg)
+                        continue
+
+                    motion_score = _motion_diversity(flow_mags)
+                    low_motion = motion_score < cfg.motion_diversity_min_score
+                    if low_motion:
+                        logger.info(f"[{stem}] Low-motion segment marked: score={motion_score:.4f} < {cfg.motion_diversity_min_score:.4f}")
+                    tags = _diversity_tags(cv2.cvtColor(seg_512, cv2.COLOR_BGR2RGB), flow_mags, cfg)
+                    open_motion_scores.append(motion_score)
+                    open_low_motion = open_low_motion or low_motion
+                    for key, val in tags.items():
+                        open_diversity_counts[key][val] = open_diversity_counts[key].get(val, 0) + 1
 
                     # ── Save pre-crash frames to the safety dataset ──────────────────────
                     # Clean frames are already in the main FPV dataset (is_terminal=False).
