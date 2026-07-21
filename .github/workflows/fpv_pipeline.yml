@@ -145,12 +145,12 @@ jobs:
             echo "YT_PROXY not configured; skipping proxy verification."
             exit 0
           fi
-          python - <<'PY'
-          import os, urllib.request
-          proxy = os.environ.get("YT_PROXY", "").strip()
-          opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-          print(opener.open("https://api.ipify.org", timeout=20).read().decode().strip())
-          PY
+          # Python's urllib ProxyHandler treats socks5:// as an HTTP CONNECT
+          # proxy and fails with BadStatusLine against real SOCKS5 servers.
+          # curl supports SOCKS5 proxies natively and matches yt-dlp's proxy URL.
+          echo "Proxy egress IP:"
+          curl --fail --silent --show-error --max-time 20 --proxy "$YT_PROXY" https://api.ipify.org
+          echo
 
       - name: Run pipeline shard ${{ matrix.shard }}
         env:
