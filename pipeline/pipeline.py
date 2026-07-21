@@ -1791,7 +1791,10 @@ def _quality_rejection(seg_rgb: np.ndarray, seg_gray: np.ndarray, overlay_mask: 
         g=seg_gray[i]
         lap=np.abs(cv2.Laplacian(g, cv2.CV_32F)); block_rates.append(float(np.mean((lap > 35) & valid)))
         edges=cv2.Canny(g,80,180); text_rates.append(float(np.mean((edges>0) & valid)))
-        std=cv2.blur((g.astype(np.float32)-cv2.blur(g.astype(np.float32),(31,31)))**2,(31,31))**0.5
+        g32 = g.astype(np.float32)
+        local_mean = cv2.blur(g32, (31, 31))
+        local_var = cv2.blur((g32 - local_mean) ** 2, (31, 31))
+        std = np.sqrt(np.maximum(local_var, 0.0))
         homog_rates.append(float(np.mean((std < 4) & valid)))
     metrics={"interference_area": float(np.mean(block_rates)), "text_edge_area": float(np.mean(text_rates)), "homogeneous_area": float(np.mean(homog_rates))}
     persistent = float(np.mean(np.array(block_rates) > cfg.reject_interference_area_threshold))
