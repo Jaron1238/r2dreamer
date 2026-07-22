@@ -53,7 +53,7 @@ jobs:
 
     # Hard cap just below GitHub's 6-hour limit.
     # The Python code itself stops at 5.5 h for a graceful upload.
-    timeout-minutes: 340
+    timeout-minutes: 355
 
     strategy:
       fail-fast: false   # one shard failing must not cancel the others
