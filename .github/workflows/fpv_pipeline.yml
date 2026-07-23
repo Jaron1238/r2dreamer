@@ -317,7 +317,7 @@ jobs:
           
       - name: Push merged file to Gist
         env:
-        GH_TOKEN: ${{ secrets.GH_TOKEN }}
-      run: |
-        gh gist edit "${{ secrets.GH_GIST_ID }}" merged_processed_urls.txt --filename processed_urls.txt
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          gh gist edit "${{ secrets.GH_GIST_ID }}" merged_processed_urls.txt --filename processed_urls.txt
 
