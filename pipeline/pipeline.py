@@ -135,13 +135,25 @@ class PipelineConfig:
     max_segment_frames: int = 1200
     mmap_max_frames: int = 3600
     chunk_size_frames: int = 60
-    # Frames per Parquet row for frames_rgb/frames_gray/actions/osd/etc.
+    # Frames per Parquet row for frames_rgb/actions/osd/etc.
     # A segment with n_frames > this is written as multiple rows
     # (chunk_id 0..n_chunks-1) instead of one giant blob-per-column row.
-    # Keeps np.concatenate + Snappy encoder peaks bounded to ~this many
+    # Keeps np.concatenate + encoder peaks bounded to ~this many
     # frames instead of the full segment (up to max_segment_frames).
-    # 240 frames @ 1280x720x1 (gray) ≈ 221 MB raw — well under CI RAM budget.
+    # 240 frames @ 1280x720x3 (rgb, pre-JPEG) ≈ 663 MB raw — well under CI RAM budget.
     parquet_row_frames: int = 240
+    # JPEG quality for frames_rgb before it's written to Parquet. 95 is
+    # visually lossless for training and cuts the RGB column to roughly
+    # 1/6-1/8 of raw-byte+Snappy size. frames_gray is no longer stored in
+    # the main FPV dataset at all (see ParquetExporter docstring) — the
+    # trainer derives SafetyNet grayscale from frames_rgb on-the-fly.
+    jpeg_quality: int = 95
+    # Parquet codec for the remaining (mostly small float/bool) columns.
+    # zstd compresses noticeably better than snappy at a modest CPU cost;
+    # frames_rgb itself is JPEG bytes by the time it reaches the writer,
+    # so this mainly helps osd/actions/speeds/... and JPEG residual entropy.
+    parquet_compression: str = "zstd"
+    parquet_compression_level: int = 15
 
 CFG = PipelineConfig()
 
@@ -326,7 +338,11 @@ def _pack_segments_to_chunks(parquet_dir: Path, chunk_dir: Path, target_bytes: i
 
         if writer is None:
             out = chunk_dir / f"chunk_{ts}_{chunk_idx:04d}.parquet"
-            writer = pq.ParquetWriter(out, pf.schema_arrow, compression="snappy")
+            writer = pq.ParquetWriter(
+                out, pf.schema_arrow,
+                compression=CFG.parquet_compression,
+                compression_level=CFG.parquet_compression_level,
+            )
             writer_path = out
 
         # Stream row-group by row-group: at any point in time we hold at
@@ -1373,6 +1389,34 @@ def _blob(array: np.ndarray) -> bytes:
     return np.ascontiguousarray(array).tobytes()
 
 
+def _encode_rgb_jpeg(frames: np.ndarray, quality: int = 95) -> bytes:
+    """JPEG-encode each frame of an (T, H, W, 3) uint8 RGB array and pack the
+    results into one contiguous blob as a sequence of
+    [uint32 little-endian length][JPEG bytes] records.
+
+    frames_rgb enters this function already BGR->RGB converted by
+    inpaint_overlays_to_numpy, so we flip back to BGR for cv2.imencode and
+    let the JPEG bytes carry RGB semantics on the read side (i.e. the
+    reader must cv2.imdecode + cv2.cvtColor(BGR2RGB), matching what this
+    function undoes here).
+
+    This replaces the previous raw-bytes-in-Parquet path
+    (frames_rgb = _blob(rgb_win)) for the RGB column; frames_gray is no
+    longer written at all (see ParquetExporter docstring).
+    """
+    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)]
+    parts: List[bytes] = []
+    for i in range(frames.shape[0]):
+        bgr = cv2.cvtColor(frames[i], cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(".jpg", bgr, encode_param)
+        if not ok:
+            raise RuntimeError("JPEG encode failed for a frames_rgb frame")
+        jbytes = buf.tobytes()
+        parts.append(len(jbytes).to_bytes(4, "little"))
+        parts.append(jbytes)
+    return b"".join(parts)
+
+
 def _table_from_chunked_rows(rows: List[Dict[str, Any]]) -> pa.Table:
     """Build a pyarrow Table from a list of per-chunk row dicts, forcing
     raw-bytes fields to large_binary (64-bit offsets).
@@ -1436,7 +1480,11 @@ class CrashDatasetExporter:
         arr = frame_hw1.squeeze() if frame_hw1.ndim == 3 else frame_hw1
         img = Image.fromarray(arr, mode="L")
         buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=False, compress_level=1)
+        # compress_level=1 was chosen purely for encode speed; this dataset is
+        # small (500 MB upload threshold) so the extra CPU from a higher level
+        # is cheap and worth the smaller files. 6 is PIL/zlib's default
+        # speed/ratio balance point.
+        img.save(buf, format="PNG", optimize=False, compress_level=6)
         return buf.getvalue()
 
     def add_frames(
@@ -1460,7 +1508,11 @@ class CrashDatasetExporter:
         df["image"] = df["image"].apply(lambda b: {"bytes": b, "path": None})
         table = pa.Table.from_pandas(df, preserve_index=False)
         out_path = self.out_dir / f"crash_{self._file_idx:06d}.parquet"
-        pq.write_table(table, out_path, compression="snappy")
+        pq.write_table(
+            table, out_path,
+            compression=CFG.parquet_compression,
+            compression_level=CFG.parquet_compression_level,
+        )
         self.total_bytes += out_path.stat().st_size
         self._file_idx += 1
         self._rows.clear()
@@ -1512,9 +1564,15 @@ def upload_crash_dataset(out_dir: Path, repo_id: str, logger: logging.Logger) ->
 class ParquetExporter:
     """
     Exports processed video segments to Parquet in the format expected by r2dreamer's FPVDataset:
-      - frames_rgb:     uint8 numpy array (T, H, W, 3)       – RGB, masked (RSSM resolution)
-      - frames_gray:    uint8 numpy array (T, safety_h, safety_w, 1) – grayscale (SafetyNet resolution)
-      - cam_overlay:    uint8 numpy array (H, W)              – binary overlay mask (0/255)
+      - frames_rgb:        bytes – JPEG-encoded frame stream at safety resolution
+                           (safety_h × safety_w, default 720×1280), one
+                           [uint32 length][JPEG bytes] record per frame
+                           (see _encode_rgb_jpeg). RGB, masked.
+      - frames_rgb_shape:  int64[3] – (T, safety_h, safety_w) the JPEG stream decodes to
+                           (channel dim is implicitly 3; kept 3-long for schema stability)
+      - frames_rgb_format: string – always "jpeg"; downstream readers should check this
+                           rather than assume raw bytes.
+      - cam_overlay:    uint8 numpy array (H, W)              – binary overlay mask (0/255), full/depth resolution
       - osd:            float32 numpy array (T, 8)      – [speed, alt, battery, 0…0]
       - actions:        float32 numpy array (T, 4)
       - speeds:         float32 numpy array (T,)
@@ -1523,9 +1581,22 @@ class ParquetExporter:
       - is_terminal:    bool numpy array (T,)
       - n_frames, drone_id, has_osd, fps, stem, segment_id
 
-    Note: frames_gray is now stored at SafetyNet resolution (safety_h × safety_w, default 1280×720),
-    downscaled from the 1080p source. The RSSM trainer still converts frames_rgb → gray on-the-fly
-    for its own encoder; frames_gray is exclusively consumed by the SafetyNet.
+    CHANGED vs. the old raw-bytes format:
+      1. frames_gray is no longer written to the main FPV dataset at all.
+         It used to duplicate a downscaled-to-safety-resolution grayscale copy
+         of every frame purely for the SafetyNet. Since frames_rgb is now
+         stored at safety resolution itself (previously it was RSSM
+         resolution, 512×288), the trainer can derive SafetyNet grayscale
+         with a single cv2.cvtColor(frame, BGR2GRAY) call and derive the
+         RSSM's 512×288 input with a cv2.resize — no separate column needed.
+         This alone removes the single largest contributor to dataset size.
+      2. frames_rgb is JPEG-encoded (quality=CFG.jpeg_quality, default 95)
+         instead of stored as raw uint8 bytes. Combined with (1), reading
+         code MUST be updated: iterate the [len][jpeg] records in
+         frames_rgb, cv2.imdecode each, cv2.cvtColor(BGR2RGB), then resize
+         down for RSSM / grayscale-convert for SafetyNet as needed.
+      3. The Parquet codec for all non-JPEG columns is CFG.parquet_compression
+         ("zstd", level CFG.parquet_compression_level) instead of "snappy".
     """
 
     def __init__(self, out_dir: Path, row_frames: int = CFG.parquet_row_frames):
@@ -1541,8 +1612,7 @@ class ParquetExporter:
         self,
         stem: str,
         segment_id: int,
-        frames_rgb_chunks: List[np.ndarray],           # list of (t, H, W, 3) uint8 RGB chunks – already inpainted
-        frames_gray_chunks: Optional[List[np.ndarray]],  # list of (t, safety_h, safety_w, 1) uint8 chunks; None/empty = omit
+        frames_rgb_chunks: List[np.ndarray],           # list of (t, safety_h, safety_w, 3) uint8 RGB chunks – already inpainted
         cam_overlay_mask: np.ndarray,         # (H, W) uint8 binary mask
         actions: np.ndarray,           # (T, 4) float32
         speeds: np.ndarray,            # (T,) float32
@@ -1569,14 +1639,16 @@ class ParquetExporter:
         ~3x a single column's raw size and blow past the CI runner's
         MemoryMax.
 
-        Here, frames_rgb/frames_gray/actions/osd/speeds/altitudes/batteries/
+        Here, frames_rgb/actions/osd/speeds/altitudes/batteries/
         is_terminal are all split into aligned windows of `self.row_frames`
         frames via _stream_windows, and each window becomes its own row
         (chunk_id 0..n_chunks-1, chunk_frame_offset = starting frame index).
-        Both np.concatenate and the Snappy encoder now only ever see one
+        Both np.concatenate and the JPEG/zstd encoders now only ever see one
         window's worth of data (tens/low-hundreds of MB) at a time, so the
-        peak no longer scales with segment length. Compression stays ON
-        (snappy) — chunking doesn't change compression ratio, Snappy is
+        peak no longer scales with segment length. frames_rgb is JPEG-encoded
+        per frame before it reaches the Parquet writer (see _encode_rgb_jpeg);
+        the remaining columns use CFG.parquet_compression (zstd) — chunking
+        doesn't change compression ratio either way, both codecs are
         stateless per call.
 
         cam_overlay is per-segment, not per-frame; it's small (H, W) and gets
@@ -1608,10 +1680,6 @@ class ParquetExporter:
         n_chunks = math.ceil(n / self.row_frames) if n > 0 else 0
 
         rgb_windows = _stream_windows(frames_rgb_chunks, self.row_frames)
-        gray_windows = (
-            _stream_windows(frames_gray_chunks, self.row_frames)
-            if frames_gray_chunks else None
-        )
 
         out_path = self.out_dir / f"{stem}_seg{segment_id:04d}.parquet"
         writer: Optional[pq.ParquetWriter] = None
@@ -1622,13 +1690,10 @@ class ParquetExporter:
                 t = rgb_win.shape[0]
                 sl = slice(frame_offset, frame_offset + t)
                 row: Dict[str, Any] = {
-                    "frames_rgb": _blob(rgb_win),
+                    "frames_rgb": _encode_rgb_jpeg(rgb_win, quality=CFG.jpeg_quality),
                     "frames_rgb_shape": list(rgb_win.shape),
+                    "frames_rgb_format": "jpeg",
                 }
-                if gray_windows is not None:
-                    gray_win = next(gray_windows)
-                    row["frames_gray"] = _blob(gray_win)
-                    row["frames_gray_shape"] = list(gray_win.shape)
                 row["cam_overlay"] = cam_overlay_bytes
                 row["cam_overlay_shape"] = cam_overlay_shape
                 row["osd"] = _blob(osd[sl].astype(np.float32, copy=False))
@@ -1663,7 +1728,11 @@ class ParquetExporter:
 
                 row_table = _table_from_chunked_rows([row])
                 if writer is None:
-                    writer = pq.ParquetWriter(out_path, row_table.schema, compression="snappy")
+                    writer = pq.ParquetWriter(
+                        out_path, row_table.schema,
+                        compression=CFG.parquet_compression,
+                        compression_level=CFG.parquet_compression_level,
+                    )
                 writer.write_table(row_table)
                 del row, row_table
 
@@ -1677,7 +1746,11 @@ class ParquetExporter:
             # n == 0 edge case: no frames at all. Still produce a (schema-less
             # but valid) parquet file so downstream globbing/packing doesn't
             # choke on a missing segment file.
-            pq.write_table(pa.Table.from_arrays([], names=[]), out_path, compression="snappy")
+            pq.write_table(
+                pa.Table.from_arrays([], names=[]), out_path,
+                compression=CFG.parquet_compression,
+                compression_level=CFG.parquet_compression_level,
+            )
 
         self.total_bytes += out_path.stat().st_size
         return out_path
@@ -1903,8 +1976,12 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
         prev_gray_boundary: Optional[np.ndarray] = None
         seg_id_counter: int = 0
         open_bufs: Dict[str, list] = {
-            "frames_rgb": [],   # list of (T_chunk, H, W, 3) uint8 arrays
-            "frames_gray": [],  # list of (T_chunk, safety_h, safety_w, 1) uint8 – SafetyNet resolution
+            # (T_chunk, safety_h, safety_w, 3) uint8 – RGB at safety resolution
+            # (720x1280 by default). No separate frames_gray buffer anymore:
+            # the trainer derives SafetyNet grayscale and the RSSM's 512x288
+            # input from this one column. seg_safety_gray is still computed
+            # per-chunk below, but only feeds the small crash dataset now.
+            "frames_rgb": [],
             "actions": [],
             "speeds": [], "alts": [], "batts": [], "is_terminal": [],
         }
@@ -1959,22 +2036,23 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
             batts_arr   = interp_nan(np.concatenate(open_bufs["batts"])   if open_bufs["batts"]   else np.full(n, np.nan, dtype=np.float32))
             terminal_arr = np.concatenate(open_bufs["is_terminal"]) if open_bufs["is_terminal"] else np.zeros(n, dtype=bool)
 
-            # Use cam overlay mask; fall back to empty mask if not yet set
-            mask = overlay_mask_cam if overlay_mask_cam is not None else np.zeros(out_hw_cam, dtype=np.uint8)
+            # frames_rgb is now stored at depth/safety resolution (overlay_mask_dep),
+            # not the old 512x288 RSSM resolution (overlay_mask_cam) — fall back to
+            # an empty mask at that resolution if it hasn't been built yet.
+            mask = overlay_mask_dep if overlay_mask_dep is not None else np.zeros(out_hw_depth, dtype=np.uint8)
 
             motion_score = float(np.mean(open_motion_scores)) if open_motion_scores else 0.0
             def _majority(key: str) -> str:
                 vals = open_diversity_counts.get(key, {})
                 return max(vals.items(), key=lambda kv: kv[1])[0] if vals else "unknown"
 
-            # frames_rgb/frames_gray are passed as chunk lists, not concatenated —
-            # np.concatenate here would briefly double the ~1.5-3.1GB buffer per
-            # field before serialization even touches it. See
-            # _array_record_from_chunks for the zero-copy pa.py_buffer wrap that replaces it.
+            # frames_rgb is passed as a chunk list, not concatenated —
+            # np.concatenate here would briefly double the multi-GB buffer
+            # before serialization even touches it. See _array_record_from_chunks
+            # for the zero-copy pa.py_buffer wrap that replaces it.
             out_path = parquet_exp.export_segment(
                 stem, sid,
                 open_bufs["frames_rgb"],
-                open_bufs["frames_gray"] if open_bufs["frames_gray"] else None,
                 mask,
                 actions_arr, speeds_arr, alts_arr, batts_arr,
                 terminal_arr,
@@ -2053,11 +2131,10 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                 chunk_end = min(chunk_start + chunk_size, n_window)
                 rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
                 rgb_mb = sum(b.nbytes for b in open_bufs["frames_rgb"]) / 1e6
-                gray_mb = sum(b.nbytes for b in open_bufs["frames_gray"]) / 1e6
                 logger.debug(
                     f"[Mem] chunk {chunk_start}-{chunk_end}/{n_window} | RSS peak: {rss_mb:.0f} MB | "
                     f"open segment frames: {sum(len(b) for b in open_bufs['frames_rgb'])} "
-                    f"(frames_rgb: {rgb_mb:.0f} MB, frames_gray: {gray_mb:.0f} MB)"
+                    f"(frames_rgb: {rgb_mb:.0f} MB, pre-JPEG raw)"
                 )
 
                 chunk_1080p = frames_dep_mmap[chunk_start:chunk_end]
@@ -2166,11 +2243,17 @@ def _process_video_cpu(video_path: Path, is_fpv: bool, parquet_exp: ParquetExpor
                     )) if drone_cls is not None else 0  # skip expensive fingerprint when Barlow-Twins is active
                     open_has_osd = open_has_osd or has_osd_seg
 
-                    # Inpaint OSD/stick overlays and convert BGR→RGB for r2dreamer
-                    rgb_seg = inpaint_overlays_to_numpy(seg_512, overlay_mask_cam, cfg.inpaint_erode_px)
+                    # Inpaint OSD/stick overlays and convert BGR→RGB for r2dreamer.
+                    # Stored at depth/safety resolution (seg_1080p, overlay_mask_dep) —
+                    # not the old 512x288 RSSM resolution — since this is now the only
+                    # RGB copy written to disk. The RSSM trainer resizes down to
+                    # 512x288 and the SafetyNet grayscale-converts, both at load time.
+                    # seg_512/seg_gray/overlay_mask_cam/roi_512 are still used above
+                    # (motion, actions, rejection, diversity heuristics) — they stay
+                    # at 512x288 purely as an internal processing resolution.
+                    rgb_seg = inpaint_overlays_to_numpy(seg_1080p, overlay_mask_dep, cfg.inpaint_erode_px)
 
                     open_bufs["frames_rgb"].append(rgb_seg)
-                    open_bufs["frames_gray"].append(seg_safety_gray)
                     open_bufs["actions"].append(actions_seg)
                     open_bufs["speeds"].append(speeds_seg)
                     open_bufs["alts"].append(alts_seg)
